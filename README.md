@@ -145,10 +145,22 @@ point Char's bundled OpenAI provider at us.
 | **Configure Providers → OpenAI → Advanced → Base URL** | `http://127.0.0.1:8000/v1` |
 
 Char defaults to model `gpt-4o-transcribe-diarize` with
-`response_format=diarized_json`; we honour that (single anonymous `speaker_0`
-for every segment — for real speaker labels use `./run.sh transcribe FILE`,
-which runs sherpa-onnx + LLM speaker-name inference). `verbose_json`, `json`,
-`text`, `srt`, and `vtt` are all supported too.
+`response_format=diarized_json`; we honour that and run real sherpa-onnx
+speaker diarization on every Generate (default ON, ~3-4s of extra latency
+on a 60s clip). `verbose_json`, `json`, `text`, `srt`, and `vtt` are all
+supported too.
+
+**Diarization tuning** — sherpa-onnx with the default `CLUSTER_THRESHOLD=0.5`
+tends to over-shard on short conversational audio (you may see 6-10 speakers
+where there were really 2-3). Either:
+
+  * If you know the speaker count, set `NUM_SPEAKERS=2` (or 3, etc.) before
+    `./run.sh start` — gives clean, exact labels.
+  * Or set `OPENAI_BATCH_DIARIZE=0` to skip diarization entirely (single
+    `speaker_0` placeholder, ~1s instead of ~4s).
+  * Or run `./run.sh transcribe FILE` for richer output: same diarization
+    plus an LLM pass that maps `speaker_0/1/...` to the actual people's
+    names by reading conversational cues.
 
 ### 3. Summary / Intelligence (LM Studio)
 
@@ -265,9 +277,10 @@ All knobs are env vars; defaults are sensible.
 | `LLM_URL` | `http://127.0.0.1:1234/v1/chat/completions` | full chat endpoint URL |
 | `LLM_MAX_TOKENS` | `4096` | upper bound for summary completion |
 | `ASR_URL` | `http://127.0.0.1:8000/v1/listen` | URL `transcribe_file.py` posts to when `--asr-backend whisper` |
-| `DIARIZE` | `1` | set `0` to disable diarization by default |
+| `DIARIZE` | `1` | set `0` to disable diarization by default in `transcribe_file.py` |
+| `OPENAI_BATCH_DIARIZE` | `1` | set `0` to skip diarization in `POST /v1/audio/transcriptions` (Char's Generate flow) |
 | `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if known |
-| `CLUSTER_THRESHOLD` | `0.5` | sherpa-onnx fast-clustering threshold |
+| `CLUSTER_THRESHOLD` | `0.5` | sherpa-onnx fast-clustering threshold (raise to merge speakers, lower to split) |
 | `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_scribe/transcripts` | where the transcript cache lives |
 | `DIARIZATION_CACHE_DIR` | `~/.cache/local_scribe/diarization` | where sherpa-onnx model files live |
 | `PYTHON` | `python3.14` else `python3.12` else `python3` | which interpreter `run.sh` uses to build the venv |
@@ -356,8 +369,10 @@ locally-configured ASR), `language` (optional ISO-639-1 hint), `response_format`
 `temperature`, `prompt`, `timestamp_granularities[]`, and `stream` are accepted
 and silently ignored.
 
-`diarized_json` returns segments labelled with a single anonymous `speaker_0`
-— for real multi-speaker diarization use `./run.sh transcribe FILE`.
+`diarized_json` runs real sherpa-onnx speaker diarization by default and
+returns segments labelled `speaker_0`, `speaker_1`, ... in encounter order.
+Disable with `OPENAI_BATCH_DIARIZE=0` to skip it (~3-4s faster). Tune speaker
+count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ### `GET /health`
 
@@ -409,8 +424,14 @@ Char's *Custom* provider is Deepgram-only and routes **live** recording only.
 File imports use whichever provider you've configured under the "Batch Only"
 list. Configure **OpenAI** (Configure Providers → OpenAI → Advanced → Base URL)
 to `http://127.0.0.1:8000/v1` with any non-empty API key. After that, every
-"Generate" click hits this server. Verify with `tail -f .run/asr_server.log`
-— you'll see `[openai <id>] received N bytes` lines.
+"Generate" click hits this server. Verify with `./run.sh logs` — you'll see
+`[openai <id>] received N bytes ... done in X.XXs (asr=, diar=, speakers=N)`.
+
+**Char shows way too many speakers in Generate output.**
+sherpa-onnx with default `CLUSTER_THRESHOLD=0.5` over-shards on short
+conversational audio. Set `NUM_SPEAKERS=2` (or your known count) before
+`./run.sh start` for exact, clean labels. Or `OPENAI_BATCH_DIARIZE=0` to
+skip diarization entirely if you don't need speaker labels.
 
 **LLM completes immediately with 0 tokens.**
 LM Studio silently rejects prompts that exceed the loaded context length. The

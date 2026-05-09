@@ -426,6 +426,115 @@ _LANG_CODE_TO_NAME = {
 _OPENAI_VALID_FORMATS = {"json", "text", "srt", "verbose_json", "vtt", "diarized_json"}
 
 
+# When response_format=diarized_json, run real sherpa-onnx diarization (defaults
+# on) and label each segment with its speaker. Set OPENAI_BATCH_DIARIZE=0 to
+# return a single anonymous speaker for ~8x lower latency.
+_OPENAI_BATCH_DIARIZE = os.getenv("OPENAI_BATCH_DIARIZE", "1").strip().lower() not in {
+    "0", "false", "no", "off", "",
+}
+_NUM_SPEAKERS = int(os.getenv("NUM_SPEAKERS") or 0) or None
+_CLUSTER_THRESHOLD = float(os.getenv("CLUSTER_THRESHOLD") or 0.5)
+
+
+def _attach_speakers_to_words(
+    audio_path: str,
+    words: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Run sherpa-onnx diarization on `audio_path` and attach a speaker
+    label to each word. Returns (words_with_speaker, num_speakers).
+
+    On any failure (model load issue, audio decode failure, etc.) we
+    log and fall back to a single anonymous speaker so Char's parser
+    still gets a valid response.
+    """
+    if not _OPENAI_BATCH_DIARIZE or not words:
+        return [dict(w, speaker="speaker_0") for w in words], 1
+    try:
+        import diarization_backend as dz
+
+        turns = dz.diarize(
+            Path(audio_path),
+            num_clusters=_NUM_SPEAKERS,
+            cluster_threshold=_CLUSTER_THRESHOLD,
+        )
+        if not turns:
+            return [dict(w, speaker="speaker_0") for w in words], 1
+        diarized = dz.attach_speaker_to_words(words, turns)
+        # Normalise sherpa-onnx labels (SPEAKER_03, SPEAKER_11, ...) to a
+        # dense, lowercase, zero-indexed sequence (speaker_0, speaker_1, ...)
+        # in encounter order, which is what Char's UI displays.
+        order: list[str] = []
+        for w in diarized:
+            label = w.get("speaker") or "SPEAKER_00"
+            if label not in order:
+                order.append(label)
+        remap = {label: f"speaker_{i}" for i, label in enumerate(order)}
+        return (
+            [dict(w, speaker=remap[w.get("speaker") or "SPEAKER_00"]) for w in diarized],
+            len(order),
+        )
+    except Exception:
+        logger.exception("diarization failed; falling back to single speaker")
+        return [dict(w, speaker="speaker_0") for w in words], 1
+
+
+def _build_diarized_segments(
+    words: list[dict[str, Any]],
+    fallback_text: str,
+) -> list[dict[str, Any]]:
+    """Group consecutive same-speaker words into segments, breaking on
+    speaker changes too. Each emitted segment carries the speaker label.
+
+    Sentence-final punctuation and the same ~12s/30-word caps from the
+    plain-text segment grouper still apply, so a single speaker's long
+    monologue gets reasonable boundaries.
+    """
+    if not words:
+        if fallback_text:
+            return [{"start": 0.0, "end": 0.0, "text": fallback_text,
+                     "speaker": "speaker_0"}]
+        return []
+
+    segments: list[dict[str, Any]] = []
+    bucket: list[dict[str, Any]] = []
+    sentence_end = (".", "?", "!")
+    max_duration = 12.0
+    max_words = 30
+
+    def flush() -> None:
+        if not bucket:
+            return
+        text = " ".join((w.get("punctuated_word") or w.get("word") or "").strip()
+                        for w in bucket).strip()
+        if text:
+            segments.append({
+                "start": round(float(bucket[0]["start"]), 3),
+                "end": round(float(bucket[-1]["end"]), 3),
+                "text": text,
+                "speaker": bucket[0].get("speaker") or "speaker_0",
+            })
+        bucket.clear()
+
+    for w in words:
+        speaker_changed = bool(bucket) and (
+            (w.get("speaker") or "speaker_0") != (bucket[0].get("speaker") or "speaker_0")
+        )
+        if speaker_changed:
+            flush()
+        bucket.append(w)
+        token = (w.get("punctuated_word") or w.get("word") or "").strip()
+        last_char = token[-1:] if token else ""
+        elapsed = float(bucket[-1]["end"]) - float(bucket[0]["start"])
+        if last_char in sentence_end or elapsed >= max_duration or len(bucket) >= max_words:
+            flush()
+    flush()
+
+    if not segments and fallback_text:
+        return [{"start": 0.0, "end": 0.0, "text": fallback_text,
+                 "speaker": "speaker_0"}]
+    return segments
+
+
 def _build_openai_segments(
     words: list[dict[str, Any]],
     fallback_text: str,
@@ -574,12 +683,16 @@ def _openai_transcription_response(
 
     if fmt == "diarized_json":
         # Char's default OpenAI batch model is gpt-4o-transcribe-diarize, which
-        # expects `segments[*].speaker` as a string label. We don't run real
-        # diarization here (that's transcribe_file.py's job, with sherpa-onnx);
-        # instead we emit a single anonymous speaker so Char can still render
-        # the transcript without crashing its parser. If you want real speaker
-        # labels, run: ./run.sh transcribe FILE
-        segments = _build_openai_segments(words, transcript)
+        # expects `segments[*].speaker` as a string label. We honour real
+        # diarization here when each word has a `speaker` field attached
+        # (the endpoint runs sherpa-onnx before calling us); otherwise we
+        # fall back to a single anonymous speaker so Char's parser still
+        # gets a valid response.
+        if any(w.get("speaker") for w in words):
+            segments = _build_diarized_segments(words, transcript)
+        else:
+            segments = [dict(s, speaker="speaker_0")
+                        for s in _build_openai_segments(words, transcript)]
         return {
             "task": "transcribe",
             "duration": round(float(duration), 3),
@@ -587,7 +700,7 @@ def _openai_transcription_response(
             "segments": [
                 {
                     "id": f"seg_{i}",
-                    "speaker": "speaker_0",
+                    "speaker": seg["speaker"],
                     "start": seg["start"],
                     "end": seg["end"],
                     "text": seg["text"],
@@ -695,11 +808,29 @@ async def openai_audio_transcriptions(request: Request):
                 status_code=500,
             )
 
+        asr_done = time.time() - started
+        num_speakers = 0
+        if response_format == "diarized_json" and _OPENAI_BATCH_DIARIZE and words:
+            logger.info(
+                "[openai %s] running diarization (sherpa-onnx) ...", request_id,
+            )
+            words, num_speakers = await asyncio.to_thread(
+                _attach_speakers_to_words, tmp.name, words,
+            )
+
     elapsed = time.time() - started
-    logger.info(
-        "[openai %s] done in %.2fs, %d chars, lang=%s, format=%s",
-        request_id, elapsed, len(transcript or ""), lang, response_format,
-    )
+    if num_speakers:
+        logger.info(
+            "[openai %s] done in %.2fs (asr=%.2fs, diar=%.2fs, "
+            "speakers=%d), %d chars, lang=%s, format=%s",
+            request_id, elapsed, asr_done, elapsed - asr_done,
+            num_speakers, len(transcript or ""), lang, response_format,
+        )
+    else:
+        logger.info(
+            "[openai %s] done in %.2fs, %d chars, lang=%s, format=%s",
+            request_id, elapsed, len(transcript or ""), lang, response_format,
+        )
 
     return _openai_transcription_response(
         transcript=transcript or "",

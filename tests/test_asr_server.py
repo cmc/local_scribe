@@ -140,6 +140,115 @@ class BuildOpenAISegmentsTests(unittest.TestCase):
         self.assertEqual(segs[0]["text"], "ok now")
 
 
+class BuildDiarizedSegmentsTests(unittest.TestCase):
+    def test_breaks_at_speaker_change(self):
+        words = [
+            {"punctuated_word": "Hi", "start": 0.0, "end": 0.3, "speaker": "speaker_0"},
+            {"punctuated_word": "there", "start": 0.4, "end": 0.7, "speaker": "speaker_0"},
+            {"punctuated_word": "Hello", "start": 0.8, "end": 1.1, "speaker": "speaker_1"},
+            {"punctuated_word": "back", "start": 1.2, "end": 1.5, "speaker": "speaker_1"},
+        ]
+        segs = asr_server._build_diarized_segments(words, "")
+        self.assertEqual(len(segs), 2)
+        self.assertEqual(segs[0]["speaker"], "speaker_0")
+        self.assertEqual(segs[0]["text"], "Hi there")
+        self.assertEqual(segs[1]["speaker"], "speaker_1")
+        self.assertEqual(segs[1]["text"], "Hello back")
+
+    def test_speaker_change_takes_priority_over_punctuation(self):
+        words = [
+            {"punctuated_word": "Yes", "start": 0.0, "end": 0.3, "speaker": "speaker_0"},
+            {"punctuated_word": "indeed", "start": 0.4, "end": 0.8, "speaker": "speaker_1"},
+        ]
+        segs = asr_server._build_diarized_segments(words, "")
+        self.assertEqual([s["speaker"] for s in segs], ["speaker_0", "speaker_1"])
+
+    def test_same_speaker_long_run_still_splits_at_caps(self):
+        words = [
+            {"punctuated_word": "word", "start": float(i) * 0.5,
+             "end": float(i) * 0.5 + 0.4, "speaker": "speaker_0"}
+            for i in range(50)
+        ]
+        segs = asr_server._build_diarized_segments(words, "")
+        self.assertGreater(len(segs), 1)
+        for seg in segs:
+            self.assertEqual(seg["speaker"], "speaker_0")
+
+    def test_empty_words_with_fallback(self):
+        segs = asr_server._build_diarized_segments([], "fallback")
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0]["speaker"], "speaker_0")
+        self.assertEqual(segs[0]["text"], "fallback")
+
+
+class AttachSpeakersTests(unittest.TestCase):
+    """Exercise the diarization-attach helper in isolation. We patch
+    diarization_backend at use-site so this stays hermetic."""
+
+    def setUp(self):
+        # Force the env-var gate ON for these tests regardless of how the
+        # process was started.
+        self._orig = asr_server._OPENAI_BATCH_DIARIZE
+        asr_server._OPENAI_BATCH_DIARIZE = True
+        self.addCleanup(lambda: setattr(asr_server, "_OPENAI_BATCH_DIARIZE", self._orig))
+
+    def test_disabled_returns_speaker_0_for_all(self):
+        asr_server._OPENAI_BATCH_DIARIZE = False
+        out, n = asr_server._attach_speakers_to_words("/nope.wav", CANNED_WORDS)
+        self.assertEqual(n, 1)
+        self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
+
+    def test_empty_words_short_circuits(self):
+        out, n = asr_server._attach_speakers_to_words("/nope.wav", [])
+        self.assertEqual((out, n), ([], 1))
+
+    def test_remaps_sherpa_labels_to_dense_speaker_n(self):
+        # sherpa-onnx returns labels like SPEAKER_03, SPEAKER_11 — we should
+        # collapse those to a dense speaker_0/speaker_1 in encounter order.
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_03", "start": 0.0, "end": 0.7},
+            {"speaker": "SPEAKER_11", "start": 0.8, "end": 2.5},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(CANNED_WORDS[0], speaker="SPEAKER_03"),
+            dict(CANNED_WORDS[1], speaker="SPEAKER_03"),
+            dict(CANNED_WORDS[2], speaker="SPEAKER_11"),
+            dict(CANNED_WORDS[3], speaker="SPEAKER_11"),
+            dict(CANNED_WORDS[4], speaker="SPEAKER_11"),
+            dict(CANNED_WORDS[5], speaker="SPEAKER_11"),
+        ]
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS,
+            )
+        self.assertEqual(n, 2)
+        speakers = [w["speaker"] for w in out]
+        self.assertEqual(speakers,
+                         ["speaker_0", "speaker_0",
+                          "speaker_1", "speaker_1", "speaker_1", "speaker_1"])
+
+    def test_no_turns_falls_back_to_single_speaker(self):
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = []
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS,
+            )
+        self.assertEqual(n, 1)
+        self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
+
+    def test_diarization_exception_falls_back_to_single_speaker(self):
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.side_effect = RuntimeError("sherpa exploded")
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS,
+            )
+        self.assertEqual(n, 1)
+        self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
+
+
 class TimestampFormatTests(unittest.TestCase):
     def test_srt_timestamp_uses_comma_decimal(self):
         self.assertEqual(asr_server._srt_timestamp(0.0), "00:00:00,000")
@@ -224,6 +333,7 @@ class OpenAITranscriptionResponseTests(unittest.TestCase):
     def test_diarized_json_shape_matches_char_contract(self):
         # Char's CreateTranscriptionResponse::Diarized parser expects:
         #   { duration, task, text, segments[*].{id, speaker, start, end, text, type} }
+        # No speakers attached to words -> placeholder speaker_0 fallback.
         result = self._build("diarized_json")
         self.assertEqual(result["task"], "transcribe")
         self.assertEqual(result["text"], CANNED_TRANSCRIPT)
@@ -235,6 +345,34 @@ class OpenAITranscriptionResponseTests(unittest.TestCase):
             self.assertTrue(seg["id"].startswith("seg_"))
             self.assertEqual(seg["speaker"], "speaker_0")
             self.assertEqual(seg["type"], "transcript.text.segment")
+
+    def test_diarized_json_uses_real_speaker_labels_when_attached(self):
+        # When words already carry a `speaker` field (because the endpoint ran
+        # sherpa-onnx beforehand), the diarized_json shaper must respect it
+        # and split segments at speaker boundaries.
+        words = [
+            dict(CANNED_WORDS[0], speaker="speaker_0"),
+            dict(CANNED_WORDS[1], speaker="speaker_0"),
+            dict(CANNED_WORDS[2], speaker="speaker_1"),
+            dict(CANNED_WORDS[3], speaker="speaker_1"),
+            dict(CANNED_WORDS[4], speaker="speaker_1"),
+            dict(CANNED_WORDS[5], speaker="speaker_1"),
+        ]
+        result = asr_server._openai_transcription_response(
+            transcript=CANNED_TRANSCRIPT,
+            words=words,
+            language=CANNED_LANG,
+            duration=CANNED_DURATION,
+            response_format="diarized_json",
+        )
+        speakers = [seg["speaker"] for seg in result["segments"]]
+        self.assertIn("speaker_0", speakers)
+        self.assertIn("speaker_1", speakers)
+        # Segment with speaker_0 must contain only the first sentence
+        s0 = next(s for s in result["segments"] if s["speaker"] == "speaker_0")
+        self.assertEqual(s0["text"], "Hello world.")
+        s1 = next(s for s in result["segments"] if s["speaker"] == "speaker_1")
+        self.assertEqual(s1["text"], "This is a test.")
 
     def test_srt_returns_subrip_response(self):
         result = self._build("srt")
@@ -305,8 +443,10 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
 
     def test_chars_default_diarized_json_shape(self):
         # The exact shape Char sends when the user clicks Generate with the
-        # default OpenAI batch model gpt-4o-transcribe-diarize.
-        resp = self._post(response_format="diarized_json")
+        # default OpenAI batch model gpt-4o-transcribe-diarize. With diarization
+        # disabled we still must produce a valid response with placeholder labels.
+        with mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", False):
+            resp = self._post(response_format="diarized_json")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(body["task"], "transcribe")
@@ -316,6 +456,58 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         self.assertEqual(first["speaker"], "speaker_0")
         self.assertEqual(first["type"], "transcript.text.segment")
         self.assertTrue(first["id"].startswith("seg_"))
+
+    def test_diarized_json_with_real_diarization_emits_multiple_speakers(self):
+        # End-to-end: fake sherpa-onnx returns two speaker turns, the endpoint
+        # must run diarization, attach labels, and the response segments must
+        # split at the speaker boundary.
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.10},
+            {"speaker": "SPEAKER_01", "start": 1.20, "end": 2.30},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(CANNED_WORDS[0], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[1], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[2], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[3], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[4], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[5], speaker="SPEAKER_01"),
+        ]
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
+             mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", True):
+            resp = self._post(response_format="diarized_json")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        speakers = sorted({s["speaker"] for s in body["segments"]})
+        self.assertEqual(speakers, ["speaker_0", "speaker_1"])
+        self.assertEqual(fake_dz.diarize.call_count, 1,
+                         "sherpa-onnx diarize() should run exactly once")
+
+    def test_diarized_json_skips_diarization_when_env_disabled(self):
+        # With OPENAI_BATCH_DIARIZE off, diarization_backend.diarize MUST NOT
+        # be invoked — keeps the latency promise honest.
+        fake_dz = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
+             mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", False):
+            resp = self._post(response_format="diarized_json")
+        self.assertEqual(resp.status_code, 200)
+        fake_dz.diarize.assert_not_called()
+        body = resp.json()
+        self.assertTrue(all(s["speaker"] == "speaker_0" for s in body["segments"]))
+
+    def test_diarization_failure_does_not_break_endpoint(self):
+        # If sherpa-onnx blows up mid-Generate, the endpoint should still
+        # return a valid diarized_json response with placeholder labels —
+        # never a 500. This is the safety net Char relies on.
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.side_effect = RuntimeError("sherpa-onnx model missing")
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
+             mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", True):
+            resp = self._post(response_format="diarized_json")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(all(s["speaker"] == "speaker_0" for s in body["segments"]))
 
     def test_verbose_json_shape(self):
         resp = self._post(response_format="verbose_json")
