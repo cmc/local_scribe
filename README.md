@@ -41,6 +41,124 @@ once the models are downloaded.
        └──────────────────────────────────┘
 ```
 
+## Privacy and data locality
+
+The whole reason this stack exists: every recording, transcript, and
+summary lives only on your laptop's disk, processed by models that run
+locally on Apple Silicon. There is no "send-to-cloud" toggle hiding
+somewhere that could flip on. Once `bootstrap` finishes pulling code
+and models, you can disable Wi-Fi and the pipeline keeps working.
+
+### What stays local
+
+| asset | path | written by |
+|---|---|---|
+| Audio recording | `~/Library/Application Support/hyprnote/sessions/<uuid>/audio.mp3` | Char.app |
+| Transcript JSON (words, speaker hints) | `~/Library/Application Support/hyprnote/sessions/<uuid>/transcript.json` | Char.app, populated from our `/v1/audio/transcriptions` response |
+| Generated note / summary (markdown) | `~/Library/Application Support/hyprnote/sessions/<uuid>/<TemplateName>.md` | Char.app, populated from the local LM Studio response |
+| Char's session catalog | `~/Library/Application Support/hyprnote/app.db` (SQLite) | Char.app |
+| Char settings (auto-config patches go here) | `~/Library/Application Support/hyprnote/settings.json` (+ `.bak.<ts>`) | Char.app + `./run.sh configure-char` |
+| Local-scribe transcript cache (sha256→result) | `~/.cache/local_scribe/transcripts/` | `transcribe_file.py` |
+| Diarization ONNX models | `~/.cache/local_scribe/diarization/` | `./run.sh bootstrap` |
+| Parakeet ASR weights (MLX) | `~/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/` | `./run.sh bootstrap` (HuggingFace `snapshot_download`) |
+| Qwen LLM weights (MLX) | `~/.cache/lm-studio/models/` | `lms get` (LM Studio.app) |
+| Backed-up real OpenAI keys (if you had one in Char) | `~/.config/local_scribe/char-openai-key.<ts>.txt` (chmod 600) | `./run.sh configure-char` |
+
+`local_scribe` never uploads any of this. The repo's
+[`.gitignore`](.gitignore) explicitly excludes every audio extension we
+know about (`.mp3`, `.m4a`, `.wav`, `.ogg`, `.flac`, `.aac`, `.opus`,
+`.aiff`, `.webm`, `.mp4`, `.mov`, `.mkv`) and every transcript /
+summary / diarized output (`*.transcript.{json,txt,md}`,
+`*.summary.{md,txt}`, `*.diarized.{txt,md}`, `out/`, `outputs/`), so
+accidentally `git add`'ing audio or notes from this repo just doesn't
+work.
+
+### What crosses the network — and when
+
+Two clearly separated lifecycles. **At install / bootstrap time**, code
+and models are downloaded one-shot:
+
+| URL | what's fetched | when |
+|---|---|---|
+| `pypi.org` (+ wheel mirrors) | Python deps from `requirements.txt` | step (1/5) of `./run.sh bootstrap` |
+| `huggingface.co` | Parakeet 0.6B v3 MLX weights (≈1.2 GB) | step (2/5) |
+| `github.com/k2-fsa/sherpa-onnx/releases/...` | sherpa-onnx pyannote 3.0 + TitaNet ONNX bundles (≈45 MB) | step (3/5) |
+| `formulae.brew.sh` + Homebrew artifact mirrors | LM Studio.app cask | step (4/5), only if `/Applications/LM Studio.app` is missing |
+| LM Studio's model hub (HF mirror) | Qwen3 MLX weights (≈32 GB or ≈2.3 GB depending on RAM) | step (4/5), only if missing locally and you confirm the y/N prompt |
+| `github.com/fastrepl/anarlog/releases/...` | pinned Char.app DMG | step (5/5), only if Char isn't installed (or you confirm replace) |
+
+After bootstrap is done these URLs are never hit again unless you re-run
+bootstrap, `setup`, `install-char`, or `install-llm`.
+
+**At runtime** (every recording, every Generate click, every summary),
+the entire data plane is loopback:
+
+| URL | role | what's transmitted |
+|---|---|---|
+| `http://127.0.0.1:8000/...` | our ASR server (Char's transcription endpoint) | audio in, transcript out |
+| `http://127.0.0.1:1234/v1/chat/completions` | LM Studio (running on this Mac) | transcript in, summary out |
+
+That's it. No `api.openai.com`, no `api.deepgram.com`, no
+`*.amazonaws.com`, no `*.googleusercontent.com`. You can verify any
+time mid-call:
+
+```bash
+lsof -nP -i -P | grep -E 'asr_server|LM Studio|Char'
+```
+
+…and confirm only `127.0.0.1` connections appear. See
+[§ How the integration works](#how-the-integration-works-aka-the-hack)
+for why Char ends up on `127.0.0.1` despite thinking it's calling
+OpenAI's Whisper API and Deepgram.
+
+### What you still have to trust
+
+Being honest about the parts of the stack that aren't ours:
+
+- **LM Studio.app is closed-source.** It collects basic usage analytics
+  by default (app-level metadata; you can opt out under Settings →
+  Telemetry). The Qwen3 model itself runs entirely locally; LM Studio
+  doesn't transmit your chat content. Disabling LM Studio's telemetry
+  by default at bootstrap is on the [TODO](TODO.md).
+- **Char.app is open source** ([source](https://github.com/fastrepl/anarlog),
+  MIT-licensed). Read or audit it directly. Calendar/event sync (if you
+  connect a calendar) does talk to your calendar provider — that's
+  orthogonal to recordings, but worth knowing.
+- **`asr_server.py` currently binds to `0.0.0.0:8000`**, not
+  `127.0.0.1:8000`. macOS's firewall blocks incoming connections by
+  default, but if you've allowed Python through the firewall and you're
+  on a public Wi-Fi, in principle a peer on the same network could hit
+  the endpoint. Tightening the default bind to loopback (with an
+  explicit `BIND_ALL=1` opt-in for "I want this reachable from another
+  machine on my LAN") is a [TODO.md](TODO.md) item — meanwhile, run on
+  trusted networks or behind a firewall.
+- **macOS Spotlight indexes audio files** by default. To exclude Char's
+  session directory:
+  ```bash
+  mdutil -i off "$HOME/Library/Application Support/hyprnote"
+  ```
+- **iCloud Drive sync** of `~/Library/Application Support/` is off by
+  default but if you've enabled Optimize Mac Storage / iCloud Drive →
+  Library, your recordings will sync. Check **System Settings → Apple
+  ID → iCloud → iCloud Drive → "Library"**.
+- **Time Machine snapshots** include the session directory by default.
+  Your call recordings end up in your local backups too — usually what
+  you want for safety, but it does mean they exist in more than one
+  place on disk.
+
+### Air-gap mode
+
+Once `./run.sh bootstrap` reports success and `./run.sh doctor` is all
+green, you can disable Wi-Fi + Bluetooth and the pipeline keeps working
+indefinitely: live recording, batch Generate, summaries, all of it.
+Bootstrap downloads are the only network dependency.
+
+### Future privacy work
+
+See [TODO.md](TODO.md) for planned hardening — encrypting audio +
+transcripts at rest with a Keychain-backed key, age-based auto-purge,
+a `./run.sh wipe` command, and tightening loopback-only binding.
+
 ## What's in here
 
 | | what | role |
