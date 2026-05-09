@@ -1,11 +1,26 @@
 """
-local_scribe - Deepgram-compatible ASR server.
+local_scribe - Local ASR server speaking both Deepgram's and OpenAI's
+batch transcription contracts, so Char's Live recording (Custom Deepgram URL)
+*and* its file-import "Generate" flow (OpenAI Batch Only provider) both route
+through the same on-device Parakeet/Whisper engine.
 
-Implements the two pieces of Deepgram's /v1/listen contract that real clients
-(including Char with BYOK Deepgram + a custom base URL) actually use:
+Endpoints:
 
-  * POST  /v1/listen   - batch transcription with raw audio in the request body
-  * WS    /v1/listen   - streaming transcription over WebSocket (linear16 PCM)
+  * POST  /v1/listen                 - Deepgram batch (raw audio body or multipart)
+                                       used by Char's Live recording when the
+                                       "Custom" provider points at this server.
+  * POST  /v1/listen/stream          - same as /v1/listen but streams NDJSON
+                                       progress events (a transcribe_file.py
+                                       extension; not part of the Deepgram spec).
+  * WS    /v1/listen                 - Deepgram WebSocket streaming (linear16 PCM)
+                                       same as POST /v1/listen but over WS.
+  * POST  /v1/audio/transcriptions   - OpenAI Whisper-API batch (multipart form),
+                                       used by Char's "OpenAI (Batch Only)"
+                                       provider when configured with
+                                       Base URL = http://127.0.0.1:8000/v1.
+                                       Honours response_format = diarized_json
+                                       | verbose_json | json | text | srt | vtt.
+  * GET   /health                    - liveness/readiness probe with backend info.
 
 Two ASR backends are pluggable via ASR_BACKEND:
 
@@ -16,13 +31,20 @@ Two ASR backends are pluggable via ASR_BACKEND:
 
 Char setup
 ----------
-Tell Char to send transcription traffic to this server instead of Deepgram:
+In Char.app -> Settings -> Transcription, configure the providers you want to
+route through this server.
 
-    export CHAR_BASE_URL="http://127.0.0.1:8000"
-    export CHAR_API_KEY="local"   # any non-empty string; we ignore auth locally
+  * Live recording  -> "Custom" provider, Base URL http://127.0.0.1:8000,
+                       any non-empty API key (we ignore auth locally).
+                       (Char only supports Deepgram-compatible endpoints
+                       for its Custom provider, which is exactly what we are.)
 
-In the desktop app: Settings -> Transcription -> BYOK Deepgram, paste any key,
-and (if available) set the base URL to http://127.0.0.1:8000.
+  * Generate from   -> "OpenAI (Batch Only)" provider, Advanced -> Base URL
+    existing audio     http://127.0.0.1:8000/v1, any non-empty API key. Char
+                       defaults to model gpt-4o-transcribe-diarize with
+                       response_format=diarized_json; we honour that and
+                       return a single anonymous speaker (use
+                       transcribe_file.py for real multi-speaker diarization).
 
 Run
 ---
@@ -60,9 +82,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+# NOTE: starlette's UploadFile (not fastapi's). request.form() yields starlette
+# UploadFile instances, and fastapi.UploadFile is a subclass — so an isinstance
+# check against fastapi.UploadFile silently rejects all uploads. Always use
+# starlette's class for runtime checks.
+from starlette.datastructures import UploadFile
 
 logger = logging.getLogger("local_scribe")
 logging.basicConfig(
@@ -138,7 +165,7 @@ _mlx_executor.submit(lambda: None).result()
 
 logger.info("model ready (backend=%s, model=%s)", ASR_BACKEND, MODEL_NAME)
 
-app = FastAPI(title="local-scribe-asr", version="0.3.0")
+app = FastAPI(title="local-scribe-asr", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -373,6 +400,316 @@ def _deepgram_batch_response(
     }
 
 
+# ---------------------------------------------------------------------------
+# OpenAI Whisper-API compatibility (POST /v1/audio/transcriptions)
+#
+# Char's "OpenAI (Batch Only)" provider posts here when its Advanced -> Base URL
+# is set to http://127.0.0.1:8000/v1. Char's open-source client lives at
+# fastrepl/anarlog and shows the wire contract we need to honour:
+# multipart form `file` + `model` + `response_format` + optional `language`.
+# Default model is gpt-4o-transcribe-diarize -> response_format=diarized_json.
+# ---------------------------------------------------------------------------
+
+# Subset of ISO-639-1 -> English name. OpenAI's verbose_json returns the full
+# English name, not the code, and Char parses the field as an opaque string,
+# so we cover the common cases and fall through to the raw code otherwise.
+_LANG_CODE_TO_NAME = {
+    "en": "english", "es": "spanish", "fr": "french", "de": "german",
+    "it": "italian", "pt": "portuguese", "nl": "dutch", "ru": "russian",
+    "ja": "japanese", "zh": "chinese", "ko": "korean", "ar": "arabic",
+    "hi": "hindi", "tr": "turkish", "pl": "polish", "sv": "swedish",
+    "no": "norwegian", "da": "danish", "fi": "finnish", "el": "greek",
+    "he": "hebrew", "id": "indonesian", "th": "thai", "vi": "vietnamese",
+    "uk": "ukrainian", "cs": "czech", "ro": "romanian", "hu": "hungarian",
+}
+
+_OPENAI_VALID_FORMATS = {"json", "text", "srt", "verbose_json", "vtt", "diarized_json"}
+
+
+def _build_openai_segments(
+    words: list[dict[str, Any]],
+    fallback_text: str,
+) -> list[dict[str, Any]]:
+    """Group ASR words into OpenAI-style transcription segments.
+
+    Char's diarized_json parser expects per-segment {start, end, text}; we
+    chunk at sentence-final punctuation and cap segments at ~12s / 30 words
+    so very long monologues still get reasonable boundaries.
+    """
+    if not words:
+        if fallback_text:
+            return [{"start": 0.0, "end": 0.0, "text": fallback_text}]
+        return []
+
+    segments: list[dict[str, Any]] = []
+    bucket: list[dict[str, Any]] = []
+    sentence_end = (".", "?", "!")
+    max_duration = 12.0
+    max_words = 30
+
+    def flush() -> None:
+        if not bucket:
+            return
+        text = " ".join((w.get("punctuated_word") or w.get("word") or "").strip()
+                        for w in bucket).strip()
+        if text:
+            segments.append({
+                "start": round(float(bucket[0]["start"]), 3),
+                "end": round(float(bucket[-1]["end"]), 3),
+                "text": text,
+            })
+        bucket.clear()
+
+    for w in words:
+        bucket.append(w)
+        token = (w.get("punctuated_word") or w.get("word") or "").strip()
+        last_char = token[-1:] if token else ""
+        elapsed = float(bucket[-1]["end"]) - float(bucket[0]["start"])
+        if last_char in sentence_end or elapsed >= max_duration or len(bucket) >= max_words:
+            flush()
+    flush()
+
+    if not segments and fallback_text:
+        return [{"start": 0.0, "end": 0.0, "text": fallback_text}]
+    return segments
+
+
+def _srt_timestamp(t: float) -> str:
+    t = max(0.0, float(t))
+    h, rem = divmod(t, 3600.0)
+    m, s = divmod(rem, 60.0)
+    return f"{int(h):02d}:{int(m):02d}:{s:06.3f}".replace(".", ",")
+
+
+def _vtt_timestamp(t: float) -> str:
+    t = max(0.0, float(t))
+    h, rem = divmod(t, 3600.0)
+    m, s = divmod(rem, 60.0)
+    return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+
+
+def _segments_to_srt(segments: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for i, seg in enumerate(segments, start=1):
+        lines.append(str(i))
+        lines.append(f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}")
+        lines.append(seg["text"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _segments_to_vtt(segments: list[dict[str, Any]]) -> str:
+    lines: list[str] = ["WEBVTT", ""]
+    for seg in segments:
+        lines.append(f"{_vtt_timestamp(seg['start'])} --> {_vtt_timestamp(seg['end'])}")
+        lines.append(seg["text"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _openai_transcription_response(
+    *,
+    transcript: str,
+    words: list[dict[str, Any]],
+    language: str | None,
+    duration: float,
+    response_format: str,
+):
+    """Shape ASR output into one of the OpenAI Whisper-API response formats.
+
+    Char's openai-transcription crate parses three JSON shapes via
+    `CreateTranscriptionResponse` (Standard / Verbose / Diarized); the strings
+    `text`, `srt` and `vtt` come back as plain bodies.
+    """
+    fmt = (response_format or "json").strip().lower()
+
+    if fmt == "text":
+        return PlainTextResponse(transcript or "")
+
+    if fmt == "srt":
+        segments = _build_openai_segments(words, transcript)
+        return PlainTextResponse(
+            _segments_to_srt(segments),
+            media_type="application/x-subrip",
+        )
+
+    if fmt == "vtt":
+        segments = _build_openai_segments(words, transcript)
+        return PlainTextResponse(
+            _segments_to_vtt(segments),
+            media_type="text/vtt",
+        )
+
+    if fmt == "verbose_json":
+        lang_code = (language or "").lower()
+        return {
+            "task": "transcribe",
+            "language": _LANG_CODE_TO_NAME.get(lang_code, lang_code or "english"),
+            "duration": round(float(duration), 3),
+            "text": transcript,
+            "words": [
+                {
+                    "word": (w.get("punctuated_word") or w.get("word") or "").strip(),
+                    "start": round(float(w["start"]), 3),
+                    "end": round(float(w["end"]), 3),
+                }
+                for w in words
+            ],
+            "segments": [
+                {
+                    "id": i,
+                    "seek": 0,
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": seg["text"],
+                    "tokens": [],
+                    "temperature": 0.0,
+                    "avg_logprob": 0.0,
+                    "compression_ratio": 1.0,
+                    "no_speech_prob": 0.0,
+                }
+                for i, seg in enumerate(_build_openai_segments(words, transcript))
+            ],
+        }
+
+    if fmt == "diarized_json":
+        # Char's default OpenAI batch model is gpt-4o-transcribe-diarize, which
+        # expects `segments[*].speaker` as a string label. We don't run real
+        # diarization here (that's transcribe_file.py's job, with sherpa-onnx);
+        # instead we emit a single anonymous speaker so Char can still render
+        # the transcript without crashing its parser. If you want real speaker
+        # labels, run: ./run.sh transcribe FILE
+        segments = _build_openai_segments(words, transcript)
+        return {
+            "task": "transcribe",
+            "duration": round(float(duration), 3),
+            "text": transcript,
+            "segments": [
+                {
+                    "id": f"seg_{i}",
+                    "speaker": "speaker_0",
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "text": seg["text"],
+                    "type": "transcript.text.segment",
+                }
+                for i, seg in enumerate(segments)
+            ],
+        }
+
+    return {"text": transcript}
+
+
+@app.post("/v1/audio/transcriptions")
+async def openai_audio_transcriptions(request: Request):
+    """OpenAI Whisper-API-compatible batch transcription.
+
+    Multipart form fields we honour:
+      * file (required)         - audio bytes (any format librosa decodes)
+      * model (optional)        - ignored; we always use ASR_BACKEND
+      * language (optional)     - ISO-639-1 hint passed to faster-whisper
+      * response_format         - json | text | srt | verbose_json | vtt | diarized_json
+                                  (default: json; Char defaults to diarized_json)
+      * temperature, prompt,
+        timestamp_granularities,
+        stream                  - silently ignored (we don't sample, prompt,
+                                  emit per-token granularity, or stream SSE
+                                  for this endpoint; transcribe_file.py and
+                                  /v1/listen/stream cover those use cases).
+
+    Auth: the Authorization: Bearer <key> header is accepted and ignored;
+    no key is required and any value works.
+    """
+    request_id = str(uuid.uuid4())
+    started = time.time()
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if not content_type.startswith("multipart/form-data"):
+        return JSONResponse(
+            {"error": {
+                "message": "Content-Type must be multipart/form-data",
+                "type": "invalid_request_error",
+                "code": "invalid_content_type",
+            }},
+            status_code=400,
+        )
+
+    form = await request.form()
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        return JSONResponse(
+            {"error": {
+                "message": "Missing required form field 'file'",
+                "type": "invalid_request_error",
+                "code": "missing_file",
+            }},
+            status_code=400,
+        )
+
+    audio_bytes = await upload.read()
+    if not audio_bytes:
+        return JSONResponse(
+            {"error": {
+                "message": "Empty 'file' upload",
+                "type": "invalid_request_error",
+                "code": "empty_file",
+            }},
+            status_code=400,
+        )
+
+    suffix = os.path.splitext(upload.filename or "audio")[1] or ".bin"
+    requested_model = (form.get("model") or "").strip()
+    response_format = (form.get("response_format") or "json").strip().lower()
+    if response_format not in _OPENAI_VALID_FORMATS:
+        return JSONResponse(
+            {"error": {
+                "message": (
+                    f"Unknown response_format '{response_format}'. "
+                    f"Expected one of: {sorted(_OPENAI_VALID_FORMATS)}"
+                ),
+                "type": "invalid_request_error",
+                "code": "invalid_response_format",
+            }},
+            status_code=400,
+        )
+
+    logger.info(
+        "[openai %s] received %d bytes (model=%r, response_format=%s, filename=%r)",
+        request_id, len(audio_bytes), requested_model or "<unset>",
+        response_format, upload.filename or "<unset>",
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        try:
+            transcript, words, lang, duration = await _run_asr_async(tmp.name)
+        except Exception as exc:
+            logger.exception("[openai %s] transcription failed", request_id)
+            return JSONResponse(
+                {"error": {
+                    "message": str(exc),
+                    "type": "internal_server_error",
+                    "code": "transcription_failed",
+                }},
+                status_code=500,
+            )
+
+    elapsed = time.time() - started
+    logger.info(
+        "[openai %s] done in %.2fs, %d chars, lang=%s, format=%s",
+        request_id, elapsed, len(transcript or ""), lang, response_format,
+    )
+
+    return _openai_transcription_response(
+        transcript=transcript or "",
+        words=words or [],
+        language=lang,
+        duration=duration,
+        response_format=response_format,
+    )
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {
@@ -383,6 +720,12 @@ async def health() -> dict[str, Any]:
         "compute_type": COMPUTE_TYPE if ASR_BACKEND == "whisper" else "mlx-bfloat16",
         "device": DEVICE if ASR_BACKEND == "whisper" else "mlx",
         "language": LANGUAGE or ("en" if ASR_BACKEND == "parakeet" else "auto"),
+        "endpoints": {
+            "deepgram_batch": "POST /v1/listen",
+            "deepgram_stream": "POST /v1/listen/stream",
+            "deepgram_ws": "WS /v1/listen",
+            "openai_batch": "POST /v1/audio/transcriptions",
+        },
     }
 
 

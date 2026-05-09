@@ -4,6 +4,10 @@
 # --- HTTP server (asr_server.py) ---
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.27,<1.0
+# python-multipart parses multipart/form-data uploads on
+# POST /v1/audio/transcriptions (OpenAI Whisper API contract used by Char's
+# "OpenAI (Batch Only)" provider) and the multipart fallback on /v1/listen.
+python-multipart>=0.0.9,<1.0
 
 # --- ASR backends ---
 # Parakeet TDT v3 (default, Apple-Silicon native via MLX)

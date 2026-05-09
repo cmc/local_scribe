@@ -14,24 +14,29 @@ once the models are downloaded.
 > backend that pairs with it — so the whole stack, app *and* models, is yours.
 
 ```
-                 ┌─────────────────────┐
-   live mic ─►   │       Char.app      │   call recording UI + auto-note
-                 └──────────┬──────────┘
-                            │ POST /v1/listen   (Deepgram contract)
-                            ▼
-       ┌──────────────────────────────────┐
-       │  asr_server.py   :8000           │
-       │  • Parakeet-TDT 0.6B v3 (MLX)    │  ← default; English; lowest WER
-       │  • faster-whisper large-v3-turbo │  ← optional; multilingual fallback
-       └──────────────┬───────────────────┘
-                      │ Deepgram JSON
-                      ▼
-                 Char ──► LM Studio :1234 ──► Qwen3-30B   summary in note UI
+                 ┌──────────────────────────────────────────────────────┐
+   live mic ─►   │                       Char.app                       │
+   audio file ─► │  (call UI, file imports, note canvas, summary view)  │
+                 └────┬───────────────────────────┬─────────────────────┘
+                      │ live recording            │ click "Generate"
+                      │ POST /v1/listen           │ POST /v1/audio/transcriptions
+                      │ (Deepgram contract,       │ (OpenAI Whisper API contract,
+                      │  Custom provider)         │  OpenAI Batch Only provider)
+                      ▼                           ▼
+       ┌────────────────────────────────────────────────────────────┐
+       │  asr_server.py   :8000                                     │
+       │    Parakeet-TDT 0.6B v3 (MLX)   default; English; lowest WER
+       │    faster-whisper large-v3-turbo  optional multilingual    │
+       └─────────────────────────────────┬──────────────────────────┘
+                                         │  transcript JSON
+                                         ▼
+                                 Char ──► LM Studio :1234 ──► Qwen3-30B
+                                          (summary in note UI)
 
        ┌──────────────────────────────────┐
        │  transcribe_file.py              │  manual one-shot CLI
        │  • cache by audio sha256         │   for files Char didn't auto-pick up
-       │  • optional speaker diarization  │   (sherpa-onnx + LLM speaker naming)
+       │  • real speaker diarization      │   (sherpa-onnx + LLM speaker naming)
        │  • streaming LLM summary         │
        └──────────────────────────────────┘
 ```
@@ -40,7 +45,7 @@ once the models are downloaded.
 
 | | what | role |
 |---|---|---|
-| `asr_server.py` | FastAPI service on `:8000`. Implements the bits of Deepgram's `/v1/listen` contract Char uses (POST batch + WebSocket streaming) and routes through Parakeet (default) or faster-whisper. | Char's transcription endpoint |
+| `asr_server.py` | FastAPI service on `:8000`. Speaks **two** transcription contracts so both of Char's flows work: Deepgram (`/v1/listen` POST + WebSocket) for live recording, and OpenAI Whisper (`/v1/audio/transcriptions`) for "Generate" on existing audio. Routes both through Parakeet (default) or faster-whisper. | Char's transcription endpoint |
 | `parakeet_backend.py` | parakeet-mlx wrapper. Merges sub-word BPE tokens into clean words, shapes output to Deepgram's word/timing schema. | Default ASR engine |
 | `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) + an LLM pass to map `SPEAKER_00/01/...` to real names. | Speaker labeling |
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
@@ -108,19 +113,51 @@ In the partial cases the message tells you exactly what to fix. Re-run
 
 ## Configure Char
 
-Once `./run.sh start` is green, in Char → Settings → Transcription:
+Char has **two separate transcription paths** and you'll want to point both
+at this server. Once `./run.sh start` is green, in Char → Settings → Transcription:
+
+### 1. Live recording (Custom provider)
+
+Used while Char is recording a meeting in real time.
 
 | field | value |
 |---|---|
 | **Model being used** | Custom (the `nova-2` string is decorative — this server ignores it) |
-| **Custom provider Base URL** | `http://127.0.0.1:8000` |
-| **API Key** | any non-empty string (auth is ignored locally) |
-| **Configure Providers** → Char Recommended → LLM | LM Studio @ `http://127.0.0.1:1234`, model `qwen3-30b-a3b-instruct-2507` |
+| **Configure Providers → Custom → Base URL** | `http://127.0.0.1:8000` |
+| **Configure Providers → Custom → API Key** | any non-empty string (auth is ignored locally) |
 
-After that, every call you record streams through Parakeet for transcription
-and Qwen for the note. Char's WebSocket streaming path also works out of the
-box (it's "batch over WebSocket" — final transcript only, no interim
-partials, since neither Parakeet nor faster-whisper streams natively).
+This routes Char's WebSocket streaming and batch live-audio path through our
+Deepgram-compatible `/v1/listen` endpoint. (It's "batch over WebSocket" — final
+transcript only, no interim partials, since neither Parakeet nor faster-whisper
+streams natively.)
+
+### 2. "Generate transcript" on existing audio (OpenAI Batch Only provider)
+
+Used when you click *Generate* on a note that already has audio. Char's
+*Custom* provider is **Deepgram-only** and only used for live recording —
+batch file imports go through whichever provider you pick from its "Batch
+Only" list. We expose an OpenAI Whisper API-compatible endpoint so you can
+point Char's bundled OpenAI provider at us.
+
+| field | value |
+|---|---|
+| **Configure Providers → OpenAI → API Key** | any non-empty string |
+| **Configure Providers → OpenAI → Advanced → Base URL** | `http://127.0.0.1:8000/v1` |
+
+Char defaults to model `gpt-4o-transcribe-diarize` with
+`response_format=diarized_json`; we honour that (single anonymous `speaker_0`
+for every segment — for real speaker labels use `./run.sh transcribe FILE`,
+which runs sherpa-onnx + LLM speaker-name inference). `verbose_json`, `json`,
+`text`, `srt`, and `vtt` are all supported too.
+
+### 3. Summary / Intelligence (LM Studio)
+
+| field | value |
+|---|---|
+| **Configure Providers → Char Recommended → LLM** | LM Studio @ `http://127.0.0.1:1234`, model `qwen3-30b-a3b-instruct-2507` |
+
+After this, every call you record (live) AND every audio file you import
+(Generate) routes through Parakeet, with Qwen producing the note.
 
 ## Daily usage
 
@@ -251,7 +288,7 @@ local_scribe/
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 84 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 116 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -299,6 +336,29 @@ on close/finalize and emits a single Deepgram `Results` message followed by
 `Metadata`. Note: this is "batch over WebSocket" — there are no interim
 partials, since neither Parakeet nor faster-whisper streams natively.
 
+### `POST /v1/audio/transcriptions` (OpenAI Whisper API)
+
+What Char hits when you click *Generate* on a note with existing audio
+(provider = OpenAI Batch Only, Base URL = `http://127.0.0.1:8000/v1`). Also
+works with the official `openai` Python SDK pointed at `base_url="http://127.0.0.1:8000/v1"`.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer any-non-empty-key" \
+  -F "file=@call.m4a" \
+  -F "model=gpt-4o-transcribe-diarize" \
+  -F "response_format=diarized_json"
+```
+
+Form fields honoured: `file` (required), `model` (ignored — we always run the
+locally-configured ASR), `language` (optional ISO-639-1 hint), `response_format`
+(one of `json` (default), `text`, `verbose_json`, `srt`, `vtt`, `diarized_json`).
+`temperature`, `prompt`, `timestamp_granularities[]`, and `stream` are accepted
+and silently ignored.
+
+`diarized_json` returns segments labelled with a single anonymous `speaker_0`
+— for real multi-speaker diarization use `./run.sh transcribe FILE`.
+
 ### `GET /health`
 
 ```json
@@ -309,7 +369,13 @@ partials, since neither Parakeet nor faster-whisper streams natively.
   "arch": "Parakeet-TDT",
   "compute_type": "mlx-bfloat16",
   "device": "mlx",
-  "language": "en"
+  "language": "en",
+  "endpoints": {
+    "deepgram_batch":  "POST /v1/listen",
+    "deepgram_stream": "POST /v1/listen/stream",
+    "deepgram_ws":     "WS /v1/listen",
+    "openai_batch":    "POST /v1/audio/transcriptions"
+  }
 }
 ```
 
@@ -317,7 +383,7 @@ partials, since neither Parakeet nor faster-whisper streams natively.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 84 tests, ~0.05s, no model loads
+venv/bin/python -m unittest discover -s tests   # 116 tests, ~0.05s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run
@@ -337,6 +403,14 @@ and download it. Then `./run.sh restart`.
 **Char shows `unauthorized`.**
 Char insists on a non-empty API key. Anything works — `local`, `dummy`, `x` —
 auth is ignored locally.
+
+**Click "Generate" in Char on an audio note → nothing happens / cloud egress.**
+Char's *Custom* provider is Deepgram-only and routes **live** recording only.
+File imports use whichever provider you've configured under the "Batch Only"
+list. Configure **OpenAI** (Configure Providers → OpenAI → Advanced → Base URL)
+to `http://127.0.0.1:8000/v1` with any non-empty API key. After that, every
+"Generate" click hits this server. Verify with `tail -f .run/asr_server.log`
+— you'll see `[openai <id>] received N bytes` lines.
 
 **LLM completes immediately with 0 tokens.**
 LM Studio silently rejects prompts that exceed the loaded context length. The

@@ -302,9 +302,10 @@ PY
   fi
 
   printf "\n%schar config (set these in Char's Settings -> Transcription):%s\n" "$c_bold" "$c_reset"
-  printf "  base URL : http://127.0.0.1:%s\n" "$ASR_PORT"
-  printf "  api key  : (any non-empty string - auth is ignored locally)\n"
-  printf "  intelligence provider : LM Studio @ http://127.0.0.1:%s   model=%s\n" "$LMSTUDIO_PORT" "$LLM_MODEL"
+  printf "  Live recording  : Custom provider, Base URL http://127.0.0.1:%s\n" "$ASR_PORT"
+  printf "  Generate (file) : OpenAI provider, Advanced -> Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
+  printf "  api key (both)  : any non-empty string (auth is ignored locally)\n"
+  printf "  intelligence    : LM Studio @ http://127.0.0.1:%s   model=%s\n" "$LMSTUDIO_PORT" "$LLM_MODEL"
   printf "\n"
 }
 
