@@ -9,18 +9,23 @@
 # The ASR backend (parakeet-mlx) and diarization backend (sherpa-onnx)
 # both run in-process - no separate service.
 #
-# Usage:
-#   ./run.sh start          run preflight (auto-install missing deps + models),
-#                            start LM Studio + ASR server, then tail the ASR log
-#                            so you can watch traffic. Ctrl+C detaches; services
-#                            keep running.
+# First-time setup on a freshly cloned repo:
+#   ./run.sh bootstrap      one-shot: build venv, install pip deps, download
+#                            ASR + diarization model weights, then print
+#                            "next steps" (Char + LM Studio + Qwen). Safe to
+#                            re-run; skips work that's already done.
+#   ./run.sh start          run preflight (auto-install anything bootstrap
+#                            missed), start LM Studio + ASR server, tail the
+#                            ASR log. Ctrl+C detaches; services keep running.
+#
+# Day-to-day:
 #   ./run.sh stop           stop the ASR server (LM Studio left alone)
 #   ./run.sh restart        stop + start
 #   ./run.sh status         show service health, PIDs, ports
 #   ./run.sh logs           tail the ASR server log
-#   ./run.sh health         one-shot health check
-#   ./run.sh doctor         run preflight only (deps, models, services) and
-#                            print a detailed report - safe to run any time
+#   ./run.sh health         one-shot HTTP health check
+#   ./run.sh doctor         deep preflight report - python, deps, models,
+#                            services, Char-config hints. Safe any time.
 #   ./run.sh setup          force-reinstall pip deps + (re)download models
 #   ./run.sh transcribe FILE [args...]
 #                            run transcribe_file.py FILE with the venv python
@@ -233,21 +238,18 @@ cmd_doctor() {
 
   printf "\n%spython packages:%s\n" "$c_bold" "$c_reset"
   if [[ -x "$VENV_PY" ]]; then
-    "$VENV_PY" - <<'PY'
-import importlib
-mods = [
-    ("fastapi", None), ("uvicorn", None), ("requests", None),
-    ("numpy", None), ("soundfile", None), ("librosa", None),
-    ("parakeet_mlx", None), ("faster_whisper", None),
-    ("sherpa_onnx", None), ("huggingface_hub", None),
-]
-for name, _ in mods:
+    "$VENV_PY" - <<PY
+import importlib, sys
+G,R,Z = ("\033[32m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","")
+mods = ["fastapi","uvicorn","requests","numpy","soundfile","librosa",
+        "parakeet_mlx","faster_whisper","sherpa_onnx","huggingface_hub"]
+for name in mods:
     try:
         m = importlib.import_module(name)
         v = getattr(m, "__version__", "ok")
-        print(f"  \033[32m●\033[0m {name:18s} {v}")
+        print(f"  {G}\u25cf{Z} {name:18s} {v}")
     except Exception as e:
-        print(f"  \033[31m○\033[0m {name:18s} MISSING ({type(e).__name__})")
+        print(f"  {R}\u25cb{Z} {name:18s} MISSING ({type(e).__name__})")
 PY
   else
     printf "  (skip - venv missing)\n"
@@ -256,22 +258,23 @@ PY
   printf "\n%smodels:%s\n" "$c_bold" "$c_reset"
   if [[ -x "$VENV_PY" ]]; then
     "$VENV_PY" - <<PY
+import sys
 from pathlib import Path
 from huggingface_hub import snapshot_download
+G,Y,Z = ("\033[32m","\033[33m","\033[0m") if sys.stdout.isatty() else ("","","")
 def check(repo, label):
     try:
         p = snapshot_download(repo_id=repo, local_files_only=True)
-        print(f"  \033[32m●\033[0m {label:30s} cached at {p}")
+        print(f"  {G}\u25cf{Z} {label:30s} cached at {p}")
     except Exception:
-        print(f"  \033[33m○\033[0m {label:30s} not yet downloaded")
+        print(f"  {Y}\u25cb{Z} {label:30s} not yet downloaded")
 check("$PARAKEET_MODEL",      "parakeet ($ASR_BACKEND_DEFAULT default)")
-import os
 diar = Path.home() / ".cache" / "whisper_server" / "diarization"
 seg  = diar / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 emb  = diar / "nemo_en_titanet_small.onnx"
-mark = lambda b: "\033[32m●\033[0m" if b else "\033[33m○\033[0m"
-print(f"  {mark(seg.exists())} pyannote segmentation         {seg}")
-print(f"  {mark(emb.exists())} NeMo TitaNet embedding        {emb}")
+mark = lambda b: f"{G}\u25cf{Z}" if b else f"{Y}\u25cb{Z}"
+print(f"  {mark(seg.exists())} pyannote segmentation          {seg}")
+print(f"  {mark(emb.exists())} NeMo TitaNet embedding         {emb}")
 PY
   fi
 
@@ -312,6 +315,48 @@ cmd_setup() {
   ensure_whisper_model        || true   # opt-in backend; don't fail run
   ensure_diarization_models   || true
   printf "\n%sready.%s run %s./run.sh start%s next.\n" "$c_green" "$c_reset" "$c_bold" "$c_reset"
+}
+
+cmd_bootstrap() {
+  printf "%sbootstrap%s — first-time setup for a fresh clone\n\n" "$c_bold" "$c_reset"
+
+  printf "%s(1/4) python venv + pip deps%s\n" "$c_bold" "$c_reset"
+  ensure_pip_deps             || return 1
+
+  printf "\n%s(2/4) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
+  ensure_parakeet_model       || return 1
+
+  printf "\n%s(3/4) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
+  ensure_diarization_models   || true   # best-effort
+
+  printf "\n%s(4/4) LM Studio CLI check%s\n" "$c_bold" "$c_reset"
+  ensure_lms_cli              || true
+
+  printf "\n%s════════ bootstrap complete ════════%s\n\n" "$c_green" "$c_reset"
+
+  # What the user still needs to do manually (we said in the brief that Char,
+  # LM Studio, and the Qwen model are out of scope to install for them).
+  printf "%sNext steps - one-time, manual:%s\n" "$c_bold" "$c_reset"
+  printf "  1. Install %sChar.app%s (https://char.so) if you haven't yet.\n" \
+         "$c_bold" "$c_reset"
+  printf "  2. Install %sLM Studio.app%s (https://lmstudio.ai), then in its\n" \
+         "$c_bold" "$c_reset"
+  printf "     model browser download %s%s%s.\n" \
+         "$c_bold" "$LLM_MODEL" "$c_reset"
+  if ! command -v lms >/dev/null 2>&1; then
+    printf "     Install the lms CLI so this script can manage it:\n"
+    printf "       %s~/.lmstudio/bin/lms bootstrap%s\n" "$c_bold" "$c_reset"
+  fi
+  printf "  3. In Char → Settings → Transcription, set:\n"
+  printf "       %sBase URL%s = http://127.0.0.1:%s\n" "$c_bold" "$c_reset" "$WHISPER_PORT"
+  printf "       %sAPI Key%s  = (any non-empty string)\n" "$c_bold" "$c_reset"
+  printf "       %sIntelligence provider%s = LM Studio @ http://127.0.0.1:%s\n" \
+         "$c_bold" "$c_reset" "$LMSTUDIO_PORT"
+  printf "       %smodel%s = %s\n" "$c_bold" "$c_reset" "$LLM_MODEL"
+
+  printf "\n%sThen start the pipeline:%s\n" "$c_bold" "$c_reset"
+  printf "    %s./run.sh start%s\n" "$c_bold" "$c_reset"
+  printf "\nVerify any time with: %s./run.sh doctor%s\n\n" "$c_bold" "$c_reset"
 }
 
 # --- whisper server ---
@@ -534,6 +579,7 @@ case "${1:-}" in
   health)     cmd_health ;;
   doctor)     cmd_doctor ;;
   setup)      cmd_setup ;;
+  bootstrap)  cmd_bootstrap ;;
   transcribe) cmd_transcribe "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}

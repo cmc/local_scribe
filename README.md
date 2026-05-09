@@ -60,25 +60,36 @@ automatically the first time you start the pipeline.
 
 ## Quick start
 
+On a freshly cloned repo:
+
 ```bash
 git clone <this repo>
 cd whisper_server
-./run.sh start
+./run.sh bootstrap        # one-shot: venv, pip deps, model downloads
+./run.sh start            # launch ASR server + LM Studio + tail the log
 ```
 
-That's it. On first run `run.sh` will:
+`./run.sh bootstrap` is idempotent and safe to re-run. It will:
 
-1. Create `./venv` and `pip install -r requirements.txt`
-2. Download the Parakeet TDT v3 weights into `~/.cache/huggingface/`
-3. Download the sherpa-onnx diarization models into
-   `~/.cache/whisper_server/diarization/`
-4. Start LM Studio's local server (if `lms` CLI is installed) and load the
-   Qwen3 model with a 65k-token context
-5. Start `uvicorn whisper_server:app` on `:8000`
-6. Tail the ASR log so you can watch traffic. Hit `Ctrl+C` to detach — the
+1. Create `./venv` (auto-picks `python3.14` / `3.12` / `3` from your system)
+2. `pip install -r requirements.txt`
+3. Download the Parakeet TDT v3 weights into `~/.cache/huggingface/` (~1.2 GB)
+4. Download the sherpa-onnx diarization ONNX models into
+   `~/.cache/whisper_server/diarization/` (~45 MB)
+5. Detect whether the `lms` CLI is installed and tell you how to bootstrap
+   it if not
+6. Print the exact strings to paste into Char's Settings UI
+
+After that, `./run.sh start` will:
+
+1. Re-run preflight (no-op if everything's already in place)
+2. Start LM Studio's local server (via the `lms` CLI) and load Qwen3 with
+   a 65 k-token context
+3. Start `uvicorn whisper_server:app` on `:8000`
+4. Tail the ASR log so you can watch traffic. Hit `Ctrl+C` to detach — the
    services keep running in the background.
 
-Subsequent runs skip everything that's already cached.
+Subsequent invocations skip everything that's already cached.
 
 ### Configure Char
 
