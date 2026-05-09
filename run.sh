@@ -338,7 +338,7 @@ cmd_bootstrap() {
   # What the user still needs to do manually (we said in the brief that Char,
   # LM Studio, and the Qwen model are out of scope to install for them).
   printf "%sNext steps - one-time, manual:%s\n" "$c_bold" "$c_reset"
-  printf "  1. Install %sChar.app%s (https://char.so) if you haven't yet.\n" \
+  printf "  1. Install %sChar.app%s (https://char.com - open-source, https://github.com/fastrepl/anarlog) if you haven't yet.\n" \
          "$c_bold" "$c_reset"
   printf "  2. Install %sLM Studio.app%s (https://lmstudio.ai), then in its\n" \
          "$c_bold" "$c_reset"

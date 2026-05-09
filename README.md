@@ -1,9 +1,17 @@
 # local_scribe
 
 Local, private, Apple-Silicon-native transcription + summarization pipeline.
-Drops in as a Deepgram-compatible endpoint behind [Char](https://char.so) and
+Drops in as a Deepgram-compatible endpoint behind [Char](https://char.com) and
 uses your local LM Studio + Qwen3 for note generation. Everything runs offline
 once the models are downloaded.
+
+> **Why Char?** Char is the **open-source**, local-first AI meeting notetaker —
+> source at [github.com/fastrepl/anarlog](https://github.com/fastrepl/anarlog)
+> (MIT licensed, ~8.4k stars), product page at [char.com](https://char.com).
+> Unlike closed-source SaaS notetakers like Granola, the entire client is code
+> you can read, fork, and self-host, and your audio/notes stay on disk as plain
+> markdown. `local_scribe` is the on-device transcription + summarization
+> backend that pairs with it — so the whole stack, app *and* models, is yours.
 
 ```
                  ┌─────────────────────┐
@@ -44,7 +52,7 @@ once the models are downloaded.
 |---|---|---|---|
 | 1 | macOS on Apple Silicon | — | Parakeet runs through MLX |
 | 2 | Python 3.12 or 3.14 | `brew install python@3.14` | runs the server + CLI |
-| 3 | [Char.app](https://char.so) | App Store / DMG | call recording UI |
+| 3 | [Char.app](https://char.com) (source: [fastrepl/anarlog](https://github.com/fastrepl/anarlog), MIT) | App Store / DMG | call recording UI — open-source Granola alternative |
 | 4 | [LM Studio.app](https://lmstudio.ai) | website | local LLM host |
 | 5 | LM Studio model: **`qwen3-30b-a3b-instruct-2507`** | LM Studio's model browser (≈18 GB MLX) | summaries + speaker naming |
 | 6 | LM Studio CLI: `lms` | `~/.lmstudio/bin/lms bootstrap` | so `run.sh` can auto-load Qwen |
