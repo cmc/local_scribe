@@ -440,22 +440,32 @@ sys.exit(1)
 " "$model"
 }
 
+# Bring LM Studio + Qwen up. Returns:
+#   0 - LM Studio reachable AND $LLM_MODEL loaded (fully ready)
+#   1 - LM Studio not reachable
+#   2 - LM Studio reachable but $LLM_MODEL not loaded
+# Callers use the exit code to decide how to render the readiness banner.
 lmstudio_start() {
-  if ! command -v lms >/dev/null 2>&1; then
-    say "${c_yellow}lms CLI not found - skipping LM Studio orchestration${c_reset}"
-    say "  open LM Studio.app and enable Developer > Local Server manually"
-    return 0
-  fi
+  local has_lms=0
+  command -v lms >/dev/null 2>&1 && has_lms=1
+
   if ! lmstudio_running; then
-    say "starting LM Studio HTTP server ..."
-    lms server start --port "$LMSTUDIO_PORT" >/dev/null 2>&1 || true
-    for _ in {1..15}; do
-      lmstudio_running && break
-      sleep 1
-    done
+    if [[ $has_lms -eq 1 ]]; then
+      say "starting LM Studio HTTP server ..."
+      lms server start --port "$LMSTUDIO_PORT" >/dev/null 2>&1 || true
+      for _ in {1..15}; do
+        lmstudio_running && break
+        sleep 1
+      done
+    fi
     if ! lmstudio_running; then
-      say "${c_red}LM Studio API isn't reachable on :$LMSTUDIO_PORT${c_reset}"
-      say "  open LM Studio.app and turn on the local server"
+      say "${c_red}LM Studio API not reachable on :$LMSTUDIO_PORT${c_reset}"
+      if [[ $has_lms -eq 0 ]]; then
+        say "  install the lms CLI:  ~/.lmstudio/bin/lms bootstrap"
+        say "  or open LM Studio.app and turn on Developer > Local Server"
+      else
+        say "  is LM Studio.app installed? open it once to grant permissions"
+      fi
       return 1
     fi
   fi
@@ -463,15 +473,25 @@ lmstudio_start() {
 
   if lmstudio_model_loaded "$LLM_MODEL"; then
     say "${c_green}$LLM_MODEL already loaded${c_reset}"
-  else
-    say "loading $LLM_MODEL with context-length=$LLM_CONTEXT (this can take a minute) ..."
-    if ! lms load "$LLM_MODEL" --context-length "$LLM_CONTEXT" >/dev/null 2>&1; then
-      say "${c_red}failed to load $LLM_MODEL via lms${c_reset}"
-      say "  is it downloaded? run \`lms ls\` to check"
-      return 1
-    fi
-    say "${c_green}$LLM_MODEL loaded${c_reset}"
+    return 0
   fi
+
+  if [[ $has_lms -eq 0 ]]; then
+    say "${c_yellow}$LLM_MODEL not loaded${c_reset}"
+    say "  install lms CLI to auto-load, or load it from LM Studio.app's UI"
+    return 2
+  fi
+
+  say "loading $LLM_MODEL with context-length=$LLM_CONTEXT (this can take a minute) ..."
+  if ! lms load "$LLM_MODEL" --context-length "$LLM_CONTEXT" >/dev/null 2>&1; then
+    say "${c_red}failed to load $LLM_MODEL via lms${c_reset}"
+    say "  is it downloaded? run \`lms ls\` to check"
+    say "  in LM Studio.app's model browser, search for and download:"
+    say "    $LLM_MODEL"
+    return 2
+  fi
+  say "${c_green}$LLM_MODEL loaded${c_reset}"
+  return 0
 }
 
 # --- top-level commands ---
@@ -483,18 +503,41 @@ cmd_start() {
     say "  fix the errors above (or run \`./run.sh setup\`) before starting"
     return 1
   }
-  lmstudio_start || true
-  whisper_start
+
+  lmstudio_start
+  local lms_rc=$?    # 0 ok, 1 unreachable, 2 reachable-but-no-model
+
+  whisper_start || return 1
   printf "\n"
-  printf "%s──── pipeline ready ────%s\n" "$c_bold" "$c_reset"
-  printf "  ASR server (Parakeet TDT v3) : %shttp://127.0.0.1:%s%s   (Char's transcription endpoint)\n" \
-         "$c_green" "$WHISPER_PORT" "$c_reset"
-  printf "  LM Studio API (Qwen3-30B)    : %shttp://127.0.0.1:%s%s   (summary + speaker naming)\n" \
-         "$c_green" "$LMSTUDIO_PORT" "$c_reset"
+
+  if [[ $lms_rc -eq 0 ]]; then
+    printf "%s──── pipeline ready ────%s\n" "$c_bold" "$c_reset"
+    printf "  ASR server (Parakeet TDT v3) : %shttp://127.0.0.1:%s%s   (Char's transcription endpoint)\n" \
+           "$c_green" "$WHISPER_PORT" "$c_reset"
+    printf "  LM Studio API (Qwen3-30B)    : %shttp://127.0.0.1:%s%s   (summary + speaker naming)\n" \
+           "$c_green" "$LMSTUDIO_PORT" "$c_reset"
+  else
+    printf "%s──── pipeline %sPARTIALLY%s ready ────%s\n" \
+           "$c_bold" "$c_yellow" "$c_reset$c_bold" "$c_reset"
+    printf "  ASR server (Parakeet TDT v3) : %shttp://127.0.0.1:%s%s   (transcription works)\n" \
+           "$c_green" "$WHISPER_PORT" "$c_reset"
+    if [[ $lms_rc -eq 1 ]]; then
+      printf "  LM Studio API                : %sNOT REACHABLE on :%s%s\n" \
+             "$c_red" "$LMSTUDIO_PORT" "$c_reset"
+      printf "                                 → Char's summary step will fail until you start LM Studio\n"
+    else
+      printf "  LM Studio API                : %shttp://127.0.0.1:%s%s   (reachable)\n" \
+             "$c_green" "$LMSTUDIO_PORT" "$c_reset"
+      printf "  %s                          : %sNOT LOADED%s\n" \
+             "$LLM_MODEL" "$c_red" "$c_reset"
+      printf "                                 → Char's summary step will fail; load the model in LM Studio.app\n"
+    fi
+  fi
   printf "  log file                     : %s\n" "$WHISPER_LOG_FILE"
   printf "\n"
   printf "  on-demand:    %s./run.sh transcribe ~/Desktop/call.m4a%s\n" "$c_bold" "$c_reset"
   printf "  status:       %s./run.sh status%s\n" "$c_bold" "$c_reset"
+  printf "  doctor:       %s./run.sh doctor%s   (full health report)\n" "$c_bold" "$c_reset"
   printf "  stop:         %s./run.sh stop%s\n" "$c_bold" "$c_reset"
   printf "\n"
   printf "tailing whisper server log; %sCtrl+C detaches without stopping%s\n" \
