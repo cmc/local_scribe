@@ -512,6 +512,75 @@ on crash, but they'll fail to upload.
 
 ---
 
+## Streaming-batch persistence bug
+
+This is a **functional** bug, not a privacy one, but it sits at the
+seam between Char and any custom OpenAI-compatible base URL (this
+project being one) and worth recording in the same audit because
+working around it required us to write into Char's session directory
+ourselves. Anyone running an alternative OpenAI shim against Char will
+hit this.
+
+**Char's progressive batch parser drops every transcript that comes
+back from the streaming `gpt-4o-transcribe` path**, regardless of
+length. The mechanism is two layers deep:
+
+1. [`crates/owhisper-client/src/adapter/openai/batch.rs:262-282`](https://github.com/fastrepl/anarlog/blob/main/crates/owhisper-client/src/adapter/openai/batch.rs#L262-L282)
+   maps `transcript.text.done` → `BatchStreamEvent::Result` with
+   **hardcoded `Vec::new()` for words**. The parsed event reaches the
+   accumulator with text but no per-word timing.
+2. [`apps/desktop/src/stt/useRunBatch.ts:120-123`](https://github.com/fastrepl/anarlog/blob/main/apps/desktop/src/stt/useRunBatch.ts#L120-L123)
+   wraps the persist callback with `if (words.length === 0) return;`,
+   which silently no-ops the entire `store.transaction(() => { ... })`
+   block that would have written `transcript.json` and updated the
+   in-memory store.
+
+So **every** progressive-batch transcription succeeds at the HTTP
+layer (`200 OK`, full transcript text in the response body) and is
+then dropped client-side with no log entry, no error toast, no UI
+change. The non-progressive path (`gpt-4o-transcribe-diarize`) doesn't
+have this bug — it preserves words from the diarized JSON via
+`convert_diarized_words` — but it's also subject to the
+60-second [`BATCH_IDLE_TIMEOUT`](#the-60-second-hack-why-we-need-streaming-sse-at-all)
+that breaks any audio whose ASR exceeds 60 seconds. There is **no Char
+configuration** that yields both word persistence and arbitrary-length
+audio.
+
+We can't fix this from response shape: the SSE parser only handles
+`transcript.text.delta` and `transcript.text.done`, and `Vec::new()`
+is hardcoded one layer down. There is no segment event type that
+threads words into the persist callback.
+
+**Workaround we ship:** [`char_persist.py`](char_persist.py) detects
+this scenario in our ASR server and atomically writes
+`transcript.json` directly to the matching Char session dir, bypassing
+Char's persist callback entirely. Char's TinyBase persister registers
+`watchPaths: ['sessions/']`
+([`multi-table-dir.ts:80`](https://github.com/fastrepl/anarlog/blob/main/apps/desktop/src/store/tinybase/persister/factories/multi-table-dir.ts#L80))
+so the file is auto-loaded. We identify the right session by
+SHA256-hashing the uploaded audio and matching against
+`<session_uuid>/audio.mp3` — the only stable join key, since Char's
+multipart form doesn't include the session ID.
+
+The full call is loopback-only (we touch nothing outside the user's
+own `~/Library/Application Support/hyprnote` dir), atomic
+(write-tempfile + rename), and idempotent (an existing transcript
+ID is preserved). See
+[README § The streaming-batch persistence bug](README.md#the-streaming-batch-persistence-bug-and-our-sidecar-workaround)
+for the user-facing summary and the audit-log format. Disable with
+`CHAR_PERSIST=0` if you ever need the broken upstream behaviour for
+repro / debugging.
+
+A non-invasive upstream fix would be a four-line change at the parser
+boundary: thread word-level data from the diarized response variant
+through the `transcript.text.done` arm — or, even simpler, drop the
+`words.length === 0` short-circuit in `useRunBatch.ts` so an
+empty-words text-only result still creates a transcript row. Worth
+filing on `fastrepl/anarlog` as it affects every custom-base-URL
+user, not just us.
+
+---
+
 ## What our local-stack avoids — and how
 
 When you run `./run.sh configure-char`, this repo rewrites the four

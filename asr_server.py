@@ -106,12 +106,54 @@ logging.basicConfig(
 )
 
 from config import load_config as _load_config
+import char_persist as _char_persist
 
 # Loaded once at import time. Env vars still win (layered inside
 # load_config), so existing scripts/tests that ``os.environ[...]`` keep
 # working unchanged. Live edits via the inspector UI take effect on
 # next ASR-server restart -- documented in README.
 _CFG = _load_config()
+
+# Char's progressive batch path silently drops every transcript whose
+# words array is empty (see CHAR_REVIEW.md § Streaming-batch persistence
+# bug). Until that's fixed upstream we sidecar-write transcript.json
+# straight to disk on a SHA256 match. Toggle off by setting
+# CHAR_PERSIST=0 if you want the upstream-broken behaviour for testing.
+_CHAR_PERSIST_ENABLED = os.getenv("CHAR_PERSIST", "1").lower() not in (
+    "0", "false", "no", "off",
+)
+_CHAR_DATA_DIR = _CFG.char_data_dir
+
+
+def _maybe_write_char_transcript(
+    audio_path: str,
+    words: list[dict[str, Any]],
+    lang: str,
+    request_id: str,
+    *,
+    channel: int = 2,
+) -> None:
+    """Best-effort sidecar write so Char's UI can display the transcript
+    despite its progressive-parser dropping our words. Failures are
+    logged but never raised: the SSE response must always succeed."""
+    if not _CHAR_PERSIST_ENABLED or not words:
+        return
+    try:
+        result = _char_persist.write_transcript_for_audio(
+            audio_path, _CHAR_DATA_DIR,
+            words=words, language=lang or "en",
+            provider="openai", channel=channel,
+            request_id=request_id,
+        )
+        if result is None:
+            logger.info(
+                "[openai %s] char_persist: no matching Char session "
+                "(was the audio uploaded outside Char?)", request_id,
+            )
+    except Exception:
+        logger.exception(
+            "[openai %s] char_persist sidecar write failed", request_id,
+        )
 
 ASR_BACKEND = _CFG.asr_backend
 if ASR_BACKEND not in {"parakeet", "whisper"}:
@@ -942,6 +984,16 @@ async def _stream_openai_transcription(
             if num_speakers > 1:
                 transcript = _compose_speaker_prefixed_text(words, transcript)
 
+        # Sidecar-write transcript.json into Char's session dir BEFORE
+        # we send `done`. Char's progressive parser will drop our words
+        # but the sidecar lands them on disk for the persister to load
+        # on next session-open. Run on a worker thread so the SSE
+        # heartbeat loop doesn't have to wait for SHA256 hashing.
+        await asyncio.to_thread(
+            _maybe_write_char_transcript,
+            audio_path, words, lang, request_id,
+        )
+
         elapsed = time.time() - started
         logger.info(
             "[openai %s] stream done in %.2fs (asr=%.2fs, diar=%.2fs, "
@@ -1109,6 +1161,16 @@ async def openai_audio_transcriptions(request: Request):
             words, num_speakers = await asyncio.to_thread(
                 _attach_speakers_to_words, tmp.name, words, duration, request_id,
             )
+
+        # Mirror the streaming path's sidecar write: ensures the
+        # non-streaming `gpt-4o-transcribe-diarize` path also lands a
+        # transcript.json on disk even when Char's IPC layer flakes out
+        # (and gives us a deterministic record of what we returned).
+        # Done while tmp still exists so SHA256 is meaningful.
+        await asyncio.to_thread(
+            _maybe_write_char_transcript,
+            tmp.name, words, lang, request_id,
+        )
 
     elapsed = time.time() - started
     if num_speakers:

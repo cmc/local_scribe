@@ -333,20 +333,95 @@ stay strictly < 60). That's the entire mechanism: a 32-byte JSON packet
 emitted four times to keep an open-source app's idle timer happy long
 enough for local ASR to finish.
 
+### The streaming-batch persistence bug (and our sidecar workaround)
+
+Solving the 60-second abort isn't enough on its own: Char's progressive
+batch parser has a second bug downstream that silently drops the
+transcript even after a successful 200 OK.
+
+In Char's
+[`crates/owhisper-client/src/adapter/openai/batch.rs`](https://github.com/fastrepl/anarlog/blob/main/crates/owhisper-client/src/adapter/openai/batch.rs#L262-L282),
+the `transcript.text.done` SSE event is converted to a
+`BatchStreamEvent::Result` with a **hardcoded `Vec::new()` for words**:
+
+```rust
+ParsedTranscriptionStreamEvent::TextDone { text, usage, .. } => {
+    Some(Ok(BatchStreamEvent::Result {
+        response: build_batch_response(
+            text.trim().to_string(),
+            Vec::new(),                    // <-- always empty
+            transcription_usage_metadata(usage),
+        ),
+    }))
+}
+```
+
+Then in [`apps/desktop/src/stt/useRunBatch.ts`](https://github.com/fastrepl/anarlog/blob/main/apps/desktop/src/stt/useRunBatch.ts#L120-L123)
+the persist callback short-circuits on empty words:
+
+```ts
+const persist = handlePersist ?? ((words, hints) => {
+    if (words.length === 0) {
+        return;                            // <-- silent drop, no error, no UI update
+    }
+    // ...build TranscriptStorage row, write transcript.json...
+});
+```
+
+So **every** transcript that travels Char's progressive (streaming)
+batch path is silently dropped, regardless of how long or short the
+audio is. Server-side our log says `200 OK / N chars`, the bytes
+make it to Char, then Char throws them away.
+
+We can't fix this from the response shape: the parser only handles
+`transcript.text.delta` and `transcript.text.done`, no segment events
+carry per-word timing through to the persist callback. The only
+hardcoded inputs that decide whether words get stored are the words
+*Char itself* synthesises from the response, and we have zero control
+over that branch from our side.
+
+**Workaround: write `transcript.json` straight to Char's session
+directory ourselves.** When a request hits
+`/v1/audio/transcriptions`, [`char_persist.py`](char_persist.py)
+SHA256-hashes the uploaded audio, walks
+`~/Library/Application Support/hyprnote/sessions/<uuid>/audio.mp3`
+looking for a match, and if it finds one, atomically writes
+`transcript.json` to that session in Char's exact persister schema
+(`{"transcripts":[{id, session_id, words[], speaker_hints[], memo_md,
+created_at, started_at, user_id}]}`, validated against
+`apps/desktop/src/store/tinybase/persister/session/load/transcript.ts`).
+
+Char's TinyBase persister registers
+`watchPaths: ['sessions/']`
+([`multi-table-dir.ts`](https://github.com/fastrepl/anarlog/blob/main/apps/desktop/src/store/tinybase/persister/factories/multi-table-dir.ts#L80))
+so the file is auto-loaded on next session-open without needing to
+restart Char. The SSE response still completes normally for backwards
+compatibility — Char drops the empty-words result as designed, but the
+real transcript is already on disk by the time it does.
+
+Disable the sidecar with `CHAR_PERSIST=0` if you ever need the broken
+upstream behaviour for repro / debugging. The audit-log line looks
+like:
+
+```
+[char_persist <req-id>] wrote transcript.json to /…/sessions/<uuid>/transcript.json (words=14715, speakers=1, sha256=031b967a3d06)
+```
+
+A `char_persist: no Char session matches uploaded audio` line at INFO
+means the request didn't come from Char (e.g. you `curl`'d the endpoint
+directly) or the SHA256 didn't match — both expected, both no-op.
+
 ### What you lose vs. real OpenAI Whisper
 
 Compared to actually hitting `api.openai.com/v1/audio/transcriptions`,
 the shim:
 
-- Returns only the **progressive** response shape on the streaming
-  path (text + usage). Per-word start/end timestamps are dropped from
-  Char's stored `transcript.json`. If you need word-level timing for a
-  specific recording, run `./run.sh transcribe FILE` outside Char — it
-  preserves them.
 - Inlines `Speaker N: …` prefixes into the streamed text on short
   files where diarization fires. The progressive shape Char accepts
-  here can't carry the structured `segments[*].speaker` array. Long
-  files auto-skip diarization (`MAX_DIARIZE_SECONDS=1800` by default).
+  here can't carry the structured `segments[*].speaker` array (Char's
+  parser doesn't have a segment arm — see § the streaming-batch
+  persistence bug). Long files auto-skip diarization
+  (`MAX_DIARIZE_SECONDS=1800` by default).
 - Ignores the OpenAI multipart fields `prompt`, `temperature`,
   `timestamp_granularities`, and `language`. Parakeet doesn't take
   sampling-temperature hints or per-token granularity, and language
@@ -999,10 +1074,12 @@ local_scribe/
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
 ├── inspector_server.py      # FastAPI web UI + sessions/config/char-audit API
 ├── char_audit.py            # Char.app safety check + configure-char logic
+├── char_persist.py          # SHA256-match audio -> sidecar-write transcript.json
+│                            #   (workaround for Char's progressive parser dropping words)
 ├── config.py                # config loader (defaults <- file <- env)
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 194 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 206 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -1099,7 +1176,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 194 tests, ~0.5s, no model loads
+venv/bin/python -m unittest discover -s tests   # 206 tests, ~0.5s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run
