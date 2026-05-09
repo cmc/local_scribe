@@ -324,7 +324,7 @@ Default behavior:
 - Caches the transcript by audio sha256 — second run is instant.
 - Diarizes with sherpa-onnx and asks Qwen to map speakers to real names.
 - Streams the structured Markdown summary to the terminal token-by-token.
-- Copies the summary to your clipboard (use `--no-copy` to skip).
+- Pass `--copy` to also drop the summary on your clipboard (off by default).
 
 Useful flags (full list: `./run.sh transcribe --help`):
 
@@ -333,6 +333,7 @@ Useful flags (full list: `./run.sh transcribe --help`):
 ./run.sh transcribe FILE --save call.json     # full bundle (transcript + diarization + summary)
 ./run.sh transcribe FILE --save call.txt      # raw transcript only
 ./run.sh transcribe FILE --save-transcript diarized.txt   # diarized transcript only
+./run.sh transcribe FILE --copy               # also copy summary to clipboard
 ./run.sh transcribe FILE --no-diarize         # skip speaker labels
 ./run.sh transcribe FILE --no-cache           # force re-transcribe
 ./run.sh transcribe FILE --asr-backend whisper      # switch to multilingual whisper
@@ -377,14 +378,61 @@ services:
   ● LM Studio    :1234   reachable
   ● qwen3-30b-a3b-instruct-2507 loaded
 
-char config (set these in Char's Settings -> Transcription):
-  base URL : http://127.0.0.1:8000
-  api key  : (any non-empty string - auth is ignored locally)
-  intelligence provider : LM Studio @ http://127.0.0.1:1234   model=qwen3-30b-a3b-instruct-2507
+char.app:
+  ● Char 1.0.24 installed (matches pinned)
+  ● Char transcriber configured for this server
 ```
 
 Yellow/red dots tell you exactly which piece is broken so you don't have to
 guess.
+
+## End-to-end smoke test
+
+To verify the whole stack — Char's wire contract, our endpoint, sherpa-onnx
+diarization, the local pipeline, and LM Studio — without touching Char's UI:
+
+```bash
+# Pick any audio file you have lying around
+AUDIO=~/Desktop/short_call.mp3
+
+# 1. Replay Char's exact "Generate" request to our OpenAI-compatible endpoint
+curl -sS http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer local" \
+  -F "file=@${AUDIO};type=audio/mpeg" \
+  -F "model=gpt-4o-transcribe-diarize" \
+  -F "response_format=diarized_json" | jq '.task, .duration, (.segments | length)'
+
+# 2. Drive the full local pipeline (ASR + diarization + Qwen summary)
+./run.sh transcribe "$AUDIO" --diarize --save /tmp/smoke.md
+
+# 3. Confirm both calls landed
+./run.sh logs | tail -3
+```
+
+A passing run looks like this (numbers from a 60s clip on M3 Max,
+ASR backend = parakeet, diarization on, Qwen3-30B-Instruct loaded):
+
+| stage | latency | notes |
+|---|---|---|
+| `/v1/audio/transcriptions` first call after `start` | ~30 s | parakeet-mlx loading into the worker thread |
+| `/v1/audio/transcriptions` warm | 2.9–3.3 s | asr 0.7–1.1s + diar 2.2s |
+| `./run.sh transcribe` cached ASR + diar + Qwen | ~12 s | LLM dominates: 8s @ 42 tok/s, ttft 0.26 s |
+| `./run.sh transcribe` first run on a new file | + ~3 s | added ASR cost vs. cached run |
+
+Log line shape on a successful Generate (or smoke run):
+
+```text
+[openai 4d06a121-…] received 946368 bytes (model='gpt-4o-transcribe-diarize',
+                  response_format=diarized_json, filename='audio.mp3')
+[openai 4d06a121-…] running diarization (sherpa-onnx) ...
+[openai 4d06a121-…] done in 2.87s (asr=0.67s, diar=2.20s, speakers=3),
+                  58 chars, lang=en, format=diarized_json
+```
+
+If the wire test passes but Char still produces hallucinated note bodies on
+short/empty audio, that's not the pipeline — that's Char's note-template
+LLM step. Pick a less prescriptive template (or turn off "Use template")
+and re-Generate. See the [Troubleshooting](#troubleshooting) section.
 
 ## Configuration
 
@@ -560,6 +608,16 @@ sherpa-onnx with default `CLUSTER_THRESHOLD=0.5` over-shards on short
 conversational audio. Set `NUM_SPEAKERS=2` (or your known count) before
 `./run.sh start` for exact, clean labels. Or `OPENAI_BATCH_DIARIZE=0` to
 skip diarization entirely if you don't need speaker labels.
+
+**Char's note body looks fabricated / corporate-flavored on a short call.**
+That's not the transcription pipeline — Char runs a *separate* LLM call to
+fill the active note template (1:1 Meeting, Legal meeting, etc.) and small
+LLMs confabulate when asked to fill prescriptive sections from a thin
+transcript. Run the smoke test above; if the diarized JSON is faithful but
+the note body isn't, switch Char to a less prescriptive template (or pick
+a more capable LLM in Char → Settings → Intelligence). For the 4B Qwen,
+swap to the 30B you've already loaded:
+`qwen3-30b-a3b-instruct-2507`.
 
 **LLM completes immediately with 0 tokens.**
 LM Studio silently rejects prompts that exceed the loaded context length. The
