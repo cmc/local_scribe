@@ -863,7 +863,26 @@ and re-Generate. See the [Troubleshooting](#troubleshooting) section.
 
 ## Configuration
 
-All knobs are env vars; defaults are sensible.
+There are now **two** layered ways to configure the stack:
+
+1.  **`~/.config/local_scribe/config.json`** — the user-editable JSON
+    file that the [Inspector UI](#inspector) reads/writes.
+    `./run.sh bootstrap` step (4/6) seeds this from baked-in defaults,
+    and every save through the inspector backs up the previous file as
+    `config.json.bak.<ts>`. Ground truth for which port the ASR server
+    listens on, which Parakeet/Whisper model to load, the LM Studio
+    host/port (handy if you run LM Studio on a different Mac), the
+    inspector's bind/port, and Char's expected provider config.
+2.  **Environment variables** (table below) — layered on top of
+    config.json (env wins). Lets you override one knob for a single
+    `./run.sh start` without editing the JSON. Existing scripts that
+    set `ASR_PORT=...` keep working unchanged.
+
+The validator at `config.validate()` rejects negative ports, unknown
+backends, port collisions between the ASR + Inspector, and binding the
+inspector to a non-loopback address without an `auth_token` set.
+
+All knobs are also env vars; defaults are sensible.
 
 | variable | default | what |
 |---|---|---|
@@ -889,6 +908,10 @@ All knobs are env vars; defaults are sensible.
 | `MAX_DIARIZE_SECONDS` | `1800` | audio longer than this auto-skips diarization on `POST /v1/audio/transcriptions` (returns ASR transcript with single `speaker_0` placeholder). Sherpa-onnx clustering is O(N²) and Char's UI doesn't tolerate multi-minute Generate latencies. Set `0` to disable the cap. |
 | `MAX_SPEAKERS` | `12` | if sherpa-onnx returns more than this many distinct speakers, treat it as a clustering blow-up and collapse to single-speaker output rather than emit JSON Char can't render. Set `0` to disable the guard. |
 | `STREAM_HEARTBEAT_SECONDS` | `20` | heartbeat interval (in seconds) for the SSE streaming branch of `POST /v1/audio/transcriptions`. Each heartbeat resets Char's hardcoded 60-second `BATCH_IDLE_TIMEOUT`; lower it on slower machines, raise it for less wire chatter. Must stay strictly less than 60. |
+| `INSPECTOR_BIND` | `127.0.0.1` | bind address for the Inspector web UI; loopback by default. Refuse to start non-loopback unless `inspector.auth_token` is also set in `config.json`. |
+| `INSPECTOR_PORT` | `8001` | port for the Inspector web UI. |
+| `INSPECTOR_AUTH_TOKEN` | unset | optional bearer token. When set, every `/api/*` request must include `Authorization: Bearer <token>`. Required if you ever rebind the inspector to a LAN address. |
+| `LOCAL_SCRIBE_CONFIG_DIR` | `~/.config/local_scribe` | where `config.json` (and Char OpenAI-key backups) live. |
 | `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_scribe/transcripts` | where the transcript cache lives |
 | `DIARIZATION_CACHE_DIR` | `~/.cache/local_scribe/diarization` | where sherpa-onnx model files live |
 | `PYTHON` | `python3.14` else `python3.12` else `python3` | which interpreter `run.sh` uses to build the venv |
@@ -899,6 +922,73 @@ Switch to whisper for, say, a Mandarin call:
 ASR_BACKEND=whisper WHISPER_LANGUAGE=zh ./run.sh restart
 ```
 
+## Inspector
+
+A tiny loopback web app at `http://127.0.0.1:8001/` that surfaces the
+data Char already collects, plus our config and a Char audit. It
+auto-starts as part of `./run.sh start`; you can also manage it
+independently:
+
+```bash
+./run.sh inspector start        # background uvicorn on :8001
+./run.sh inspector status
+./run.sh inspector open         # launch your default browser
+./run.sh inspector logs         # tail
+./run.sh inspector stop
+```
+
+Three tabs:
+
+* **Sessions** — every Char session on disk under
+  `~/Library/Application Support/hyprnote/sessions/` listed newest
+  first, with audio playback (`<audio>` streaming the same `audio.mp3`
+  Char wrote), the diarised transcript flattened from
+  `transcript.json` into speaker-prefixed paragraphs, every per-session
+  note (`<Template>.md`), and a one-click `transcript.txt` download.
+  Read-only — for editing the notes themselves, use Char's UI.
+* **Config** — form-bound editor for `~/.config/local_scribe/config.json`.
+  Each field is annotated with what it does (e.g. "set `llm.host` to a
+  LAN address to run LM Studio on another Mac"). Saving runs the
+  validator, writes a timestamped backup, and persists the result;
+  the response includes a "restart required" hint when ASR / LLM
+  values change. Env vars still win over the file at process start, so
+  setting `LLM_HOST=...` for a single launch overrides whatever the
+  inspector wrote.
+* **Char audit** — runs the same checks as `./run.sh doctor`'s Char
+  block, but in a sortable table with `ok` / `warn` / `info` /
+  `miss` badges per row. Verifies that
+  `ai.stt.openai.base_url` still points at our local server,
+  flags any provider-specific `base_url` that's been changed from its
+  vendor default, masks any leftover real OpenAI key (so the inspector
+  never echoes a full secret), and offers a one-click "Run
+  configure-char" button that backs up `settings.json` and rewrites
+  the four keys. Also lists every backup we've already saved (Char's
+  settings + any extracted OpenAI keys at
+  `~/.config/local_scribe/char-openai-key.<ts>.txt`) so a restore is a
+  trivial `cp` away.
+
+A status-pill row in the header pings `/api/asr/health`,
+`/api/llm/health`, and the Char audit every 15 seconds — the easy way
+to spot LM Studio or Char drift without leaving your editor.
+
+### Privacy posture for the Inspector
+
+* Binds to `127.0.0.1` by default. The validator refuses any non-loopback
+  bind unless `inspector.auth_token` is also set, so you can't
+  accidentally expose `/api/sessions` to the LAN.
+* No external CDN — all CSS/JS lives inside `inspector_server.py` and
+  is served from the same origin.
+* No write access to Char's session data. Only `config.json` and
+  Char's `settings.json` / `store.json` are mutated, and only the
+  latter via an explicit POST to `/api/char/configure`.
+* No analytics, no telemetry. The inspector's only outbound network
+  calls are the two health pings to your own ASR server + LM Studio.
+
+If you ever want to expose it to your LAN (e.g. read sessions from
+another laptop), set `inspector.auth_token` to a long random value
+**and** `inspector.bind` to your LAN address. The validator will
+refuse the latter without the former.
+
 ## Project layout
 
 ```
@@ -907,9 +997,12 @@ local_scribe/
 ├── transcribe_file.py       # CLI for manual files
 ├── parakeet_backend.py      # parakeet-mlx wrapper, BPE -> Deepgram words
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
+├── inspector_server.py      # FastAPI web UI + sessions/config/char-audit API
+├── char_audit.py            # Char.app safety check + configure-char logic
+├── config.py                # config loader (defaults <- file <- env)
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 147 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 194 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -1006,7 +1099,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 147 tests, ~0.05s, no model loads
+venv/bin/python -m unittest discover -s tests   # 194 tests, ~0.5s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run

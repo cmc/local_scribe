@@ -110,15 +110,39 @@ sweep whenever `CHAR_KNOWN_GOOD_VERSION` is bumped.
 
 ## UX / features
 
-- [ ] **Web inspector at `:8001`** — small FastAPI service that lists
-      Char's sessions, plays audio in-browser, shows transcripts +
-      summaries, supports per-session delete + audio download. Reads
-      Char's directory directly (no parallel database). Loopback only.
-      Earlier proposed; deferred to focus on the LM Studio bootstrap.
+- [x] **Web inspector at `:8001`** — ✅ Landed: `inspector_server.py`
+      (FastAPI + single-page vanilla JS, no build step), wired into
+      `./run.sh inspector {start|stop|status|open|logs}` and auto-started
+      by `./run.sh start`. Sessions tab lists every Char session with
+      audio playback, diarised transcript, and per-template notes;
+      Config tab edits `~/.config/local_scribe/config.json`; Char audit
+      tab runs `char_audit.audit()` with one-click `configure-char` fix.
+      Loopback only by default; the validator refuses non-loopback bind
+      without an `inspector.auth_token` set.
+- [x] **`config.json` as the source of truth.** ✅ Landed: `config.py`
+      layers defaults <- `~/.config/local_scribe/config.json` <- env vars,
+      so `LM Studio on another Mac` is now `llm.host = "..."` in the
+      inspector UI (no env-var dance). Existing scripts that set
+      `ASR_PORT=...` etc. keep working unchanged.
+- [x] **Char audit module** that flags drift toward non-local providers.
+      ✅ Landed: `char_audit.py` reads `settings.json` + `store.json`,
+      surfaces `ok` / `warn` / `info` / `miss` per check, masks any real
+      OpenAI key it finds, lists `settings.json.bak.*` + saved-key
+      backups so a restore is a `cp` away. Surfaced in both
+      `./run.sh doctor` and the inspector's Char Audit tab.
 - [ ] **`./run.sh retranscribe SESSION_ID`** that re-runs ASR on an
       existing recording and overwrites `transcript.json`. Useful when
       you switch ASR backend, fix a diarization bug, or pull a better
       model. Inspector page would expose this as a button.
+- [ ] **Per-session delete from the inspector.** Currently read-only;
+      adding `DELETE /api/sessions/{id}` (with a typed-confirmation
+      modal in the UI) would round out the "what Char has" tab.
+- [ ] **Restore an OpenAI key backup from the inspector UI.** Surface
+      the `~/.config/local_scribe/char-openai-key.*.txt` list (already
+      shown in the Char audit tab) with a "restore this key into Char"
+      button that re-writes `settings.json` and prompts for a Char
+      relaunch. Useful for the rollback story when someone wants to go
+      back to real OpenAI temporarily.
 - [ ] **Calendar-aware participant prefill.** When a session has a
       linked calendar event, prefill `transcript.speaker_hints` with
       the attendees so the LLM speaker-naming pass starts from real

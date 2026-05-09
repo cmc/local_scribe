@@ -71,17 +71,29 @@ from pathlib import Path
 
 import requests
 
-DEFAULT_ASR_BACKEND = os.getenv("ASR_BACKEND", "parakeet").lower()
-DEFAULT_PARAKEET_MODEL = os.getenv(
-    "PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3"
+from config import load_config as _load_config
+
+# Single-shot config snapshot. Env vars layered inside ``load_config``
+# preserve the historical contract -- ``ASR_URL=...`` etc. still work,
+# they just no longer have to be set if config.json carries the value.
+_CFG = _load_config()
+
+DEFAULT_ASR_BACKEND = _CFG.asr_backend
+DEFAULT_PARAKEET_MODEL = _CFG.parakeet_model
+DEFAULT_DIARIZE = _CFG.diarize_enabled
+DEFAULT_NUM_SPEAKERS = _CFG.num_speakers
+DEFAULT_CLUSTER_THRESHOLD = _CFG.cluster_threshold or 0.5
+# transcribe_file.py talks to the ASR server's Deepgram-compatible
+# /v1/listen endpoint (the "live transcription" path), distinct from
+# the OpenAI /v1/audio/transcriptions Char uses. Both live behind the
+# same asr.bind:asr.port pair.
+DEFAULT_ASR_URL = os.getenv(
+    "ASR_URL",
+    f"http://{_CFG.asr_bind}:{_CFG.asr_port}/v1/listen",
 )
-DEFAULT_DIARIZE = os.getenv("DIARIZE", "1").strip() not in {"0", "false", "no", ""}
-DEFAULT_NUM_SPEAKERS = int(os.getenv("NUM_SPEAKERS", "0")) or None
-DEFAULT_CLUSTER_THRESHOLD = float(os.getenv("CLUSTER_THRESHOLD", "0.5"))
-DEFAULT_ASR_URL = os.getenv("ASR_URL", "http://127.0.0.1:8000/v1/listen")
-DEFAULT_LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:1234/v1/chat/completions")
-DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "qwen3-30b-a3b-instruct-2507")
-DEFAULT_LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+DEFAULT_LLM_URL = os.getenv("LLM_URL", _CFG.llm_url)
+DEFAULT_LLM_MODEL = _CFG.llm_model
+DEFAULT_LLM_MAX_TOKENS = _CFG.llm_max_tokens
 DEFAULT_CACHE_DIR = Path(
     os.getenv("TRANSCRIPT_CACHE_DIR")
     or (Path.home() / ".cache" / "local_scribe" / "transcripts")

@@ -105,17 +105,27 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-ASR_BACKEND = os.getenv("ASR_BACKEND", "parakeet").lower()
+from config import load_config as _load_config
+
+# Loaded once at import time. Env vars still win (layered inside
+# load_config), so existing scripts/tests that ``os.environ[...]`` keep
+# working unchanged. Live edits via the inspector UI take effect on
+# next ASR-server restart -- documented in README.
+_CFG = _load_config()
+
+ASR_BACKEND = _CFG.asr_backend
 if ASR_BACKEND not in {"parakeet", "whisper"}:
     raise RuntimeError(
-        f"Unknown ASR_BACKEND={ASR_BACKEND!r}; use 'parakeet' or 'whisper'"
+        f"Unknown asr.backend={ASR_BACKEND!r}; use 'parakeet' or 'whisper'"
     )
 
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+WHISPER_MODEL_NAME = _CFG.whisper_model
+# Whisper-only tuning knobs stay env-var-only -- low-frequency overrides
+# that don't deserve a top-level config slot.
 COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 LANGUAGE = os.getenv("WHISPER_LANGUAGE") or None
-PARAKEET_MODEL_ID = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
+PARAKEET_MODEL_ID = _CFG.parakeet_model
 
 _whisper_model = None
 _arch: str
@@ -435,29 +445,25 @@ _OPENAI_VALID_FORMATS = {"json", "text", "srt", "verbose_json", "vtt", "diarized
 
 
 # When response_format=diarized_json, run real sherpa-onnx diarization (defaults
-# on) and label each segment with its speaker. Set OPENAI_BATCH_DIARIZE=0 to
-# return a single anonymous speaker for ~8x lower latency.
-_OPENAI_BATCH_DIARIZE = os.getenv("OPENAI_BATCH_DIARIZE", "1").strip().lower() not in {
-    "0", "false", "no", "off", "",
-}
-_NUM_SPEAKERS = int(os.getenv("NUM_SPEAKERS") or 0) or None
+# on) and label each segment with its speaker. Set asr.diarization.enabled=false
+# in config.json (or DIARIZE=0 / OPENAI_BATCH_DIARIZE=0 env) for ~8x lower latency.
+_OPENAI_BATCH_DIARIZE = _CFG.diarize_enabled
+_NUM_SPEAKERS = _CFG.num_speakers
 # The user-set CLUSTER_THRESHOLD (or None when unset). We hold the explicit
 # user override separately so the long-audio auto-bump only kicks in when
 # nothing was explicitly configured.
-_CLUSTER_THRESHOLD_OVERRIDE: float | None = (
-    float(os.environ["CLUSTER_THRESHOLD"]) if os.environ.get("CLUSTER_THRESHOLD") else None
-)
+_CLUSTER_THRESHOLD_OVERRIDE: float | None = _CFG.cluster_threshold
 _CLUSTER_THRESHOLD_DEFAULT = 0.5
 # Audio longer than this auto-skips diarization entirely (returns a single
 # `speaker_0` placeholder), because: (a) sherpa-onnx clustering is O(N^2) and
 # blows up past ~30 min, and (b) the resulting wall time would exceed Char's
-# UI patience. Set MAX_DIARIZE_SECONDS=0 to disable the auto-skip.
-_MAX_DIARIZE_SECONDS = int(os.getenv("MAX_DIARIZE_SECONDS") or 1800)
+# UI patience. Set asr.diarization.max_seconds=0 to disable the auto-skip.
+_MAX_DIARIZE_SECONDS = _CFG.max_diarize_seconds
 # When sherpa-onnx returns more than this many distinct speakers we treat it
 # as a clustering blow-up (long mono recordings often produce 100+ phantom
 # speakers). The endpoint then collapses to a single speaker rather than
-# emitting unusable JSON. Set MAX_SPEAKERS=0 to disable the cap.
-_MAX_SPEAKERS = int(os.getenv("MAX_SPEAKERS") or 12)
+# emitting unusable JSON. Set asr.diarization.max_speakers=0 to disable the cap.
+_MAX_SPEAKERS = _CFG.max_speakers
 # Audio at or above this duration auto-bumps CLUSTER_THRESHOLD to the looser
 # default of 0.7 (long meetings have few speakers; tighter thresholds
 # over-shard). Skipped if the user explicitly set CLUSTER_THRESHOLD.
@@ -837,7 +843,7 @@ def _openai_transcription_response(
 # (no toast, no log -- the spawned future is just dropped). The progressive
 # path (used for `gpt-4o-transcribe`) resets that timer on every SSE delta,
 # so we keep it alive with a tiny heartbeat delta every N seconds.
-_OPENAI_STREAM_HEARTBEAT_SECONDS = float(os.getenv("STREAM_HEARTBEAT_SECONDS", "20"))
+_OPENAI_STREAM_HEARTBEAT_SECONDS = _CFG.stream_heartbeat_seconds
 
 
 def _sse(event: dict[str, Any]) -> str:

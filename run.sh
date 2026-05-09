@@ -42,10 +42,17 @@
 #                            (interactive; offers to back up existing API key).
 #                            Bootstrap calls install-char + configure-char in
 #                            sequence on a fresh install.
+#   ./run.sh inspector {start|stop|restart|status|open|logs}
+#                            local web UI on :8001 with a list of Char's
+#                            sessions (audio playback + transcript + notes),
+#                            a config editor for ~/.config/local_scribe/
+#                            config.json, and a Char audit tab that flags
+#                            drift toward non-local providers. Loopback
+#                            only by default.
 #   ./run.sh transcribe FILE [args...]
 #                            run transcribe_file.py FILE with the venv python
 #
-# Env overrides:
+# Env overrides (prefer ~/.config/local_scribe/config.json for these):
 #   ASR_BACKEND       default parakeet  (parakeet | whisper)
 #   ASR_PORT          default 8000      (where the ASR server listens)
 #   PARAKEET_MODEL    default mlx-community/parakeet-tdt-0.6b-v3
@@ -53,7 +60,13 @@
 #   LMSTUDIO_PORT     default 1234
 #   LLM_MODEL         default qwen3-30b-a3b-instruct-2507
 #   LLM_CONTEXT       default 65536
+#   INSPECTOR_BIND    default 127.0.0.1
+#   INSPECTOR_PORT    default 8001
 #   PYTHON            default python3.14 (else python3.12, else python3)
+#
+# Env vars layered on top of config.json (env wins) so legacy scripts keep
+# working unchanged. Inspector "Config" tab and `vim ~/.config/local_scribe/
+# config.json` both edit the same file.
 
 set -euo pipefail
 
@@ -67,6 +80,8 @@ mkdir -p "$RUN_DIR"
 
 ASR_PID_FILE="$RUN_DIR/asr_server.pid"
 ASR_LOG_FILE="$RUN_DIR/asr_server.log"
+INSPECTOR_PID_FILE="$RUN_DIR/inspector_server.pid"
+INSPECTOR_LOG_FILE="$RUN_DIR/inspector_server.log"
 DEPS_STAMP="$RUN_DIR/deps.stamp"   # mtime tracks last successful pip install
 
 ASR_BACKEND_DEFAULT="${ASR_BACKEND:-parakeet}"
@@ -74,6 +89,8 @@ PARAKEET_MODEL="${PARAKEET_MODEL:-mlx-community/parakeet-tdt-0.6b-v3}"
 WHISPER_MODEL="${WHISPER_MODEL:-large-v3-turbo}"
 ASR_PORT="${ASR_PORT:-8000}"
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
+INSPECTOR_PORT="${INSPECTOR_PORT:-8001}"
+INSPECTOR_BIND="${INSPECTOR_BIND:-127.0.0.1}"
 
 # Default LLM (recommended for ≥48 GB unified memory).
 LLM_MODEL="${LLM_MODEL:-qwen3-30b-a3b-instruct-2507}"
@@ -259,6 +276,25 @@ PY
   say "  they will auto-download on the first --diarize run instead"
 }
 
+# Seed ~/.config/local_scribe/config.json from the baked-in DEFAULT_CONFIG
+# if missing. Idempotent: re-running bootstrap on an existing install
+# leaves an edited config alone.
+ensure_config_json() {
+  if [[ ! -x "$VENV_PY" ]]; then
+    say "${c_red}venv python missing; can't seed config.json${c_reset}"
+    return 1
+  fi
+  "$VENV_PY" - <<'PY'
+import sys
+from config import DEFAULT_CONFIG_PATH, write_default_config_if_missing
+created = write_default_config_if_missing()
+if created:
+    print(f"\033[32mwrote default config\033[0m  {created}")
+else:
+    print(f"\033[2mconfig.json already exists\033[0m  {DEFAULT_CONFIG_PATH}")
+PY
+}
+
 # Friendly check for the LM Studio CLI. Not strictly required (you can run
 # LM Studio.app's local server manually) but the auto-load convenience needs it.
 ensure_lms_cli() {
@@ -301,7 +337,28 @@ preflight() {
 cmd_doctor() {
   printf "%sdoctor%s — validating local pipeline\n\n" "$c_bold" "$c_reset"
 
-  printf "%spython:%s\n" "$c_bold" "$c_reset"
+  printf "%sconfig.json:%s\n" "$c_bold" "$c_reset"
+  if [[ -x "$VENV_PY" ]]; then
+    "$VENV_PY" - <<'PY'
+import sys
+from config import DEFAULT_CONFIG_PATH, load_config, validate, to_dict
+G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
+exists = DEFAULT_CONFIG_PATH.is_file()
+mark = (G + "\u25cf") if exists else (Y + "\u25cb")
+print(f"  {mark}{Z} {DEFAULT_CONFIG_PATH}"
+      + ("" if exists else "  (will be seeded on next bootstrap)"))
+cfg = load_config()
+errs = validate(to_dict(cfg))
+if errs:
+    for e in errs: print(f"  {R}\u25cb{Z} {e}")
+else:
+    print(f"  {G}\u25cf{Z} schema OK   asr={cfg.asr_backend}  llm={cfg.llm_host}:{cfg.llm_port}  inspector={cfg.inspector_bind}:{cfg.inspector_port}")
+PY
+  else
+    printf "  (skip - venv missing)\n"
+  fi
+
+  printf "\n%spython:%s\n" "$c_bold" "$c_reset"
   if [[ -x "$VENV_PY" ]]; then
     printf "  "; ok; printf "venv at %s (%s)\n" "$VENV_DIR" "$($VENV_PY --version)"
   else
@@ -432,6 +489,16 @@ PY
     printf "  "; bad; printf "Char.app NOT installed (run \`./run.sh install-char\` to fetch v%s)\n" "$CHAR_KNOWN_GOOD_VERSION"
   fi
 
+  printf "\n%sinspector:%s\n" "$c_bold" "$c_reset"
+  if inspector_pid >/dev/null; then
+    printf "  "; ok; printf "running at http://%s:%s/   (pid %s)\n" \
+                          "$INSPECTOR_BIND" "$INSPECTOR_PORT" "$(inspector_pid)"
+    printf "                   open with: %s./run.sh inspector open%s\n" "$c_bold" "$c_reset"
+  else
+    printf "  "; warn; printf "not running -- start with %s./run.sh inspector start%s (or %s./run.sh start%s)\n" \
+                            "$c_bold" "$c_reset" "$c_bold" "$c_reset"
+  fi
+
   printf "\n%schar config hints (manual fallback):%s\n" "$c_bold" "$c_reset"
   printf "  Live recording  : Custom provider, Base URL http://127.0.0.1:%s\n" "$ASR_PORT"
   printf "  Generate (file) : OpenAI provider, Model gpt-4o-transcribe, Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
@@ -453,22 +520,25 @@ cmd_setup() {
 cmd_bootstrap() {
   printf "%sbootstrap%s — first-time setup for a fresh clone\n\n" "$c_bold" "$c_reset"
 
-  printf "%s(1/5) python venv + pip deps%s\n" "$c_bold" "$c_reset"
+  printf "%s(1/6) python venv + pip deps%s\n" "$c_bold" "$c_reset"
   ensure_pip_deps             || return 1
 
-  printf "\n%s(2/5) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(2/6) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
   ensure_parakeet_model       || return 1
 
-  printf "\n%s(3/5) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(3/6) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
   ensure_diarization_models   || true   # best-effort
 
-  printf "\n%s(4/5) LM Studio.app + Qwen LLM%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(4/6) ~/.config/local_scribe/config.json%s\n" "$c_bold" "$c_reset"
+  ensure_config_json          || true   # best-effort
+
+  printf "\n%s(5/6) LM Studio.app + Qwen LLM%s\n" "$c_bold" "$c_reset"
   if ! lmstudio_full_bootstrap; then
     say "${c_yellow}LM Studio bootstrap incomplete — Char's summary step will fail${c_reset}"
     say "  fix the issues above (or load the model from LM Studio.app), then re-run"
   fi
 
-  printf "\n%s(5/5) Char.app — install + auto-config%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(6/6) Char.app — install + auto-config%s\n" "$c_bold" "$c_reset"
   if ! char_installed; then
     printf "  Char.app not installed at /Applications/Char.app.\n"
     printf "  We can fetch the pinned version (%s) from GitHub Releases:\n" "$CHAR_KNOWN_GOOD_VERSION"
@@ -978,6 +1048,95 @@ asr_stop() {
   say "${c_green}ASR server stopped${c_reset}"
 }
 
+# --- Inspector (web UI) ---
+#
+# Tiny FastAPI app on :8001 that surfaces Char's sessions, our config,
+# and the Char audit. Optional service -- no other component depends on
+# it. Defaults to loopback-only; the validator inside config.py refuses
+# a non-loopback bind without an auth token.
+
+inspector_pid() {
+  [[ -f "$INSPECTOR_PID_FILE" ]] || return 1
+  local pid; pid="$(cat "$INSPECTOR_PID_FILE")"
+  kill -0 "$pid" 2>/dev/null && echo "$pid" || return 1
+}
+
+inspector_start() {
+  if inspector_pid >/dev/null; then
+    say "Inspector already running (pid $(inspector_pid))"
+    return 0
+  fi
+  if [[ ! -x "$VENV_PY" ]]; then
+    say "${c_red}venv python missing at $VENV_PY${c_reset}"
+    return 1
+  fi
+  say "starting inspector on $INSPECTOR_BIND:$INSPECTOR_PORT ..."
+  printf "\n========== started %s ==========\n" "$(date)" >> "$INSPECTOR_LOG_FILE"
+  nohup "$VENV_PY" -u -m uvicorn inspector_server:app \
+        --host "$INSPECTOR_BIND" --port "$INSPECTOR_PORT" \
+        >>"$INSPECTOR_LOG_FILE" 2>&1 &
+  echo $! > "$INSPECTOR_PID_FILE"
+  for _ in {1..15}; do
+    if curl -sf "http://127.0.0.1:$INSPECTOR_PORT/api/health" >/dev/null 2>&1; then
+      say "${c_green}inspector up at http://$INSPECTOR_BIND:$INSPECTOR_PORT (pid $(inspector_pid))${c_reset}"
+      return 0
+    fi
+    sleep 1
+  done
+  say "${c_red}inspector didn't respond after 15s${c_reset}"
+  say "  see $INSPECTOR_LOG_FILE"
+  return 1
+}
+
+inspector_stop() {
+  if ! inspector_pid >/dev/null; then
+    say "Inspector is not running"
+    rm -f "$INSPECTOR_PID_FILE"
+    return 0
+  fi
+  local pid; pid="$(inspector_pid)"
+  say "stopping inspector (pid $pid) ..."
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..10}; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$INSPECTOR_PID_FILE"
+  say "${c_green}inspector stopped${c_reset}"
+}
+
+cmd_inspector() {
+  case "${1:-status}" in
+    start)   inspector_start ;;
+    stop)    inspector_stop ;;
+    restart) inspector_stop; inspector_start ;;
+    status)
+      if inspector_pid >/dev/null; then
+        printf "  "; ok; printf "inspector       pid=%-7s url=http://%s:%s\n" \
+                              "$(inspector_pid)" "$INSPECTOR_BIND" "$INSPECTOR_PORT"
+      else
+        printf "  "; bad; printf "inspector       not running\n"
+      fi
+      ;;
+    open)
+      if ! inspector_pid >/dev/null; then inspector_start || return 1; fi
+      open "http://127.0.0.1:$INSPECTOR_PORT/" 2>/dev/null \
+        || say "open http://127.0.0.1:$INSPECTOR_PORT/ in your browser"
+      ;;
+    log|logs)
+      [[ -f "$INSPECTOR_LOG_FILE" ]] || { say "no log at $INSPECTOR_LOG_FILE"; return 1; }
+      exec tail -F "$INSPECTOR_LOG_FILE"
+      ;;
+    *)
+      printf "usage: %s./run.sh inspector%s {start|stop|restart|status|open|logs}\n" "$c_bold" "$c_reset"
+      return 2
+      ;;
+  esac
+}
+
 # --- LM Studio ---
 
 # Path to the `lms` CLI binary. LM Studio.app stages it in two different
@@ -1282,6 +1441,9 @@ cmd_start() {
   local lms_rc=$?    # 0 ok, 1 unreachable, 2 reachable-but-no-model
 
   asr_start || return 1
+  # Inspector is best-effort: if it fails to start, the ASR pipeline
+  # still works -- just no web UI. Don't fail the whole `start` for it.
+  inspector_start || say "${c_yellow}inspector failed to start; ASR pipeline still ok${c_reset}"
   printf "\n"
 
   if [[ $lms_rc -eq 0 ]]; then
@@ -1290,6 +1452,10 @@ cmd_start() {
            "$c_green" "$ASR_PORT" "$c_reset"
     printf "  LM Studio API (Qwen3-30B)    : %shttp://127.0.0.1:%s%s   (summary + speaker naming)\n" \
            "$c_green" "$LMSTUDIO_PORT" "$c_reset"
+    if inspector_pid >/dev/null; then
+      printf "  Inspector (web UI)           : %shttp://127.0.0.1:%s/%s   (sessions, config, char audit)\n" \
+             "$c_green" "$INSPECTOR_PORT" "$c_reset"
+    fi
   else
     printf "%s──── pipeline %sPARTIALLY%s ready ────%s\n" \
            "$c_bold" "$c_yellow" "$c_reset$c_bold" "$c_reset"
@@ -1322,6 +1488,7 @@ cmd_start() {
 
 cmd_stop() {
   asr_stop
+  inspector_stop
   printf "  %sLM Studio left running%s; use \`lms server stop\` to free GPU memory\n" \
          "$c_dim" "$c_reset"
 }
@@ -1350,6 +1517,12 @@ cmd_status() {
     fi
   else
     printf "  "; bad; printf "LM Studio API    not running on :%s\n" "$LMSTUDIO_PORT"
+  fi
+  if inspector_pid >/dev/null; then
+    printf "  "; ok; printf "Inspector        pid=%-7s url=http://%s:%s\n" \
+                          "$(inspector_pid)" "$INSPECTOR_BIND" "$INSPECTOR_PORT"
+  else
+    printf "  "; warn; printf "Inspector        not running (\`./run.sh inspector start\`)\n"
   fi
 }
 
@@ -1403,6 +1576,8 @@ case "${1:-}" in
               cmd_install_char ;;
   install-llm|install_llm|install-lmstudio|install_lmstudio)
               cmd_install_llm ;;
+  inspector|web|ui)
+              shift; cmd_inspector "$@" ;;
   transcribe) cmd_transcribe "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
