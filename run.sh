@@ -28,9 +28,14 @@
 #   ./run.sh doctor         deep preflight report - python, deps, models,
 #                            services, Char-config hints. Safe any time.
 #   ./run.sh setup          force-reinstall pip deps + (re)download models
+#   ./run.sh install-char   download the pinned Char.app DMG from GitHub
+#                            Releases, verify SHA256, install to /Applications.
+#                            Refuses to clobber a different installed version
+#                            without confirmation.
 #   ./run.sh configure-char point Char's OpenAI transcriber at this server
 #                            (interactive; offers to back up existing API key).
-#                            Bootstrap calls this for you on a fresh install.
+#                            Bootstrap calls install-char + configure-char in
+#                            sequence on a fresh install.
 #   ./run.sh transcribe FILE [args...]
 #                            run transcribe_file.py FILE with the venv python
 #
@@ -65,6 +70,29 @@ ASR_PORT="${ASR_PORT:-8000}"
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 LLM_MODEL="${LLM_MODEL:-qwen3-30b-a3b-instruct-2507}"
 LLM_CONTEXT="${LLM_CONTEXT:-65536}"
+
+# --- Char.app version pin --------------------------------------------------
+#
+# We've validated our auto-config flow + OpenAI-compatible endpoint against
+# this exact Char build. Newer versions may rename settings.json keys, change
+# the multipart contract on `/v1/audio/transcriptions`, or restructure the
+# bundle layout in ways that break us. So:
+#   - if the installed Char's CFBundleShortVersionString != $CHAR_KNOWN_GOOD,
+#     `doctor`, `start`, and `configure-char` print a yellow warning (not a
+#     hard error - we still try, since most patches are backwards-compatible).
+#   - `bootstrap` offers to download exactly this version from GitHub Releases
+#     when no Char.app is installed yet; the .dmg is verified against the
+#     SHA256s below before we touch /Applications.
+#
+# To bump: download the new desktop_vX.Y.Z DMGs from
+# https://github.com/fastrepl/anarlog/releases, run end-to-end smoke (record a
+# call, click Generate, confirm transcription routes here), then update the
+# four constants below and the test count / dates in the README.
+CHAR_KNOWN_GOOD_VERSION="1.0.24"
+CHAR_RELEASE_TAG="desktop_v${CHAR_KNOWN_GOOD_VERSION}"
+CHAR_RELEASE_BASE_URL="https://github.com/fastrepl/anarlog/releases/download/${CHAR_RELEASE_TAG}"
+CHAR_DMG_SHA256_AARCH64="7f9c06881b9593b2aec17c8eddd65e5eb67d2c1072bfd008501989eb4181da89"
+CHAR_DMG_SHA256_X86_64="e7061d274308b563df724d7da5ede80e0cc68ff7082a3586b41ed8cc2c815503"
 
 # --- styling helpers ---
 if [[ -t 1 ]]; then
@@ -304,9 +332,47 @@ PY
     fi
   fi
 
-  printf "\n%schar config (set these in Char's Settings -> Transcription):%s\n" "$c_bold" "$c_reset"
+  printf "\n%schar.app:%s\n" "$c_bold" "$c_reset"
+  if char_installed; then
+    local v; v="$(char_installed_version)"
+    if [[ "$v" == "$CHAR_KNOWN_GOOD_VERSION" ]]; then
+      printf "  "; ok; printf "Char %s installed (matches pinned)\n" "$v"
+    elif [[ -z "$v" ]]; then
+      printf "  "; warn; printf "Char installed but version unreadable (pinned: %s)\n" "$CHAR_KNOWN_GOOD_VERSION"
+    else
+      printf "  "; warn; printf "Char %s installed; %s pinned -- run \`./run.sh install-char\` to align\n" \
+             "$v" "$CHAR_KNOWN_GOOD_VERSION"
+    fi
+    if [[ -f "$CHAR_SETTINGS" ]]; then
+      "$VENV_PY" - "$CHAR_SETTINGS" "$ASR_PORT" <<'PY'
+import json, sys, pathlib
+expected_port = sys.argv[2]
+G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
+d = json.loads(pathlib.Path(sys.argv[1]).read_text())
+ai  = d.get("ai") or {}
+oai = ((ai.get("stt") or {}).get("openai")) or {}
+prov  = ai.get("current_stt_provider", "")
+model = ai.get("current_stt_model", "")
+url   = oai.get("base_url", "")
+expected_url = f"http://127.0.0.1:{expected_port}/v1"
+if prov == "openai" and model == "gpt-4o-transcribe-diarize" and url == expected_url:
+    print(f"  {G}\u25cf{Z} Char transcriber configured for this server")
+else:
+    print(f"  {Y}\u25cb{Z} Char transcriber NOT pointed here -- run `./run.sh configure-char`")
+    print(f"      provider : {prov!r:<25s} (want 'openai')")
+    print(f"      model    : {model!r:<25s} (want 'gpt-4o-transcribe-diarize')")
+    print(f"      base_url : {url!r:<25s} (want '{expected_url}')")
+PY
+    else
+      printf "  "; warn; printf "Char settings.json missing -- open Char once, then \`./run.sh configure-char\`\n"
+    fi
+  else
+    printf "  "; bad; printf "Char.app NOT installed (run \`./run.sh install-char\` to fetch v%s)\n" "$CHAR_KNOWN_GOOD_VERSION"
+  fi
+
+  printf "\n%schar config hints (manual fallback):%s\n" "$c_bold" "$c_reset"
   printf "  Live recording  : Custom provider, Base URL http://127.0.0.1:%s\n" "$ASR_PORT"
-  printf "  Generate (file) : OpenAI provider, Advanced -> Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
+  printf "  Generate (file) : OpenAI provider, Model gpt-4o-transcribe-diarize, Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
   printf "  api key (both)  : any non-empty string (auth is ignored locally)\n"
   printf "  intelligence    : LM Studio @ http://127.0.0.1:%s   model=%s\n" "$LMSTUDIO_PORT" "$LLM_MODEL"
   printf "\n"
@@ -337,17 +403,45 @@ cmd_bootstrap() {
   printf "\n%s(4/5) LM Studio CLI check%s\n" "$c_bold" "$c_reset"
   ensure_lms_cli              || true
 
-  printf "\n%s(5/5) Char transcriber config%s\n" "$c_bold" "$c_reset"
-  if char_installed; then
+  printf "\n%s(5/5) Char.app — install + auto-config%s\n" "$c_bold" "$c_reset"
+  if ! char_installed; then
+    printf "  Char.app not installed at /Applications/Char.app.\n"
+    printf "  We can fetch the pinned version (%s) from GitHub Releases:\n" "$CHAR_KNOWN_GOOD_VERSION"
+    printf "    %s%s/hyprnote-macos-<arch>.dmg%s\n" \
+           "$c_dim" "$CHAR_RELEASE_BASE_URL" "$c_reset"
+    if ask_yn "  Download and install Char $CHAR_KNOWN_GOOD_VERSION now?" y; then
+      printf "\n"
+      if char_install_pinned; then
+        printf "\n"
+        if ask_yn "  Now configure Char to send transcripts to this server?" y; then
+          printf "\n"
+          cmd_configure_char || say "${c_yellow}Char config skipped/failed; rerun with ./run.sh configure-char${c_reset}"
+        fi
+      else
+        say "${c_yellow}install failed; install Char manually then run \`./run.sh configure-char\`${c_reset}"
+      fi
+    else
+      printf "  skipped — install Char manually, then: %s./run.sh configure-char%s\n" "$c_bold" "$c_reset"
+    fi
+  else
+    local cur; cur="$(char_installed_version)"
+    if [[ "$cur" == "$CHAR_KNOWN_GOOD_VERSION" ]]; then
+      printf "  Char %s already installed (matches pinned).\n" "$cur"
+    else
+      printf "  %sChar %s installed; pinned %s.%s\n" \
+             "$c_yellow" "$cur" "$CHAR_KNOWN_GOOD_VERSION" "$c_reset"
+      printf "  Auto-config has only been tested against %s.\n" "$CHAR_KNOWN_GOOD_VERSION"
+      if ask_yn "  Replace with pinned $CHAR_KNOWN_GOOD_VERSION?" n; then
+        printf "\n"
+        char_install_pinned || say "${c_yellow}install failed; keeping existing Char $cur${c_reset}"
+      fi
+    fi
     if ask_yn "  Configure Char.app now to send transcripts to this server?" y; then
       printf "\n"
       cmd_configure_char || say "${c_yellow}Char config skipped/failed; rerun with ./run.sh configure-char${c_reset}"
     else
       printf "  skipped — run %s./run.sh configure-char%s any time\n" "$c_bold" "$c_reset"
     fi
-  else
-    printf "  Char.app not installed at /Applications/Char.app — skipping.\n"
-    printf "  After installing Char, run: %s./run.sh configure-char%s\n" "$c_bold" "$c_reset"
   fi
 
   printf "\n%s════════ bootstrap complete ════════%s\n\n" "$c_green" "$c_reset"
@@ -383,10 +477,37 @@ cmd_bootstrap() {
 # `ai.current_stt_*` keys here; LLM provider, templates, etc. are left alone.
 
 CHAR_APP="/Applications/Char.app"
+CHAR_INFO_PLIST="$CHAR_APP/Contents/Info.plist"
 CHAR_DATA_DIR="$HOME/Library/Application Support/hyprnote"
 CHAR_SETTINGS="$CHAR_DATA_DIR/settings.json"
 
 char_installed() { [[ -d "$CHAR_APP" ]]; }
+
+# Read the installed Char's CFBundleShortVersionString. Echoes the version
+# string on stdout (e.g. "1.0.24") or empty if Char isn't installed. Does NOT
+# fail; callers compare with $CHAR_KNOWN_GOOD_VERSION themselves.
+char_installed_version() {
+  [[ -f "$CHAR_INFO_PLIST" ]] || return 0
+  defaults read "$CHAR_INFO_PLIST" CFBundleShortVersionString 2>/dev/null || true
+}
+
+# Print a one-liner about version drift. Returns 0 when in-pin or Char is
+# missing entirely; returns 1 only when we detect a mismatch (so callers can
+# colorize accordingly). Never blocks.
+char_version_status() {
+  local v
+  v="$(char_installed_version)"
+  if [[ -z "$v" ]]; then
+    return 0  # not installed; not our problem here
+  fi
+  if [[ "$v" == "$CHAR_KNOWN_GOOD_VERSION" ]]; then
+    printf "Char %s (matches pinned)" "$v"
+    return 0
+  fi
+  printf "Char %s installed; %s pinned -- auto-config tested against the pinned version only" \
+         "$v" "$CHAR_KNOWN_GOOD_VERSION"
+  return 1
+}
 
 char_running() {
   pgrep -f "$CHAR_APP/Contents/MacOS/char" >/dev/null 2>&1
@@ -403,6 +524,103 @@ char_quit() {
 }
 
 char_relaunch() { open -ga Char; }
+
+# Download + install the pinned Char.app from the GitHub Release attached to
+# this commit. We refuse to overwrite an existing /Applications/Char.app
+# without explicit confirmation. Returns 0 on success.
+char_install_pinned() {
+  local arch dmg_name expected_sha
+  case "$(uname -m)" in
+    arm64)  arch="aarch64"; expected_sha="$CHAR_DMG_SHA256_AARCH64" ;;
+    x86_64) arch="x86_64";  expected_sha="$CHAR_DMG_SHA256_X86_64"  ;;
+    *)
+      say "${c_red}unsupported architecture: $(uname -m)${c_reset}"
+      say "  Char DMGs are published for arm64 and x86_64 only"
+      return 1 ;;
+  esac
+  dmg_name="hyprnote-macos-${arch}.dmg"
+  local url="${CHAR_RELEASE_BASE_URL}/${dmg_name}"
+
+  printf "  pinned version : %s\n" "$CHAR_KNOWN_GOOD_VERSION"
+  printf "  arch           : %s\n" "$arch"
+  printf "  download URL   : %s\n" "$url"
+  printf "  expected sha256: %s\n" "$expected_sha"
+
+  if char_installed; then
+    local cur; cur="$(char_installed_version)"
+    if [[ "$cur" == "$CHAR_KNOWN_GOOD_VERSION" ]]; then
+      say "${c_green}Char $cur already installed and matches pin -- nothing to do${c_reset}"
+      return 0
+    fi
+    if ! ask_yn "  Char $cur is installed; replace with pinned $CHAR_KNOWN_GOOD_VERSION?" n; then
+      say "  keeping existing Char $cur"
+      return 0
+    fi
+  fi
+
+  local tmpdir; tmpdir="$(mktemp -d -t local_scribe_char.XXXXXX)"
+  trap 'rm -rf "$tmpdir"; hdiutil detach "$tmpdir/mount" -quiet >/dev/null 2>&1 || true' RETURN
+  local dmg_path="$tmpdir/$dmg_name"
+
+  say "downloading $dmg_name (~600 MB on Apple Silicon, this takes a minute) ..."
+  if ! curl -fL --progress-bar -o "$dmg_path" "$url"; then
+    say "${c_red}download failed${c_reset}"
+    return 1
+  fi
+
+  say "verifying sha256 ..."
+  local actual_sha
+  actual_sha="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    say "${c_red}sha256 mismatch -- refusing to install${c_reset}"
+    say "  expected: $expected_sha"
+    say "  got     : $actual_sha"
+    say "  this could mean the release was retagged, or the download was tampered with."
+    return 1
+  fi
+  say "${c_green}sha256 ok${c_reset}"
+
+  local mountpoint="$tmpdir/mount"
+  mkdir -p "$mountpoint"
+  say "mounting DMG ..."
+  if ! hdiutil attach "$dmg_path" -mountpoint "$mountpoint" -nobrowse -quiet; then
+    say "${c_red}failed to mount $dmg_path${c_reset}"
+    return 1
+  fi
+
+  local src_app
+  src_app="$(find "$mountpoint" -maxdepth 2 -name "Char.app" -print -quit 2>/dev/null)"
+  if [[ -z "$src_app" ]]; then
+    src_app="$(find "$mountpoint" -maxdepth 2 -name "Hyprnote.app" -print -quit 2>/dev/null)"
+  fi
+  if [[ -z "$src_app" ]]; then
+    say "${c_red}couldn't find Char.app or Hyprnote.app inside the DMG${c_reset}"
+    hdiutil detach "$mountpoint" -quiet >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if char_running; then
+    say "Char is running; quitting before replace ..."
+    char_quit
+  fi
+
+  say "installing to $CHAR_APP ..."
+  rm -rf "$CHAR_APP"
+  if ! cp -R "$src_app" "$CHAR_APP"; then
+    say "${c_red}cp failed -- you may need to grant your terminal Full Disk Access${c_reset}"
+    hdiutil detach "$mountpoint" -quiet >/dev/null 2>&1 || true
+    return 1
+  fi
+  hdiutil detach "$mountpoint" -quiet >/dev/null 2>&1 || true
+
+  # Strip macOS quarantine so Gatekeeper doesn't pop the "downloaded from
+  # internet" prompt on first launch. (We just verified the SHA pin manually,
+  # so the user has already opted in to trusting this artifact.)
+  xattr -dr com.apple.quarantine "$CHAR_APP" 2>/dev/null || true
+
+  local new_v; new_v="$(char_installed_version)"
+  say "${c_green}Char ${new_v} installed at $CHAR_APP${c_reset}"
+}
 
 # Yes/no prompt with default. $1=question, $2=default ("y" or "n").
 # Returns 0 for yes, 1 for no. Falls back to default when there's no tty
@@ -444,7 +662,8 @@ cmd_configure_char() {
 
   if ! char_installed; then
     say "${c_red}Char.app not found at $CHAR_APP${c_reset}"
-    say "  install Char from https://char.com (or https://github.com/fastrepl/anarlog), then re-run"
+    say "  install Char from https://char.com (or https://github.com/fastrepl/anarlog),"
+    say "  or run \`./run.sh install-char\` to fetch the pinned version $CHAR_KNOWN_GOOD_VERSION"
     return 1
   fi
   if [[ ! -f "$CHAR_SETTINGS" ]]; then
@@ -455,6 +674,14 @@ cmd_configure_char() {
   if [[ ! -x "$VENV_PY" ]]; then
     say "${c_red}venv python missing — run \`./run.sh bootstrap\` first${c_reset}"
     return 1
+  fi
+
+  local installed_v; installed_v="$(char_installed_version)"
+  if [[ "$installed_v" != "$CHAR_KNOWN_GOOD_VERSION" ]]; then
+    say "${c_yellow}WARNING: Char $installed_v installed; auto-config tested only against pinned $CHAR_KNOWN_GOOD_VERSION${c_reset}"
+    say "  the four settings.json keys we patch are stable across recent versions,"
+    say "  but if Char misbehaves after this, downgrade with: ./run.sh install-char"
+    say ""
   fi
 
   if char_running; then
@@ -557,6 +784,12 @@ PY
       say "${c_yellow}Char did not relaunch automatically — open it manually${c_reset}"
     fi
   fi
+}
+
+cmd_install_char() {
+  printf "%sinstall-char%s — fetch the pinned Char.app DMG and install to /Applications\n\n" \
+         "$c_bold" "$c_reset"
+  char_install_pinned
 }
 
 # --- ASR server ---
@@ -825,6 +1058,8 @@ case "${1:-}" in
   bootstrap)  cmd_bootstrap ;;
   configure-char|configure_char|configure)
               cmd_configure_char ;;
+  install-char|install_char)
+              cmd_install_char ;;
   transcribe) cmd_transcribe "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
