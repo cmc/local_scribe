@@ -1,7 +1,7 @@
 # Local transcription + summarization pipeline.
 # Tested on macOS 14+ (Apple Silicon) with Python 3.12-3.14.
 
-# --- HTTP server (whisper_server.py) ---
+# --- HTTP server (asr_server.py) ---
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.27,<1.0
 

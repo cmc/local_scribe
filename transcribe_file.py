@@ -1,12 +1,12 @@
 """
-Manual transcribe-and-summarize CLI for the local ASR + LM Studio rig.
+local_transcriber - manual transcribe-and-summarize CLI.
 
 Use case: when Char doesn't auto-transcribe an audio file you dragged
 into it, run this script to (1) transcribe the audio using either
 NVIDIA Parakeet TDT v3 (default; lowest WER for English on the OpenASR
-leaderboard, runs locally via parakeet-mlx) or the legacy Whisper server,
-then (2) feed the transcript into LM Studio (Qwen3 by default) to produce
-a structured call summary with these sections:
+leaderboard, runs locally via parakeet-mlx) or faster-whisper through
+the local ASR HTTP server, then (2) feed the transcript into LM Studio
+(Qwen3 by default) to produce a structured call summary with these sections:
 
     - Participants
     - Key points discussed
@@ -20,7 +20,7 @@ Studio backend - this script only matters for the manual / file-upload path.
 
 Usage:
     python transcribe_file.py path/to/call.m4a
-    python transcribe_file.py path/to/call.m4a --asr-backend whisper   # use the HTTP whisper server
+    python transcribe_file.py path/to/call.m4a --asr-backend whisper   # use the HTTP ASR server
     python transcribe_file.py path/to/call.m4a --progress
     python transcribe_file.py path/to/call.m4a --copy
     python transcribe_file.py path/to/call.m4a --no-llm
@@ -33,26 +33,26 @@ Usage:
     python transcribe_file.py --clear-cache                       # wipe the cache
 
 Caching & bulk analysis:
-    Transcripts are cached to ~/.cache/whisper_server/transcripts/<sha256>.json
+    Transcripts are cached to ~/.cache/local_transcriber/transcripts/<sha256>.json
     keyed by the audio file's content hash. Each cache entry embeds a `_source`
     block with original path, file mtime, hash, transcribed-at timestamp, and
-    Whisper-detected duration - so bulk analysis is a simple glob:
+    detected duration - so bulk analysis is a simple glob:
 
-        for f in ~/.cache/whisper_server/transcripts/*.json:
+        for f in ~/.cache/local_transcriber/transcripts/*.json:
             data = json.load(open(f))
             print(data["_source"]["path"], data["_source"]["transcribed_at_human"])
 
     Or use --list-cache for a quick tabular overview. Override the location
-    with --cache-dir or WHISPER_CACHE_DIR.
+    with --cache-dir or TRANSCRIPT_CACHE_DIR.
 
 Env overrides:
-    ASR_BACKEND        default parakeet (alternative: whisper)
-    PARAKEET_MODEL     default mlx-community/parakeet-tdt-0.6b-v3
-    WHISPER_URL        default http://127.0.0.1:8000/v1/listen
-    LLM_URL            default http://127.0.0.1:1234/v1/chat/completions
-    LLM_MODEL          default qwen3-30b-a3b-instruct-2507
-    LLM_MAX_TOKENS     default 4096
-    WHISPER_CACHE_DIR  default ~/.cache/whisper_server/transcripts
+    ASR_BACKEND          default parakeet (alternative: whisper)
+    PARAKEET_MODEL       default mlx-community/parakeet-tdt-0.6b-v3
+    ASR_URL              default http://127.0.0.1:8000/v1/listen
+    LLM_URL              default http://127.0.0.1:1234/v1/chat/completions
+    LLM_MODEL            default qwen3-30b-a3b-instruct-2507
+    LLM_MAX_TOKENS       default 4096
+    TRANSCRIPT_CACHE_DIR default ~/.cache/local_transcriber/transcripts
 """
 
 from __future__ import annotations
@@ -78,13 +78,13 @@ DEFAULT_PARAKEET_MODEL = os.getenv(
 DEFAULT_DIARIZE = os.getenv("DIARIZE", "1").strip() not in {"0", "false", "no", ""}
 DEFAULT_NUM_SPEAKERS = int(os.getenv("NUM_SPEAKERS", "0")) or None
 DEFAULT_CLUSTER_THRESHOLD = float(os.getenv("CLUSTER_THRESHOLD", "0.5"))
-DEFAULT_WHISPER_URL = os.getenv("WHISPER_URL", "http://127.0.0.1:8000/v1/listen")
+DEFAULT_ASR_URL = os.getenv("ASR_URL", "http://127.0.0.1:8000/v1/listen")
 DEFAULT_LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:1234/v1/chat/completions")
 DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "qwen3-30b-a3b-instruct-2507")
 DEFAULT_LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 DEFAULT_CACHE_DIR = Path(
-    os.getenv("WHISPER_CACHE_DIR")
-    or (Path.home() / ".cache" / "whisper_server" / "transcripts")
+    os.getenv("TRANSCRIPT_CACHE_DIR")
+    or (Path.home() / ".cache" / "local_transcriber" / "transcripts")
 )
 
 
@@ -869,11 +869,11 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Which ASR engine to use (default: {DEFAULT_ASR_BACKEND}). "
                         "'parakeet' runs NVIDIA Parakeet-TDT v3 in-process via parakeet-mlx "
                         "(top of OpenASR leaderboard for English; recommended for max accuracy). "
-                        "'whisper' POSTs to the local Whisper HTTP server.")
+                        "'whisper' POSTs to the local ASR HTTP server (faster-whisper).")
     p.add_argument("--parakeet-model", default=DEFAULT_PARAKEET_MODEL,
                    help=f"Parakeet model id (default: {DEFAULT_PARAKEET_MODEL})")
-    p.add_argument("--server", default=DEFAULT_WHISPER_URL,
-                   help=f"Whisper server URL (default: {DEFAULT_WHISPER_URL})")
+    p.add_argument("--server", default=DEFAULT_ASR_URL,
+                   help=f"ASR HTTP server URL (default: {DEFAULT_ASR_URL})")
     p.add_argument("--llm-url", default=DEFAULT_LLM_URL,
                    help=f"LM Studio chat completions URL (default: {DEFAULT_LLM_URL})")
     p.add_argument("--llm-model", default=DEFAULT_LLM_MODEL,
@@ -982,11 +982,11 @@ def main(argv: list[str] | None = None) -> int:
                 if payload is None:
                     return 2
             else:
-                _log(f"🎙️  Transcribing via Whisper batch endpoint at {args.server} ...")
+                _log(f"🎙️  Transcribing via ASR HTTP server at {args.server} ...")
                 payload = transcribe(args.file, args.server)
         except requests.RequestException as exc:
             print(f"\n❌ Transcription request failed: {exc}", file=sys.stderr)
-            print("   Is the whisper server running? (uvicorn whisper_server:app --port 8000)",
+            print("   Is the ASR server running? (./run.sh start  -or-  uvicorn asr_server:app --port 8000)",
                   file=sys.stderr)
             return 2
         except ImportError as exc:

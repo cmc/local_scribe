@@ -1,5 +1,5 @@
 """
-Local Deepgram-compatible ASR server.
+local_transcriber - Deepgram-compatible ASR server.
 
 Implements the two pieces of Deepgram's /v1/listen contract that real clients
 (including Char with BYOK Deepgram + a custom base URL) actually use:
@@ -12,8 +12,7 @@ Two ASR backends are pluggable via ASR_BACKEND:
   * parakeet (default) - NVIDIA Parakeet-TDT 0.6B v3 via parakeet-mlx
                          (top of the OpenASR leaderboard for English; runs
                          natively on Apple Silicon)
-  * whisper            - faster-whisper large-v3-turbo (the original backend;
-                         multilingual)
+  * whisper            - faster-whisper large-v3-turbo (multilingual fallback)
 
 Char setup
 ----------
@@ -27,7 +26,7 @@ and (if available) set the base URL to http://127.0.0.1:8000.
 
 Run
 ---
-    uvicorn whisper_server:app --host 0.0.0.0 --port 8000
+    uvicorn asr_server:app --host 0.0.0.0 --port 8000
 
 Configuration env vars
 ----------------------
@@ -65,7 +64,7 @@ from fastapi import FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-logger = logging.getLogger("whisper_server")
+logger = logging.getLogger("local_transcriber")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -139,7 +138,7 @@ _mlx_executor.submit(lambda: None).result()
 
 logger.info("model ready (backend=%s, model=%s)", ASR_BACKEND, MODEL_NAME)
 
-app = FastAPI(title="whisper-server", version="0.2.0")
+app = FastAPI(title="local-transcriber-asr", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

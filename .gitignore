@@ -19,8 +19,9 @@ env/
 .idea/
 .vscode/
 
-# Local model caches and transcript caches live under ~/.cache/whisper_server/,
-# but if anyone ever drops them in the repo, ignore them too.
+# Local model caches and transcript caches live under
+# ~/.cache/local_transcriber/, but if anyone ever drops them in the repo,
+# ignore them too.
 models/
 transcripts/
 

@@ -16,7 +16,7 @@ reading conversational cues (introductions, "thanks for calling", etc.).
 
 The intermediate model files are pulled once from
 https://github.com/k2-fsa/sherpa-onnx/releases (public, no auth) and cached
-to ~/.cache/whisper_server/diarization/.
+to ~/.cache/local_transcriber/diarization/.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ import requests
 
 DEFAULT_CACHE_DIR = Path(
     os.getenv("DIARIZATION_CACHE_DIR")
-    or (Path.home() / ".cache" / "whisper_server" / "diarization")
+    or (Path.home() / ".cache" / "local_transcriber" / "diarization")
 )
 
 SEGMENTATION_MODEL_URL = (

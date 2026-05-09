@@ -1,4 +1,4 @@
-# whisper_server
+# local_transcriber
 
 Local, private, Apple-Silicon-native transcription + summarization pipeline.
 Drops in as a Deepgram-compatible endpoint behind [Char](https://char.so) and
@@ -12,9 +12,9 @@ once the models are downloaded.
                             │ POST /v1/listen   (Deepgram contract)
                             ▼
        ┌──────────────────────────────────┐
-       │  whisper_server.py   :8000       │
+       │  asr_server.py   :8000           │
        │  • Parakeet-TDT 0.6B v3 (MLX)    │  ← default; English; lowest WER
-       │  • faster-whisper large-v3-turbo │  ← fallback; multilingual
+       │  • faster-whisper large-v3-turbo │  ← optional; multilingual fallback
        └──────────────┬───────────────────┘
                       │ Deepgram JSON
                       ▼
@@ -32,8 +32,8 @@ once the models are downloaded.
 
 | | what | role |
 |---|---|---|
-| `whisper_server.py` | FastAPI service on `:8000`. Implements the bits of Deepgram's `/v1/listen` contract Char uses (POST batch + WebSocket streaming) and routes through Parakeet (default) or faster-whisper. | Char's transcription endpoint |
-| `parakeet_backend.py` | parakeet-mlx wrapper. Merges sub-word BPE tokens into clean words, shapes output to Deepgram's word/timing schema. | ASR engine |
+| `asr_server.py` | FastAPI service on `:8000`. Implements the bits of Deepgram's `/v1/listen` contract Char uses (POST batch + WebSocket streaming) and routes through Parakeet (default) or faster-whisper. | Char's transcription endpoint |
+| `parakeet_backend.py` | parakeet-mlx wrapper. Merges sub-word BPE tokens into clean words, shapes output to Deepgram's word/timing schema. | Default ASR engine |
 | `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) + an LLM pass to map `SPEAKER_00/01/...` to real names. | Speaker labeling |
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
 | `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, and produce health reports. | Operator tool |
@@ -58,7 +58,7 @@ On a freshly cloned repo:
 
 ```bash
 git clone <this repo>
-cd whisper_server
+cd local_transcriber
 ./run.sh bootstrap        # venv + pip deps + ASR + diarization models
 # (do the manual installs above if you haven't already)
 ./run.sh start            # boot ASR server + LM Studio + tail the log
@@ -172,7 +172,7 @@ read-only and produces a report like:
 doctor — validating local pipeline
 
 python:
-  ● venv at /…/whisper_server/venv (Python 3.14.3)
+  ● venv at /…/local_transcriber/venv (Python 3.14.3)
 
 python packages:
   ● fastapi            0.136.1
@@ -184,8 +184,8 @@ python packages:
 
 models:
   ● parakeet (parakeet default)   cached at ~/.cache/huggingface/hub/…
-  ● pyannote segmentation         ~/.cache/whisper_server/diarization/…/model.onnx
-  ● NeMo TitaNet embedding        ~/.cache/whisper_server/diarization/nemo_en_titanet_small.onnx
+  ● pyannote segmentation         ~/.cache/local_transcriber/diarization/…/model.onnx
+  ● NeMo TitaNet embedding        ~/.cache/local_transcriber/diarization/nemo_en_titanet_small.onnx
 
 services:
   ● ASR server   :8000   reachable
@@ -208,22 +208,23 @@ All knobs are env vars; defaults are sensible.
 | variable | default | what |
 |---|---|---|
 | `ASR_BACKEND` | `parakeet` | `parakeet` (English, MLX, lowest WER) or `whisper` (multilingual) |
-| `PARAKEET_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | HuggingFace repo for parakeet weights |
+| `ASR_PORT` | `8000` | what port the ASR server listens on |
+| `PARAKEET_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | HuggingFace repo for Parakeet weights |
 | `WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model id (only used when `ASR_BACKEND=whisper`) |
 | `WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `int16` / `float32` for the whisper backend |
 | `WHISPER_DEVICE` | `auto` | `cpu` / `cuda` / `auto` for the whisper backend |
 | `WHISPER_LANGUAGE` | unset | ISO-639 code; force a language (whisper only) |
-| `WHISPER_PORT` | `8000` | what port the ASR server listens on |
 | `LMSTUDIO_PORT` | `1234` | LM Studio HTTP API port |
 | `LLM_MODEL` | `qwen3-30b-a3b-instruct-2507` | the model `lms load` will bring up |
 | `LLM_CONTEXT` | `65536` | context length to load Qwen with |
 | `LLM_URL` | `http://127.0.0.1:1234/v1/chat/completions` | full chat endpoint URL |
 | `LLM_MAX_TOKENS` | `4096` | upper bound for summary completion |
+| `ASR_URL` | `http://127.0.0.1:8000/v1/listen` | URL `transcribe_file.py` posts to when `--asr-backend whisper` |
 | `DIARIZE` | `1` | set `0` to disable diarization by default |
 | `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if known |
 | `CLUSTER_THRESHOLD` | `0.5` | sherpa-onnx fast-clustering threshold |
-| `WHISPER_CACHE_DIR` | `~/.cache/whisper_server/transcripts` | where the transcript cache lives |
-| `DIARIZATION_CACHE_DIR` | `~/.cache/whisper_server/diarization` | where sherpa-onnx model files live |
+| `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_transcriber/transcripts` | where the transcript cache lives |
+| `DIARIZATION_CACHE_DIR` | `~/.cache/local_transcriber/diarization` | where sherpa-onnx model files live |
 | `PYTHON` | `python3.14` else `python3.12` else `python3` | which interpreter `run.sh` uses to build the venv |
 
 Switch to whisper for, say, a Mandarin call:
@@ -235,8 +236,8 @@ ASR_BACKEND=whisper WHISPER_LANGUAGE=zh ./run.sh restart
 ## Project layout
 
 ```
-whisper_server/
-├── whisper_server.py        # FastAPI server (Deepgram-compatible)
+local_transcriber/
+├── asr_server.py            # FastAPI server (Deepgram-compatible)
 ├── transcribe_file.py       # CLI for manual files
 ├── parakeet_backend.py      # parakeet-mlx wrapper, BPE -> Deepgram words
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
@@ -249,9 +250,9 @@ whisper_server/
 Caches (gitignored, safe to delete to free disk):
 
 ```
-~/.cache/huggingface/hub/                          # parakeet, faster-whisper
-~/.cache/whisper_server/diarization/               # sherpa-onnx ONNX models
-~/.cache/whisper_server/transcripts/<sha256>.json  # cached ASR results
+~/.cache/huggingface/hub/                                # Parakeet, faster-whisper
+~/.cache/local_transcriber/diarization/                  # sherpa-onnx ONNX models
+~/.cache/local_transcriber/transcripts/<sha256>.json     # cached ASR results
 ```
 
 ## API surface (for non-Char clients)

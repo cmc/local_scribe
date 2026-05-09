@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Local transcription pipeline manager.
+# local_transcriber - service manager for the local ASR + LLM pipeline.
 #
-# Services:
+# Services managed:
 #   - LM Studio API @ :1234            (started via `lms server start`)
 #     + qwen3-30b-a3b-instruct-2507    (loaded via `lms load`)
-#   - ASR server @ :8000               (uvicorn whisper_server:app, Parakeet by default)
+#   - ASR server @ :8000               (uvicorn asr_server:app)
+#                                        backend = parakeet (default) or whisper
 #
 # The ASR backend (parakeet-mlx) and diarization backend (sherpa-onnx)
 # both run in-process - no separate service.
@@ -32,9 +33,9 @@
 #
 # Env overrides:
 #   ASR_BACKEND       default parakeet  (parakeet | whisper)
+#   ASR_PORT          default 8000      (where the ASR server listens)
 #   PARAKEET_MODEL    default mlx-community/parakeet-tdt-0.6b-v3
 #   WHISPER_MODEL     default large-v3-turbo  (only used if ASR_BACKEND=whisper)
-#   WHISPER_PORT      default 8000
 #   LMSTUDIO_PORT     default 1234
 #   LLM_MODEL         default qwen3-30b-a3b-instruct-2507
 #   LLM_CONTEXT       default 65536
@@ -50,14 +51,14 @@ VENV_PY="$VENV_DIR/bin/python"
 RUN_DIR="$REPO/.run"
 mkdir -p "$RUN_DIR"
 
-WHISPER_PID_FILE="$RUN_DIR/whisper_server.pid"
-WHISPER_LOG_FILE="$RUN_DIR/whisper_server.log"
+ASR_PID_FILE="$RUN_DIR/asr_server.pid"
+ASR_LOG_FILE="$RUN_DIR/asr_server.log"
 DEPS_STAMP="$RUN_DIR/deps.stamp"   # mtime tracks last successful pip install
 
 ASR_BACKEND_DEFAULT="${ASR_BACKEND:-parakeet}"
 PARAKEET_MODEL="${PARAKEET_MODEL:-mlx-community/parakeet-tdt-0.6b-v3}"
 WHISPER_MODEL="${WHISPER_MODEL:-large-v3-turbo}"
-WHISPER_PORT="${WHISPER_PORT:-8000}"
+ASR_PORT="${ASR_PORT:-8000}"
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
 LLM_MODEL="${LLM_MODEL:-qwen3-30b-a3b-instruct-2507}"
 LLM_CONTEXT="${LLM_CONTEXT:-65536}"
@@ -269,7 +270,7 @@ def check(repo, label):
     except Exception:
         print(f"  {Y}\u25cb{Z} {label:30s} not yet downloaded")
 check("$PARAKEET_MODEL",      "parakeet ($ASR_BACKEND_DEFAULT default)")
-diar = Path.home() / ".cache" / "whisper_server" / "diarization"
+diar = Path.home() / ".cache" / "local_transcriber" / "diarization"
 seg  = diar / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 emb  = diar / "nemo_en_titanet_small.onnx"
 mark = lambda b: f"{G}\u25cf{Z}" if b else f"{Y}\u25cb{Z}"
@@ -279,10 +280,10 @@ PY
   fi
 
   printf "\n%sservices:%s\n" "$c_bold" "$c_reset"
-  if curl -sf "http://127.0.0.1:$WHISPER_PORT/health" -o /dev/null 2>&1; then
-    printf "  "; ok; printf "ASR server   :%s   reachable\n" "$WHISPER_PORT"
+  if curl -sf "http://127.0.0.1:$ASR_PORT/health" -o /dev/null 2>&1; then
+    printf "  "; ok; printf "ASR server   :%s   reachable\n" "$ASR_PORT"
   else
-    printf "  "; warn; printf "ASR server   :%s   not running (start with ./run.sh start)\n" "$WHISPER_PORT"
+    printf "  "; warn; printf "ASR server   :%s   not running (start with ./run.sh start)\n" "$ASR_PORT"
   fi
   if lmstudio_running; then
     printf "  "; ok; printf "LM Studio    :%s   reachable\n" "$LMSTUDIO_PORT"
@@ -301,7 +302,7 @@ PY
   fi
 
   printf "\n%schar config (set these in Char's Settings -> Transcription):%s\n" "$c_bold" "$c_reset"
-  printf "  base URL : http://127.0.0.1:%s\n" "$WHISPER_PORT"
+  printf "  base URL : http://127.0.0.1:%s\n" "$ASR_PORT"
   printf "  api key  : (any non-empty string - auth is ignored locally)\n"
   printf "  intelligence provider : LM Studio @ http://127.0.0.1:%s   model=%s\n" "$LMSTUDIO_PORT" "$LLM_MODEL"
   printf "\n"
@@ -348,7 +349,7 @@ cmd_bootstrap() {
     printf "       %s~/.lmstudio/bin/lms bootstrap%s\n" "$c_bold" "$c_reset"
   fi
   printf "  3. In Char → Settings → Transcription, set:\n"
-  printf "       %sBase URL%s = http://127.0.0.1:%s\n" "$c_bold" "$c_reset" "$WHISPER_PORT"
+  printf "       %sBase URL%s = http://127.0.0.1:%s\n" "$c_bold" "$c_reset" "$ASR_PORT"
   printf "       %sAPI Key%s  = (any non-empty string)\n" "$c_bold" "$c_reset"
   printf "       %sIntelligence provider%s = LM Studio @ http://127.0.0.1:%s\n" \
          "$c_bold" "$c_reset" "$LMSTUDIO_PORT"
@@ -359,51 +360,51 @@ cmd_bootstrap() {
   printf "\nVerify any time with: %s./run.sh doctor%s\n\n" "$c_bold" "$c_reset"
 }
 
-# --- whisper server ---
+# --- ASR server ---
 
-whisper_pid() {
-  [[ -f "$WHISPER_PID_FILE" ]] || return 1
-  local pid; pid="$(cat "$WHISPER_PID_FILE")"
+asr_pid() {
+  [[ -f "$ASR_PID_FILE" ]] || return 1
+  local pid; pid="$(cat "$ASR_PID_FILE")"
   kill -0 "$pid" 2>/dev/null && echo "$pid" || return 1
 }
 
-whisper_start() {
-  if whisper_pid >/dev/null; then
-    say "whisper server already running (pid $(whisper_pid))"
+asr_start() {
+  if asr_pid >/dev/null; then
+    say "ASR server already running (pid $(asr_pid))"
     return 0
   fi
   if [[ ! -x "$VENV_PY" ]]; then
     say "${c_red}venv python missing at $VENV_PY${c_reset}"
     return 1
   fi
-  say "starting whisper server on :$WHISPER_PORT ..."
+  say "starting ASR server on :$ASR_PORT ..."
   # The Whisper model loads lazily on first request, so startup is instant.
   # We append to the log so previous runs' output stays around for review.
-  printf "\n========== started %s ==========\n" "$(date)" >> "$WHISPER_LOG_FILE"
-  nohup "$VENV_PY" -u -m uvicorn whisper_server:app \
-        --host 0.0.0.0 --port "$WHISPER_PORT" \
-        >>"$WHISPER_LOG_FILE" 2>&1 &
-  echo $! > "$WHISPER_PID_FILE"
+  printf "\n========== started %s ==========\n" "$(date)" >> "$ASR_LOG_FILE"
+  nohup "$VENV_PY" -u -m uvicorn asr_server:app \
+        --host 0.0.0.0 --port "$ASR_PORT" \
+        >>"$ASR_LOG_FILE" 2>&1 &
+  echo $! > "$ASR_PID_FILE"
   for _ in {1..30}; do
-    if curl -sf "http://127.0.0.1:$WHISPER_PORT/health" >/dev/null 2>&1; then
-      say "${c_green}whisper server up on :$WHISPER_PORT (pid $(whisper_pid))${c_reset}"
+    if curl -sf "http://127.0.0.1:$ASR_PORT/health" >/dev/null 2>&1; then
+      say "${c_green}ASR server up on :$ASR_PORT (pid $(asr_pid))${c_reset}"
       return 0
     fi
     sleep 1
   done
-  say "${c_red}whisper server didn't respond on :$WHISPER_PORT after 30s${c_reset}"
-  say "  see $WHISPER_LOG_FILE"
+  say "${c_red}ASR server didn't respond on :$ASR_PORT after 30s${c_reset}"
+  say "  see $ASR_LOG_FILE"
   return 1
 }
 
-whisper_stop() {
-  if ! whisper_pid >/dev/null; then
-    say "whisper server is not running"
-    rm -f "$WHISPER_PID_FILE"
+asr_stop() {
+  if ! asr_pid >/dev/null; then
+    say "ASR server is not running"
+    rm -f "$ASR_PID_FILE"
     return 0
   fi
-  local pid; pid="$(whisper_pid)"
-  say "stopping whisper server (pid $pid) ..."
+  local pid; pid="$(asr_pid)"
+  say "stopping ASR server (pid $pid) ..."
   kill "$pid" 2>/dev/null || true
   for _ in {1..15}; do
     kill -0 "$pid" 2>/dev/null || break
@@ -413,8 +414,8 @@ whisper_stop() {
     say "${c_yellow}forcing kill -9${c_reset}"
     kill -9 "$pid" 2>/dev/null || true
   fi
-  rm -f "$WHISPER_PID_FILE"
-  say "${c_green}whisper server stopped${c_reset}"
+  rm -f "$ASR_PID_FILE"
+  say "${c_green}ASR server stopped${c_reset}"
 }
 
 # --- LM Studio ---
@@ -507,20 +508,20 @@ cmd_start() {
   lmstudio_start
   local lms_rc=$?    # 0 ok, 1 unreachable, 2 reachable-but-no-model
 
-  whisper_start || return 1
+  asr_start || return 1
   printf "\n"
 
   if [[ $lms_rc -eq 0 ]]; then
     printf "%s──── pipeline ready ────%s\n" "$c_bold" "$c_reset"
     printf "  ASR server (Parakeet TDT v3) : %shttp://127.0.0.1:%s%s   (Char's transcription endpoint)\n" \
-           "$c_green" "$WHISPER_PORT" "$c_reset"
+           "$c_green" "$ASR_PORT" "$c_reset"
     printf "  LM Studio API (Qwen3-30B)    : %shttp://127.0.0.1:%s%s   (summary + speaker naming)\n" \
            "$c_green" "$LMSTUDIO_PORT" "$c_reset"
   else
     printf "%s──── pipeline %sPARTIALLY%s ready ────%s\n" \
            "$c_bold" "$c_yellow" "$c_reset$c_bold" "$c_reset"
     printf "  ASR server (Parakeet TDT v3) : %shttp://127.0.0.1:%s%s   (transcription works)\n" \
-           "$c_green" "$WHISPER_PORT" "$c_reset"
+           "$c_green" "$ASR_PORT" "$c_reset"
     if [[ $lms_rc -eq 1 ]]; then
       printf "  LM Studio API                : %sNOT REACHABLE on :%s%s\n" \
              "$c_red" "$LMSTUDIO_PORT" "$c_reset"
@@ -533,37 +534,37 @@ cmd_start() {
       printf "                                 → Char's summary step will fail; load the model in LM Studio.app\n"
     fi
   fi
-  printf "  log file                     : %s\n" "$WHISPER_LOG_FILE"
+  printf "  log file                     : %s\n" "$ASR_LOG_FILE"
   printf "\n"
   printf "  on-demand:    %s./run.sh transcribe ~/Desktop/call.m4a%s\n" "$c_bold" "$c_reset"
   printf "  status:       %s./run.sh status%s\n" "$c_bold" "$c_reset"
   printf "  doctor:       %s./run.sh doctor%s   (full health report)\n" "$c_bold" "$c_reset"
   printf "  stop:         %s./run.sh stop%s\n" "$c_bold" "$c_reset"
   printf "\n"
-  printf "tailing whisper server log; %sCtrl+C detaches without stopping%s\n" \
+  printf "tailing ASR server log; %sCtrl+C detaches without stopping%s\n" \
          "$c_yellow" "$c_reset"
   printf "\n"
-  exec tail -F "$WHISPER_LOG_FILE"
+  exec tail -F "$ASR_LOG_FILE"
 }
 
 cmd_stop() {
-  whisper_stop
+  asr_stop
   printf "  %sLM Studio left running%s; use \`lms server stop\` to free GPU memory\n" \
          "$c_dim" "$c_reset"
 }
 
 cmd_status() {
   printf "%spipeline status%s\n" "$c_bold" "$c_reset"
-  if whisper_pid >/dev/null; then
+  if asr_pid >/dev/null; then
     local backend="?" model="?"
-    local health_json; health_json="$(curl -sf "http://127.0.0.1:$WHISPER_PORT/health" 2>/dev/null || true)"
+    local health_json; health_json="$(curl -sf "http://127.0.0.1:$ASR_PORT/health" 2>/dev/null || true)"
     if [[ -n "$health_json" ]]; then
       backend="$(printf '%s' "$health_json" | "$VENV_PY" -c "import json,sys;print(json.load(sys.stdin).get('asr_backend','?'))" 2>/dev/null || echo "?")"
       model="$(printf '%s' "$health_json"   | "$VENV_PY" -c "import json,sys;print(json.load(sys.stdin).get('model','?'))" 2>/dev/null || echo "?")"
     fi
     printf "  "; ok; printf "ASR server       pid=%-7s port=%s   backend=%s   model=%s\n" \
-                          "$(whisper_pid)" "$WHISPER_PORT" "$backend" "$model"
-    printf "                   log=%s\n" "$WHISPER_LOG_FILE"
+                          "$(asr_pid)" "$ASR_PORT" "$backend" "$model"
+    printf "                   log=%s\n" "$ASR_LOG_FILE"
   else
     printf "  "; bad; printf "ASR server       not running\n"
   fi
@@ -580,10 +581,10 @@ cmd_status() {
 }
 
 cmd_logs() {
-  if [[ -f "$WHISPER_LOG_FILE" ]]; then
-    exec tail -F "$WHISPER_LOG_FILE"
+  if [[ -f "$ASR_LOG_FILE" ]]; then
+    exec tail -F "$ASR_LOG_FILE"
   else
-    say "no log file at $WHISPER_LOG_FILE"
+    say "no log file at $ASR_LOG_FILE"
     say "(start the pipeline with './run.sh start' first)"
     exit 1
   fi
@@ -591,10 +592,10 @@ cmd_logs() {
 
 cmd_health() {
   local rc=0
-  if curl -sf "http://127.0.0.1:$WHISPER_PORT/health" -o /dev/null; then
-    printf "  "; ok; printf "whisper @ :%s\n" "$WHISPER_PORT"
+  if curl -sf "http://127.0.0.1:$ASR_PORT/health" -o /dev/null; then
+    printf "  "; ok; printf "ASR @ :%s\n" "$ASR_PORT"
   else
-    printf "  "; bad; printf "whisper @ :%s\n" "$WHISPER_PORT"; rc=1
+    printf "  "; bad; printf "ASR @ :%s\n" "$ASR_PORT"; rc=1
   fi
   if curl -sf "http://127.0.0.1:$LMSTUDIO_PORT/v1/models" -o /dev/null; then
     printf "  "; ok; printf "LM Studio @ :%s\n" "$LMSTUDIO_PORT"
