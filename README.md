@@ -1,9 +1,9 @@
 # whisper_server
 
 Local, private, Apple-Silicon-native transcription + summarization pipeline.
-Drops in as a Deepgram-compatible endpoint behind [Char](https://char.so) and uses
-your local LM Studio + Qwen for note generation. Everything runs offline once
-the models are downloaded.
+Drops in as a Deepgram-compatible endpoint behind [Char](https://char.so) and
+uses your local LM Studio + Qwen3 for note generation. Everything runs offline
+once the models are downloaded.
 
 ```
                  ┌─────────────────────┐
@@ -23,40 +23,34 @@ the models are downloaded.
        ┌──────────────────────────────────┐
        │  transcribe_file.py              │  manual one-shot CLI
        │  • cache by audio sha256         │   for files Char didn't auto-pick up
-       │  • optional diarization          │   (sherpa-onnx + LLM speaker naming)
+       │  • optional speaker diarization  │   (sherpa-onnx + LLM speaker naming)
        │  • streaming LLM summary         │
        └──────────────────────────────────┘
 ```
 
-## What you get
+## What's in here
 
-- **`whisper_server.py`** — FastAPI service that mimics the bits of Deepgram's
-  `/v1/listen` API that Char actually uses (POST batch + WebSocket streaming).
-  Char doesn't know it's not Deepgram.
-- **`transcribe_file.py`** — CLI for files Char didn't auto-transcribe.
-  Outputs a structured summary (TL;DR, Participants, Key points, Decisions,
-  Open questions, Risks, Next steps, Notable quotes), with optional speaker
-  diarization, a content-addressed cache so re-runs are instant, and live
-  progress + token-streaming.
-- **`run.sh`** — single command for the whole pipeline. Auto-installs
-  Python deps + ASR/diarization model weights on first run.
+| | what | role |
+|---|---|---|
+| `whisper_server.py` | FastAPI service on `:8000`. Implements the bits of Deepgram's `/v1/listen` contract Char uses (POST batch + WebSocket streaming) and routes through Parakeet (default) or faster-whisper. | Char's transcription endpoint |
+| `parakeet_backend.py` | parakeet-mlx wrapper. Merges sub-word BPE tokens into clean words, shapes output to Deepgram's word/timing schema. | ASR engine |
+| `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) + an LLM pass to map `SPEAKER_00/01/...` to real names. | Speaker labeling |
+| `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
+| `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, and produce health reports. | Operator tool |
 
-## Prerequisites
+## Prerequisites — install these manually once
 
-You need to install these manually once:
-
-| | what | where | why |
+| | what | how | why |
 |---|---|---|---|
-| 1 | macOS on Apple Silicon (M-series) | — | Parakeet uses MLX |
+| 1 | macOS on Apple Silicon | — | Parakeet runs through MLX |
 | 2 | Python 3.12 or 3.14 | `brew install python@3.14` | runs the server + CLI |
 | 3 | [Char.app](https://char.so) | App Store / DMG | call recording UI |
 | 4 | [LM Studio.app](https://lmstudio.ai) | website | local LLM host |
-| 5 | LM Studio model: **`qwen3-30b-a3b-instruct-2507`** | LM Studio's model search | summaries (≈18 GB MLX) |
-| 6 | LM Studio CLI: `lms` | run `~/.lmstudio/bin/lms bootstrap` once | so `run.sh` can auto-load Qwen |
+| 5 | LM Studio model: **`qwen3-30b-a3b-instruct-2507`** | LM Studio's model browser (≈18 GB MLX) | summaries + speaker naming |
+| 6 | LM Studio CLI: `lms` | `~/.lmstudio/bin/lms bootstrap` | so `run.sh` can auto-load Qwen |
 
-Everything else (parakeet weights ≈1.2 GB, sherpa-onnx diarization models
-≈45 MB, faster-whisper large-v3-turbo ≈1.6 GB if you opt into it) is fetched
-automatically the first time you start the pipeline.
+Everything else (Parakeet ≈1.2 GB, sherpa-onnx ONNX bundles ≈45 MB,
+faster-whisper ≈1.6 GB if you opt into it) is fetched automatically.
 
 ## Quick start
 
@@ -65,56 +59,72 @@ On a freshly cloned repo:
 ```bash
 git clone <this repo>
 cd whisper_server
-./run.sh bootstrap        # one-shot: venv, pip deps, model downloads
-./run.sh start            # launch ASR server + LM Studio + tail the log
+./run.sh bootstrap        # venv + pip deps + ASR + diarization models
+# (do the manual installs above if you haven't already)
+./run.sh start            # boot ASR server + LM Studio + tail the log
 ```
 
-`./run.sh bootstrap` is idempotent and safe to re-run. It will:
+`bootstrap` is idempotent — re-runs are a no-op when everything is cached.
 
-1. Create `./venv` (auto-picks `python3.14` / `3.12` / `3` from your system)
-2. `pip install -r requirements.txt`
-3. Download the Parakeet TDT v3 weights into `~/.cache/huggingface/` (~1.2 GB)
-4. Download the sherpa-onnx diarization ONNX models into
-   `~/.cache/whisper_server/diarization/` (~45 MB)
-5. Detect whether the `lms` CLI is installed and tell you how to bootstrap
-   it if not
-6. Print the exact strings to paste into Char's Settings UI
+`start` runs preflight first (so even if you skipped `bootstrap` it Just Works),
+then brings up the services and tails the ASR log. `Ctrl+C` detaches without
+stopping anything.
 
-After that, `./run.sh start` will:
+### What `start` will print
 
-1. Re-run preflight (no-op if everything's already in place)
-2. Start LM Studio's local server (via the `lms` CLI) and load Qwen3 with
-   a 65 k-token context
-3. Start `uvicorn whisper_server:app` on `:8000`
-4. Tail the ASR log so you can watch traffic. Hit `Ctrl+C` to detach — the
-   services keep running in the background.
+You'll see one of three banners:
 
-Subsequent invocations skip everything that's already cached.
+```
+──── pipeline ready ────                                # everything wired
+  ASR server (Parakeet TDT v3) : http://127.0.0.1:8000  (Char's transcription endpoint)
+  LM Studio API (Qwen3-30B)    : http://127.0.0.1:1234  (summary + speaker naming)
+```
 
-### Configure Char
+```
+──── pipeline PARTIALLY ready ────                      # LM Studio not running
+  ASR server (Parakeet TDT v3) : http://127.0.0.1:8000  (transcription works)
+  LM Studio API                : NOT REACHABLE on :1234
+                                 → Char's summary step will fail until you start LM Studio
+```
 
-In Char → Settings → Transcription:
+```
+──── pipeline PARTIALLY ready ────                      # Qwen not loaded
+  ASR server (Parakeet TDT v3) : http://127.0.0.1:8000  (transcription works)
+  LM Studio API                : http://127.0.0.1:1234  (reachable)
+  qwen3-30b-a3b-instruct-2507  : NOT LOADED
+                                 → Char's summary step will fail; load the model in LM Studio.app
+```
 
-- **Model being used**: Custom (the right-hand "nova-2" string is decorative —
-  this server ignores it and routes through whatever `ASR_BACKEND` is set to).
-- **Custom provider Base URL**: `http://127.0.0.1:8000`
-- **API Key**: any non-empty string (auth is ignored locally).
-- **Configure Providers** → **Char (Recommended)**: point its LLM at
-  `http://127.0.0.1:1234` with model `qwen3-30b-a3b-instruct-2507`.
+In the partial cases the message tells you exactly what to fix. Re-run
+`./run.sh start` once you've done it.
 
-After that, every call you record in Char streams through Parakeet for
-transcription and Qwen for the note. No further wiring needed.
+## Configure Char
+
+Once `./run.sh start` is green, in Char → Settings → Transcription:
+
+| field | value |
+|---|---|
+| **Model being used** | Custom (the `nova-2` string is decorative — this server ignores it) |
+| **Custom provider Base URL** | `http://127.0.0.1:8000` |
+| **API Key** | any non-empty string (auth is ignored locally) |
+| **Configure Providers** → Char Recommended → LLM | LM Studio @ `http://127.0.0.1:1234`, model `qwen3-30b-a3b-instruct-2507` |
+
+After that, every call you record streams through Parakeet for transcription
+and Qwen for the note. Char's WebSocket streaming path also works out of the
+box (it's "batch over WebSocket" — final transcript only, no interim
+partials, since neither Parakeet nor faster-whisper streams natively).
 
 ## Daily usage
 
 ### Live calls (Char-driven)
 
-Just record in Char as usual. `./run.sh start` once after a reboot is enough.
+Just record in Char as usual. After a reboot, one `./run.sh start` is enough.
 
 ```bash
-./run.sh status      # both lights green = ready
+./run.sh status      # PIDs, ports, which model
 ./run.sh logs        # tail Char's incoming POST /v1/listen requests
 ./run.sh stop        # shut down ASR (LM Studio left running)
+./run.sh restart     # stop + start
 ```
 
 ### Files Char didn't auto-pick up
@@ -125,7 +135,7 @@ Just record in Char as usual. `./run.sh start` once after a reboot is enough.
 
 Default behavior:
 
-- Transcribes with Parakeet (ASR_BACKEND=parakeet).
+- Transcribes with Parakeet (`ASR_BACKEND=parakeet`).
 - Caches the transcript by audio sha256 — second run is instant.
 - Diarizes with sherpa-onnx and asks Qwen to map speakers to real names.
 - Streams the structured Markdown summary to the terminal token-by-token.
@@ -138,10 +148,10 @@ Useful flags (full list: `./run.sh transcribe --help`):
 ./run.sh transcribe FILE --save call.json     # full bundle (transcript + diarization + summary)
 ./run.sh transcribe FILE --save call.txt      # raw transcript only
 ./run.sh transcribe FILE --save-transcript diarized.txt   # diarized transcript only
-./run.sh transcribe FILE --no-diarize         # ASR only, no speaker labels
+./run.sh transcribe FILE --no-diarize         # skip speaker labels
 ./run.sh transcribe FILE --no-cache           # force re-transcribe
-./run.sh transcribe FILE --asr-backend whisper   # use multilingual whisper instead
-./run.sh transcribe FILE --call-time "2026-05-08T14:30"   # override timestamp in summary
+./run.sh transcribe FILE --asr-backend whisper      # switch to multilingual whisper
+./run.sh transcribe FILE --call-time "2026-05-08T14:30"   # override timestamp
 ./run.sh transcribe --list-cache              # table of cached transcripts
 ./run.sh transcribe --clear-cache             # wipe transcript cache
 ```
@@ -149,15 +159,47 @@ Useful flags (full list: `./run.sh transcribe --help`):
 ## Health & diagnostics
 
 ```bash
-./run.sh doctor      # full preflight: deps, models, services, char-config hints
+./run.sh doctor      # full report: python, deps, models, services, Char-config hints (read-only)
 ./run.sh status      # quick PIDs + ports + which model
-./run.sh health      # one-shot HTTP probe of both services
+./run.sh health      # one-shot HTTP probe of both services (exit non-zero if down)
 ./run.sh setup       # force reinstall pip deps + redownload models
 ```
 
-`./run.sh doctor` is the first thing to run if anything misbehaves. It
-distinguishes between "missing dep" / "missing model" / "service down" so
-you don't have to guess.
+`./run.sh doctor` is the first thing to run if anything misbehaves. It's
+read-only and produces a report like:
+
+```
+doctor — validating local pipeline
+
+python:
+  ● venv at /…/whisper_server/venv (Python 3.14.3)
+
+python packages:
+  ● fastapi            0.136.1
+  ● uvicorn            0.46.0
+  ● parakeet_mlx       ok
+  ● faster_whisper     1.2.1
+  ● sherpa_onnx        1.13.1
+  …
+
+models:
+  ● parakeet (parakeet default)   cached at ~/.cache/huggingface/hub/…
+  ● pyannote segmentation         ~/.cache/whisper_server/diarization/…/model.onnx
+  ● NeMo TitaNet embedding        ~/.cache/whisper_server/diarization/nemo_en_titanet_small.onnx
+
+services:
+  ● ASR server   :8000   reachable
+  ● LM Studio    :1234   reachable
+  ● qwen3-30b-a3b-instruct-2507 loaded
+
+char config (set these in Char's Settings -> Transcription):
+  base URL : http://127.0.0.1:8000
+  api key  : (any non-empty string - auth is ignored locally)
+  intelligence provider : LM Studio @ http://127.0.0.1:1234   model=qwen3-30b-a3b-instruct-2507
+```
+
+Yellow/red dots tell you exactly which piece is broken so you don't have to
+guess.
 
 ## Configuration
 
@@ -165,12 +207,12 @@ All knobs are env vars; defaults are sensible.
 
 | variable | default | what |
 |---|---|---|
-| `ASR_BACKEND` | `parakeet` | `parakeet` (English, MLX) or `whisper` (multilingual) |
-| `PARAKEET_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | HF repo for parakeet weights |
+| `ASR_BACKEND` | `parakeet` | `parakeet` (English, MLX, lowest WER) or `whisper` (multilingual) |
+| `PARAKEET_MODEL` | `mlx-community/parakeet-tdt-0.6b-v3` | HuggingFace repo for parakeet weights |
 | `WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model id (only used when `ASR_BACKEND=whisper`) |
-| `WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `int16` / `float32` for the whisper backend on CPU |
+| `WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `int16` / `float32` for the whisper backend |
 | `WHISPER_DEVICE` | `auto` | `cpu` / `cuda` / `auto` for the whisper backend |
-| `WHISPER_LANGUAGE` | unset | ISO-639 code; force a specific language (whisper only) |
+| `WHISPER_LANGUAGE` | unset | ISO-639 code; force a language (whisper only) |
 | `WHISPER_PORT` | `8000` | what port the ASR server listens on |
 | `LMSTUDIO_PORT` | `1234` | LM Studio HTTP API port |
 | `LLM_MODEL` | `qwen3-30b-a3b-instruct-2507` | the model `lms load` will bring up |
@@ -178,7 +220,7 @@ All knobs are env vars; defaults are sensible.
 | `LLM_URL` | `http://127.0.0.1:1234/v1/chat/completions` | full chat endpoint URL |
 | `LLM_MAX_TOKENS` | `4096` | upper bound for summary completion |
 | `DIARIZE` | `1` | set `0` to disable diarization by default |
-| `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if you know it |
+| `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if known |
 | `CLUSTER_THRESHOLD` | `0.5` | sherpa-onnx fast-clustering threshold |
 | `WHISPER_CACHE_DIR` | `~/.cache/whisper_server/transcripts` | where the transcript cache lives |
 | `DIARIZATION_CACHE_DIR` | `~/.cache/whisper_server/diarization` | where sherpa-onnx model files live |
@@ -198,9 +240,9 @@ whisper_server/
 ├── transcribe_file.py       # CLI for manual files
 ├── parakeet_backend.py      # parakeet-mlx wrapper, BPE -> Deepgram words
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
-├── run.sh                   # service manager + preflight
+├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 84 unit tests, all hermetic
+├── tests/                   # 84 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -226,7 +268,8 @@ curl -X POST http://127.0.0.1:8000/v1/listen \
 ```
 
 Returns a Deepgram-shaped JSON document with `metadata`, `results.channels[0].alternatives[0].{transcript,confidence,words}`,
-and `detected_language`.
+and `detected_language`. Query params (`model`, `smart_format`, `punctuate`, …)
+are accepted and quietly ignored — we always use the locally-configured ASR.
 
 ### `POST /v1/listen/stream` (extension)
 
@@ -265,45 +308,53 @@ partials, since neither Parakeet nor faster-whisper streams natively.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # run the test suite (~0.05s, no model loads)
+venv/bin/python -m unittest discover -s tests   # 84 tests, ~0.05s, no model loads
 ```
 
-The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they
-run in milliseconds without any models present.
+The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run
+in milliseconds without any models present.
 
 ## Troubleshooting
+
+**`./run.sh start` shows "PARTIALLY ready" with `LM Studio NOT REACHABLE`.**
+Open LM Studio.app and turn on Developer → Local Server. After that, install
+the `lms` CLI with `~/.lmstudio/bin/lms bootstrap` so future `./run.sh start`
+calls can keep it up automatically.
+
+**`./run.sh start` shows "PARTIALLY ready" with `<model> NOT LOADED`.**
+Open LM Studio.app → Discover → search for `qwen3-30b-a3b-instruct-2507`
+and download it. Then `./run.sh restart`.
+
+**Char shows `unauthorized`.**
+Char insists on a non-empty API key. Anything works — `local`, `dummy`, `x` —
+auth is ignored locally.
+
+**LLM completes immediately with 0 tokens.**
+LM Studio silently rejects prompts that exceed the loaded context length. The
+pipeline ships with `LLM_CONTEXT=65536`. If you set it lower, large calls will
+fail this way. `./run.sh restart` will reload Qwen with the configured
+context.
 
 **`./run.sh doctor` says my parakeet model isn't downloaded.**
 Run `./run.sh setup` (or just `./run.sh start` — preflight will fetch it).
 
-**LM Studio API isn't running on :1234.**
-Open LM Studio.app once and turn on Developer → Local Server. After that
-`./run.sh start` can keep it up via the `lms` CLI. If you don't have the
-CLI: `~/.lmstudio/bin/lms bootstrap`.
-
-**Char shows `unauthorized`.**
-Char insists on a non-empty API key. Anything works — `local`, `dummy`,
-`x` — auth is ignored locally.
-
-**LLM completes immediately with 0 tokens.**
-LM Studio silently rejects prompts that exceed the loaded context length.
-The pipeline ships with `LLM_CONTEXT=65536`. If you set it lower, large
-calls will fail this way. Re-run `./run.sh restart` to reload Qwen with the
-default context.
-
 **`There is no Stream(gpu, 0) in current thread.`**
-This is an MLX threading issue that shouldn't surface anymore — all parakeet
-work is pinned to a dedicated worker thread that initializes its own stream
-and loads the model on that thread. If it does, file an issue with the
-`./run.sh logs` output.
+This MLX threading issue shouldn't surface — all Parakeet work is pinned to a
+dedicated worker thread that initializes its own stream and loads the model
+on that thread. If it does happen, file an issue with `./run.sh logs`.
 
 **Want to free GPU memory.**
 `./run.sh stop` shuts down ASR but leaves LM Studio running so the next
 restart is fast. To unload Qwen too: `lms unload qwen3-30b-a3b-instruct-2507`
 or `lms server stop`.
 
+**Want to start fresh.**
+`./run.sh stop && ./run.sh setup` rebuilds the venv from scratch and
+re-downloads the ASR weights. To wipe the transcript cache too:
+`./run.sh transcribe --clear-cache`.
+
 ## License
 
 MIT for the glue code in this repo. The underlying models have their own
 licenses — Parakeet TDT v3 is CC-BY-4.0 (NVIDIA), Whisper is MIT (OpenAI),
-sherpa-onnx ONNX models are Apache 2.0 / MIT.
+sherpa-onnx ONNX models are Apache 2.0 / MIT, Qwen3 is Apache 2.0.
