@@ -7,7 +7,10 @@ tightens that guarantee further.
 
 Cross-reference: [§ Privacy and data locality](README.md#privacy-and-data-locality)
 in the main README explains the current guarantees this list is
-extending.
+extending. The `CHAR_REVIEW.md` companion file enumerates every
+network endpoint Char.app uses and how to block the ones we can't
+toggle in-app — re-run its [§ Methodology](CHAR_REVIEW.md#methodology)
+sweep whenever `CHAR_KNOWN_GOOD_VERSION` is bumped.
 
 ## Privacy & security (P0)
 
@@ -49,8 +52,28 @@ extending.
       (`~/.lmstudio/preferences.json`?) and report which version it was
       set on, so a future LM Studio upgrade that resets it gets caught
       by `doctor`. Best-effort since LM Studio is closed-source.
-- [ ] **Disable Char analytics by default** (if Char ships any). Same
-      pattern, written to `settings.json`.
+- [x] **Disable Char PostHog analytics by default.** ✅ Landed:
+      `./run.sh configure-char` writes
+      `analytics: "{\"Disabled\":true}"` to
+      `~/Library/Application Support/hyprnote/store.json`, which
+      short-circuits `tauri_plugin_analytics::is_disabled()` before any
+      event hits `us.i.posthog.com`. `doctor` now reports the toggle
+      state. See [CHAR_REVIEW.md § PostHog deep dive](CHAR_REVIEW.md#posthog-deep-dive).
+- [ ] **Block / spoof Char's auto-update endpoint.** No in-app toggle
+      exists for `desktop2.hyprnote.com` (proxied through `gateway.scarf.sh`).
+      Options: (a) write a `/etc/hosts` patcher behind a `--block-updates`
+      flag in `configure-char`; (b) ship a Little Snitch ruleset; (c) wrap
+      Char in a launcher that sets `tauri-plugin-updater` env vars to point
+      to a no-op endpoint. (a) is most user-friendly; (c) is least invasive.
+      See [CHAR_REVIEW.md § Auto-update channel](CHAR_REVIEW.md#auto-update-channel).
+- [ ] **Add a runtime kill-switch for Char's Sentry DSN.** Currently
+      compile-time baked via `option_env!("SENTRY_DSN")`. Two paths: (a)
+      maintain a fork of `fastrepl/anarlog` with the DSN pull replaced by
+      a `settings.json`-aware branch and bundle the rebuilt DMG via
+      `./run.sh install-char`; (b) keep upstream and rely on firewall
+      rules — document the exact `pf` / Little Snitch entries in
+      [CHAR_REVIEW.md § Mitigations](CHAR_REVIEW.md#mitigations) and have
+      `./run.sh configure-char` offer to write them. (b) ships first.
 - [ ] **Spotlight exclusion.** `bootstrap` could optionally run
       `mdutil -i off ~/Library/Application\ Support/hyprnote/` so
       Spotlight doesn't index recordings into a separately-readable

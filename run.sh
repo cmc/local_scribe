@@ -408,6 +408,26 @@ PY
     else
       printf "  "; warn; printf "Char settings.json missing -- open Char once, then \`./run.sh configure-char\`\n"
     fi
+    # Char's PostHog analytics toggle (CHAR_REVIEW.md). Sentry has no toggle.
+    if [[ -f "$CHAR_STORE" ]]; then
+      "$VENV_PY" - "$CHAR_STORE" <<'PY'
+import json, sys, pathlib
+G,Y,Z = ("\033[32m","\033[33m","\033[0m") if sys.stdout.isatty() else ("","","")
+try:
+    d = json.loads(pathlib.Path(sys.argv[1]).read_text() or "{}")
+except json.JSONDecodeError:
+    d = {}
+raw = d.get("analytics") or "{}"
+try:
+    inner = json.loads(raw) if isinstance(raw, str) else dict(raw)
+except json.JSONDecodeError:
+    inner = {}
+if inner.get("Disabled") is True:
+    print(f"  {G}\u25cf{Z} Char PostHog analytics disabled in store.json")
+else:
+    print(f"  {Y}\u25cb{Z} Char PostHog analytics ENABLED -- run `./run.sh configure-char` to disable")
+PY
+    fi
   else
     printf "  "; bad; printf "Char.app NOT installed (run \`./run.sh install-char\` to fetch v%s)\n" "$CHAR_KNOWN_GOOD_VERSION"
   fi
@@ -518,6 +538,10 @@ CHAR_APP="/Applications/Char.app"
 CHAR_INFO_PLIST="$CHAR_APP/Contents/Info.plist"
 CHAR_DATA_DIR="$HOME/Library/Application Support/hyprnote"
 CHAR_SETTINGS="$CHAR_DATA_DIR/settings.json"
+# tauri-plugin-store2 scoped store. Char's analytics-disable toggle lives at
+# `analytics` -> `{"Disabled": true}`. PostHog short-circuits at the
+# is_disabled() check inside tauri_plugin_analytics; see CHAR_REVIEW.md.
+CHAR_STORE="$CHAR_DATA_DIR/store.json"
 
 char_installed() { [[ -d "$CHAR_APP" ]]; }
 
@@ -811,14 +835,60 @@ PY
     return 1
   fi
 
+  # Disable PostHog analytics in Char's tauri-plugin-store2 scoped store. This
+  # is the ONLY in-app telemetry kill-switch -- Sentry's DSN is compile-time
+  # baked, see CHAR_REVIEW.md. The plugin reads `analytics.Disabled` as a
+  # JSON-string-encoded value (Char wraps each scoped-store dict as a string).
+  local analytics_status=""
+  if [[ -f "$CHAR_STORE" ]]; then
+    if "$VENV_PY" - "$CHAR_STORE" <<'PY'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    d = json.loads(p.read_text() or "{}")
+except json.JSONDecodeError:
+    d = {}
+raw = d.get("analytics") or "{}"
+try:
+    inner = json.loads(raw) if isinstance(raw, str) else dict(raw)
+except json.JSONDecodeError:
+    inner = {}
+inner["Disabled"] = True
+d["analytics"] = json.dumps(inner, separators=(",", ":"))
+p.write_text(json.dumps(d, indent=4) + "\n")
+PY
+    then
+      analytics_status="disabled"
+    else
+      analytics_status="failed"
+    fi
+  else
+    # File doesn't exist yet (Char hasn't run since install). Create it with
+    # the disable flag pre-populated so PostHog never gets a chance.
+    if "$VENV_PY" - "$CHAR_STORE" <<'PY'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps({"analytics": "{\"Disabled\":true}"}, indent=4) + "\n")
+PY
+    then
+      analytics_status="disabled (created)"
+    else
+      analytics_status="failed"
+    fi
+  fi
+
   printf "\n  %s● char configured%s\n" "$c_green" "$c_reset"
   printf "    current_stt_provider : openai\n"
   printf "    current_stt_model    : gpt-4o-transcribe           (progressive/SSE -- no 60s client-side timeout)\n"
   printf "    stt.openai.base_url  : http://127.0.0.1:%s/v1\n" "$ASR_PORT"
   printf "    stt.openai.api_key   : local\n"
+  printf "    posthog analytics    : %s\n" "$analytics_status"
   if [[ -n "$key_backup_path" ]]; then
     printf "    previous key saved   : %s\n" "$key_backup_path"
   fi
+  printf "  %sNOTE:%s Sentry crash reporting + the auto-updater have NO in-app toggle.\n" "$c_yellow" "$c_reset"
+  printf "        See CHAR_REVIEW.md for firewall / hosts-file mitigations.\n"
   printf "\n"
 
   if ask_yn "  Relaunch Char now?" y; then

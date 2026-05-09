@@ -121,9 +121,17 @@ Being honest about the parts of the stack that aren't ours:
   doesn't transmit your chat content. Disabling LM Studio's telemetry
   by default at bootstrap is on the [TODO](TODO.md).
 - **Char.app is open source** ([source](https://github.com/fastrepl/anarlog),
-  MIT-licensed). Read or audit it directly. Calendar/event sync (if you
-  connect a calendar) does talk to your calendar provider — that's
-  orthogonal to recordings, but worth knowing.
+  MIT-licensed). The full audit lives in [CHAR_REVIEW.md](CHAR_REVIEW.md);
+  the short version: the data plane (audio / transcripts / notes) stays
+  local, but Char ships with **Sentry crash reporting and PostHog product
+  analytics enabled by default**, plus a Tauri auto-updater that polls
+  `desktop2.hyprnote.com`. `./run.sh configure-char` writes the in-app
+  PostHog kill-switch (`store.json::analytics.Disabled = true`); Sentry
+  and the auto-updater have **no in-app toggle** and need to be blocked
+  at the firewall or via `/etc/hosts` overrides — see
+  [§ Mitigations](CHAR_REVIEW.md#mitigations) for the exact rule set.
+  Calendar / event sync (if you connect a calendar) does talk to your
+  calendar provider — orthogonal to recordings, but worth knowing.
 - **`asr_server.py` currently binds to `0.0.0.0:8000`**, not
   `127.0.0.1:8000`. macOS's firewall blocks incoming connections by
   default, but if you've allowed Python through the firewall and you're
