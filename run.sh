@@ -28,6 +28,9 @@
 #   ./run.sh doctor         deep preflight report - python, deps, models,
 #                            services, Char-config hints. Safe any time.
 #   ./run.sh setup          force-reinstall pip deps + (re)download models
+#   ./run.sh configure-char point Char's OpenAI transcriber at this server
+#                            (interactive; offers to back up existing API key).
+#                            Bootstrap calls this for you on a fresh install.
 #   ./run.sh transcribe FILE [args...]
 #                            run transcribe_file.py FILE with the venv python
 #
@@ -322,17 +325,30 @@ cmd_setup() {
 cmd_bootstrap() {
   printf "%sbootstrap%s — first-time setup for a fresh clone\n\n" "$c_bold" "$c_reset"
 
-  printf "%s(1/4) python venv + pip deps%s\n" "$c_bold" "$c_reset"
+  printf "%s(1/5) python venv + pip deps%s\n" "$c_bold" "$c_reset"
   ensure_pip_deps             || return 1
 
-  printf "\n%s(2/4) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(2/5) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
   ensure_parakeet_model       || return 1
 
-  printf "\n%s(3/4) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(3/5) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
   ensure_diarization_models   || true   # best-effort
 
-  printf "\n%s(4/4) LM Studio CLI check%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(4/5) LM Studio CLI check%s\n" "$c_bold" "$c_reset"
   ensure_lms_cli              || true
+
+  printf "\n%s(5/5) Char transcriber config%s\n" "$c_bold" "$c_reset"
+  if char_installed; then
+    if ask_yn "  Configure Char.app now to send transcripts to this server?" y; then
+      printf "\n"
+      cmd_configure_char || say "${c_yellow}Char config skipped/failed; rerun with ./run.sh configure-char${c_reset}"
+    else
+      printf "  skipped — run %s./run.sh configure-char%s any time\n" "$c_bold" "$c_reset"
+    fi
+  else
+    printf "  Char.app not installed at /Applications/Char.app — skipping.\n"
+    printf "  After installing Char, run: %s./run.sh configure-char%s\n" "$c_bold" "$c_reset"
+  fi
 
   printf "\n%s════════ bootstrap complete ════════%s\n\n" "$c_green" "$c_reset"
 
@@ -340,6 +356,8 @@ cmd_bootstrap() {
   # LM Studio, and the Qwen model are out of scope to install for them).
   printf "%sNext steps - one-time, manual:%s\n" "$c_bold" "$c_reset"
   printf "  1. Install %sChar.app%s (https://char.com - open-source, https://github.com/fastrepl/anarlog) if you haven't yet.\n" \
+         "$c_bold" "$c_reset"
+  printf "     Then run %s./run.sh configure-char%s to wire it up automatically.\n" \
          "$c_bold" "$c_reset"
   printf "  2. Install %sLM Studio.app%s (https://lmstudio.ai), then in its\n" \
          "$c_bold" "$c_reset"
@@ -349,16 +367,196 @@ cmd_bootstrap() {
     printf "     Install the lms CLI so this script can manage it:\n"
     printf "       %s~/.lmstudio/bin/lms bootstrap%s\n" "$c_bold" "$c_reset"
   fi
-  printf "  3. In Char → Settings → Transcription, set:\n"
-  printf "       %sBase URL%s = http://127.0.0.1:%s\n" "$c_bold" "$c_reset" "$ASR_PORT"
-  printf "       %sAPI Key%s  = (any non-empty string)\n" "$c_bold" "$c_reset"
-  printf "       %sIntelligence provider%s = LM Studio @ http://127.0.0.1:%s\n" \
-         "$c_bold" "$c_reset" "$LMSTUDIO_PORT"
-  printf "       %smodel%s = %s\n" "$c_bold" "$c_reset" "$LLM_MODEL"
+  printf "  3. In Char → Settings → Intelligence, set provider = LM Studio,\n"
+  printf "     base URL = http://127.0.0.1:%s, model = %s\n" \
+         "$LMSTUDIO_PORT" "$LLM_MODEL"
 
   printf "\n%sThen start the pipeline:%s\n" "$c_bold" "$c_reset"
   printf "    %s./run.sh start%s\n" "$c_bold" "$c_reset"
   printf "\nVerify any time with: %s./run.sh doctor%s\n\n" "$c_bold" "$c_reset"
+}
+
+# --- Char configuration ---
+#
+# Char is a Tauri app whose settings live as JSON on disk under the legacy
+# bundle id `com.hyprnote.stable`. We only touch the `ai.stt.openai.*` and
+# `ai.current_stt_*` keys here; LLM provider, templates, etc. are left alone.
+
+CHAR_APP="/Applications/Char.app"
+CHAR_DATA_DIR="$HOME/Library/Application Support/hyprnote"
+CHAR_SETTINGS="$CHAR_DATA_DIR/settings.json"
+
+char_installed() { [[ -d "$CHAR_APP" ]]; }
+
+char_running() {
+  pgrep -f "$CHAR_APP/Contents/MacOS/char" >/dev/null 2>&1
+}
+
+char_quit() {
+  osascript -e 'tell application "Char" to quit' >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    char_running || return 0
+    sleep 0.5
+  done
+  pkill -f "$CHAR_APP/Contents/MacOS/char" 2>/dev/null || true
+  sleep 1
+}
+
+char_relaunch() { open -ga Char; }
+
+# Yes/no prompt with default. $1=question, $2=default ("y" or "n").
+# Returns 0 for yes, 1 for no. Falls back to default when there's no tty
+# (so the script remains usable from CI / piped invocations).
+ask_yn() {
+  local prompt="$1" default="${2:-y}" reply
+  local hint="[Y/n]"
+  [[ "$default" == "n" ]] && hint="[y/N]"
+  # /dev/tty is a *device file* — exists even on detached subshells where it
+  # can't actually be opened. Probe by trying to open it; fall back to the
+  # default if the open fails (no controlling terminal).
+  if ! { : </dev/tty; } 2>/dev/null; then
+    [[ "$default" == "y" ]]
+    return $?
+  fi
+  printf "%s %s " "$prompt" "$hint" >/dev/tty 2>/dev/null
+  IFS= read -r reply </dev/tty 2>/dev/null || reply=""
+  reply="${reply:-$default}"
+  case "${reply,,}" in
+    y|yes) return 0 ;;
+    *)     return 1 ;;
+  esac
+}
+
+# Mask a secret-looking string for display.
+mask_secret() {
+  local s="$1"
+  local n=${#s}
+  if (( n < 12 )); then
+    printf '<%d chars>' "$n"
+  else
+    printf '%s…%s (%d chars)' "${s:0:8}" "${s: -4}" "$n"
+  fi
+}
+
+cmd_configure_char() {
+  printf "%sconfigure char%s — point Char's OpenAI transcriber at this server\n\n" \
+         "$c_bold" "$c_reset"
+
+  if ! char_installed; then
+    say "${c_red}Char.app not found at $CHAR_APP${c_reset}"
+    say "  install Char from https://char.com (or https://github.com/fastrepl/anarlog), then re-run"
+    return 1
+  fi
+  if [[ ! -f "$CHAR_SETTINGS" ]]; then
+    say "${c_yellow}Char settings.json not found at $CHAR_SETTINGS${c_reset}"
+    say "  open Char.app once so it creates its config dir, then re-run"
+    return 1
+  fi
+  if [[ ! -x "$VENV_PY" ]]; then
+    say "${c_red}venv python missing — run \`./run.sh bootstrap\` first${c_reset}"
+    return 1
+  fi
+
+  if char_running; then
+    say "Char is running; quitting it so settings.json edits stick ..."
+    char_quit
+  fi
+
+  # Read current values (one per line) so we can show + decide whether to back up.
+  local snapshot
+  snapshot="$("$VENV_PY" - "$CHAR_SETTINGS" <<'PY'
+import json, sys, pathlib
+d = json.loads(pathlib.Path(sys.argv[1]).read_text())
+ai  = d.get("ai") or {}
+oai = ((ai.get("stt") or {}).get("openai")) or {}
+print(ai.get("current_stt_provider") or "")
+print(ai.get("current_stt_model") or "")
+print(oai.get("base_url") or "")
+print(oai.get("api_key") or "")
+PY
+)"
+  local cur_prov cur_model cur_url cur_key
+  cur_prov="$(printf '%s' "$snapshot"  | sed -n '1p')"
+  cur_model="$(printf '%s' "$snapshot" | sed -n '2p')"
+  cur_url="$(printf '%s' "$snapshot"   | sed -n '3p')"
+  cur_key="$(printf '%s' "$snapshot"   | sed -n '4p')"
+
+  printf "  current Char settings:\n"
+  printf "    current_stt_provider : %s\n" "${cur_prov:-<unset>}"
+  printf "    current_stt_model    : %s\n" "${cur_model:-<unset>}"
+  printf "    stt.openai.base_url  : %s\n" "${cur_url:-<unset>}"
+  if [[ -z "$cur_key" ]]; then
+    printf "    stt.openai.api_key   : <unset>\n"
+  elif [[ "$cur_key" == "local" ]]; then
+    printf "    stt.openai.api_key   : local (already our placeholder)\n"
+  else
+    printf "    stt.openai.api_key   : %s  %s(looks like a real key)%s\n" \
+           "$(mask_secret "$cur_key")" "$c_yellow" "$c_reset"
+  fi
+  printf "\n"
+
+  # Offer to back up the existing key only if it's a non-placeholder value.
+  local key_backup_path=""
+  if [[ -n "$cur_key" && "$cur_key" != "local" ]]; then
+    if ask_yn "  Save existing OpenAI API key to a file before replacing it?" y; then
+      mkdir -p "$HOME/.config/local_scribe"
+      chmod 700 "$HOME/.config/local_scribe" 2>/dev/null || true
+      key_backup_path="$HOME/.config/local_scribe/char-openai-key.$(date +%Y%m%d-%H%M%S).txt"
+      printf '%s\n' "$cur_key" > "$key_backup_path"
+      chmod 600 "$key_backup_path"
+      printf "  saved to %s (chmod 600)\n" "$key_backup_path"
+      printf "  %sNOTE:%s if this is a real OpenAI key, rotate it on platform.openai.com — it sat unencrypted in Char's settings.json.\n" \
+             "$c_yellow" "$c_reset"
+    else
+      printf "  skipping backup — existing key will be overwritten\n"
+    fi
+  fi
+
+  # Always back up the whole settings file (cheap insurance).
+  local settings_backup
+  settings_backup="$CHAR_SETTINGS.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$CHAR_SETTINGS" "$settings_backup"
+  printf "  settings.json backup : %s\n" "$settings_backup"
+
+  # Patch the four keys we care about. Everything else (LLM, templates,
+  # general.*, calendars, etc.) is left untouched.
+  if ! "$VENV_PY" - "$CHAR_SETTINGS" "$ASR_PORT" <<'PY'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1]); port = sys.argv[2]
+d = json.loads(p.read_text())
+ai  = d.setdefault("ai", {})
+stt = ai.setdefault("stt", {})
+oai = stt.setdefault("openai", {})
+ai["current_stt_provider"] = "openai"
+ai["current_stt_model"]    = "gpt-4o-transcribe-diarize"
+oai["base_url"]            = f"http://127.0.0.1:{port}/v1"
+oai["api_key"]             = "local"
+p.write_text(json.dumps(d, indent=2) + "\n")
+PY
+  then
+    say "${c_red}failed to write settings.json — your backup is at $settings_backup${c_reset}"
+    return 1
+  fi
+
+  printf "\n  %s● char configured%s\n" "$c_green" "$c_reset"
+  printf "    current_stt_provider : openai\n"
+  printf "    current_stt_model    : gpt-4o-transcribe-diarize  (non-streaming, with speaker labels)\n"
+  printf "    stt.openai.base_url  : http://127.0.0.1:%s/v1\n" "$ASR_PORT"
+  printf "    stt.openai.api_key   : local\n"
+  if [[ -n "$key_backup_path" ]]; then
+    printf "    previous key saved   : %s\n" "$key_backup_path"
+  fi
+  printf "\n"
+
+  if ask_yn "  Relaunch Char now?" y; then
+    char_relaunch
+    sleep 2
+    if char_running; then
+      say "${c_green}Char relaunched${c_reset}"
+    else
+      say "${c_yellow}Char did not relaunch automatically — open it manually${c_reset}"
+    fi
+  fi
 }
 
 # --- ASR server ---
@@ -625,6 +823,8 @@ case "${1:-}" in
   doctor)     cmd_doctor ;;
   setup)      cmd_setup ;;
   bootstrap)  cmd_bootstrap ;;
+  configure-char|configure_char|configure)
+              cmd_configure_char ;;
   transcribe) cmd_transcribe "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}

@@ -73,9 +73,20 @@ On a freshly cloned repo:
 git clone <this repo>
 cd local_scribe
 ./run.sh bootstrap        # venv + pip deps + ASR + diarization models
+                          # + (optional) auto-configure Char.app
 # (do the manual installs above if you haven't already)
 ./run.sh start            # boot ASR server + LM Studio + tail the log
 ```
+
+`bootstrap` runs five steps:
+
+1. Build the Python venv and install pip deps.
+2. Download Parakeet ASR weights (~1.2 GB).
+3. Download sherpa-onnx diarization models (~45 MB).
+4. Check for the `lms` CLI.
+5. **If Char.app is installed**, prompt you to auto-configure its OpenAI
+   transcriber to point at this server (Y/n). Equivalent to running
+   `./run.sh configure-char` later — see [§ Configure Char](#configure-char).
 
 `bootstrap` is idempotent — re-runs are a no-op when everything is cached.
 
@@ -113,10 +124,44 @@ In the partial cases the message tells you exactly what to fix. Re-run
 
 ## Configure Char
 
-Char has **two separate transcription paths** and you'll want to point both
-at this server. Once `./run.sh start` is green, in Char → Settings → Transcription:
+### Automated (recommended)
 
-### 1. Live recording (Custom provider)
+```bash
+./run.sh configure-char
+```
+
+This is the same hook bootstrap offers, exposed as a standalone command so
+you can re-run it any time. It:
+
+- Locates Char's `settings.json` at `~/Library/Application Support/hyprnote/`.
+- Quits Char.app if it's running (so the edit doesn't get clobbered on next save).
+- **If `stt.openai.api_key` already holds a real-looking key**, prompts whether
+  to save it (default Yes) to `~/.config/local_scribe/char-openai-key.<ts>.txt`
+  with `chmod 600` before overwriting. If you accidentally pasted a real OpenAI
+  project key into Char, this preserves it; you should still rotate that key on
+  platform.openai.com because it sat unencrypted in the config file.
+- Always backs up the whole `settings.json` to `settings.json.bak.<ts>` for
+  trivial rollback.
+- Patches exactly four keys (everything else — LLM provider, templates,
+  calendars — is left untouched):
+
+  | key | value |
+  |---|---|
+  | `ai.current_stt_provider` | `openai` |
+  | `ai.current_stt_model` | `gpt-4o-transcribe-diarize` (non-streaming, with diarization) |
+  | `ai.stt.openai.base_url` | `http://127.0.0.1:8000/v1` |
+  | `ai.stt.openai.api_key` | `local` |
+
+- Offers to relaunch Char (default Yes).
+
+Safe to re-run: if `api_key` is already `local`, the backup-key prompt is
+skipped; only `settings.json` is re-snapshotted.
+
+### Manual (if you'd rather poke the UI)
+
+Char has **two separate transcription paths** — point both at this server.
+
+#### 1. Live recording (Custom provider)
 
 Used while Char is recording a meeting in real time.
 
@@ -131,7 +176,7 @@ Deepgram-compatible `/v1/listen` endpoint. (It's "batch over WebSocket" — fina
 transcript only, no interim partials, since neither Parakeet nor faster-whisper
 streams natively.)
 
-### 2. "Generate transcript" on existing audio (OpenAI Batch Only provider)
+#### 2. "Generate transcript" on existing audio (OpenAI Batch Only provider)
 
 Used when you click *Generate* on a note that already has audio. Char's
 *Custom* provider is **Deepgram-only** and only used for live recording —
@@ -141,6 +186,7 @@ point Char's bundled OpenAI provider at us.
 
 | field | value |
 |---|---|
+| **Model selector** | `gpt-4o-transcribe-diarize` *(not* `gpt-4o-transcribe` — that variant uses SSE streaming which we don't speak)* |
 | **Configure Providers → OpenAI → API Key** | any non-empty string |
 | **Configure Providers → OpenAI → Advanced → Base URL** | `http://127.0.0.1:8000/v1` |
 
@@ -162,7 +208,7 @@ where there were really 2-3). Either:
     plus an LLM pass that maps `speaker_0/1/...` to the actual people's
     names by reading conversational cues.
 
-### 3. Summary / Intelligence (LM Studio)
+#### 3. Summary / Intelligence (LM Studio)
 
 | field | value |
 |---|---|
