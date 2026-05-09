@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtualenv
+venv/
+.venv/
+env/
+
+# Runtime artifacts (PIDs, logs)
+.run/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local model caches and transcript caches live under ~/.cache/whisper_server/,
+# but if anyone ever drops them in the repo, ignore them too.
+models/
+transcripts/
+
+# Outputs
+*.log
+*.tmp
