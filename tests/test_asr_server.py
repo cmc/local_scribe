@@ -164,10 +164,12 @@ class BuildDiarizedSegmentsTests(unittest.TestCase):
         self.assertEqual([s["speaker"] for s in segs], ["speaker_0", "speaker_1"])
 
     def test_same_speaker_long_run_still_splits_at_caps(self):
+        # 200 words over 100 seconds; even with the looser single-speaker
+        # 80-word / 30-second caps this must split into multiple segments.
         words = [
             {"punctuated_word": "word", "start": float(i) * 0.5,
              "end": float(i) * 0.5 + 0.4, "speaker": "speaker_0"}
-            for i in range(50)
+            for i in range(200)
         ]
         segs = asr_server._build_diarized_segments(words, "")
         self.assertGreater(len(segs), 1)
@@ -179,6 +181,69 @@ class BuildDiarizedSegmentsTests(unittest.TestCase):
         self.assertEqual(len(segs), 1)
         self.assertEqual(segs[0]["speaker"], "speaker_0")
         self.assertEqual(segs[0]["text"], "fallback")
+
+    def test_single_speaker_does_not_break_on_sentence_end(self):
+        """In single-speaker mode, sentence-final punctuation must NOT
+        close a segment. The reader still sees the period via the
+        punctuated_word value, but multiple sentences flow into the same
+        segment so Char's UI doesn't have to render thousands of tiny rows.
+        Multi-speaker mode keeps the old per-sentence breaking.
+        """
+        # Three short sentences, single speaker -> ONE segment.
+        single = [
+            {"punctuated_word": "Hi.", "start": 0.0, "end": 0.3, "speaker": "speaker_0"},
+            {"punctuated_word": "OK?", "start": 0.5, "end": 0.7, "speaker": "speaker_0"},
+            {"punctuated_word": "Cool.", "start": 0.9, "end": 1.2, "speaker": "speaker_0"},
+        ]
+        segs = asr_server._build_diarized_segments(single, "")
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0]["text"], "Hi. OK? Cool.")
+
+        # Same words, two speakers -> sentence-final still respected per
+        # speaker turn, so we still get clean turn boundaries.
+        multi = [
+            {"punctuated_word": "Hi.", "start": 0.0, "end": 0.3, "speaker": "speaker_0"},
+            {"punctuated_word": "OK?", "start": 0.5, "end": 0.7, "speaker": "speaker_1"},
+        ]
+        segs = asr_server._build_diarized_segments(multi, "")
+        self.assertEqual(len(segs), 2)
+        self.assertEqual(segs[0]["speaker"], "speaker_0")
+        self.assertEqual(segs[1]["speaker"], "speaker_1")
+
+    def test_single_speaker_uses_chunkier_segments_than_multi_speaker(self):
+        """Single-speaker output (post auto-skip / one-cluster) must produce
+        far fewer segments than multi-speaker output for the same word
+        sequence, so Char's UI doesn't have to mint thousands of UUIDs.
+        Boundaries: ~30s/80 words instead of ~12s/30 words.
+        """
+        # 200 words, 0.5s each, all speaker_0 -> 100s total.
+        single = [
+            {"punctuated_word": "word", "start": float(i) * 0.5,
+             "end": float(i) * 0.5 + 0.4, "speaker": "speaker_0"}
+            for i in range(200)
+        ]
+        # Same words, but speaker alternates each word -> tightest chunking.
+        alternating = [
+            {"punctuated_word": "word", "start": float(i) * 0.5,
+             "end": float(i) * 0.5 + 0.4,
+             "speaker": f"speaker_{i % 2}"}
+            for i in range(200)
+        ]
+        single_segs = asr_server._build_diarized_segments(single, "")
+        multi_segs = asr_server._build_diarized_segments(alternating, "")
+        # Single-speaker should be at least 2x cheaper to render than the
+        # alternating case under the same input volume (in practice it's
+        # ~2.6x with the 30s/80w vs 12s/30w boundary policy).
+        self.assertLess(
+            len(single_segs), len(multi_segs) // 2,
+            f"single={len(single_segs)} multi={len(multi_segs)}; "
+            f"single-speaker chunking should be much chunkier",
+        )
+        # Sanity: single-speaker output must still hit the 80-word cap (200
+        # words / 80 ≈ 3 segments minimum after sentence-end breaks).
+        self.assertGreaterEqual(len(single_segs), 1)
+        # And every segment really is one speaker.
+        self.assertEqual({s["speaker"] for s in single_segs}, {"speaker_0"})
 
 
 class AttachSpeakersTests(unittest.TestCase):

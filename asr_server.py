@@ -553,6 +553,19 @@ def _attach_speakers_to_words(
         return [dict(w, speaker="speaker_0") for w in words], 1
 
 
+# When the entire response is going to be a single speaker (either because
+# diarization was skipped or because all words landed in the same cluster),
+# Char's UI has to mint a UUID per word and per speaker_hint. With 1000+
+# segments x ~10 words/segment that's tens of thousands of allocations on the
+# main thread, which empirically hangs the transcript view. So when we know
+# there's only one speaker we use much chunkier boundaries (~30s / 80 words)
+# instead of the 12s / 30 words used when speakers actually change.
+_DIAR_SEG_MAX_DURATION = 12.0
+_DIAR_SEG_MAX_WORDS = 30
+_SINGLE_SPEAKER_SEG_MAX_DURATION = 30.0
+_SINGLE_SPEAKER_SEG_MAX_WORDS = 80
+
+
 def _build_diarized_segments(
     words: list[dict[str, Any]],
     fallback_text: str,
@@ -560,9 +573,15 @@ def _build_diarized_segments(
     """Group consecutive same-speaker words into segments, breaking on
     speaker changes too. Each emitted segment carries the speaker label.
 
-    Sentence-final punctuation and the same ~12s/30-word caps from the
-    plain-text segment grouper still apply, so a single speaker's long
-    monologue gets reasonable boundaries.
+    Boundary policy:
+      - When the response is single-speaker (diarization skipped or
+        clustering produced one cluster), use ~30s / 80-word chunks. Char's
+        UI minted a UUID per word + a speaker_hint per word; 1000+ small
+        segments on a 2-hour file synchronously hangs the renderer.
+      - When speakers actually differ, keep tighter ~12s / 30-word chunks
+        so the transcript reads naturally turn-by-turn.
+
+    Sentence-final punctuation always closes a segment in either mode.
     """
     if not words:
         if fallback_text:
@@ -570,11 +589,25 @@ def _build_diarized_segments(
                      "speaker": "speaker_0"}]
         return []
 
+    distinct = {(w.get("speaker") or "speaker_0") for w in words}
+    single_speaker = len(distinct) <= 1
+    if single_speaker:
+        max_duration = _SINGLE_SPEAKER_SEG_MAX_DURATION
+        max_words = _SINGLE_SPEAKER_SEG_MAX_WORDS
+        # Sentence-final punctuation does NOT close a segment in single-
+        # speaker mode -- the reader still sees the period via
+        # `punctuated_word`, but multiple sentences flow into one segment.
+        # This is what keeps 2-hour single-speaker output to ~200 segments
+        # instead of 1400+, which is what Char's UI can actually render.
+        break_on_sentence_end = False
+    else:
+        max_duration = _DIAR_SEG_MAX_DURATION
+        max_words = _DIAR_SEG_MAX_WORDS
+        break_on_sentence_end = True
+
     segments: list[dict[str, Any]] = []
     bucket: list[dict[str, Any]] = []
     sentence_end = (".", "?", "!")
-    max_duration = 12.0
-    max_words = 30
 
     def flush() -> None:
         if not bucket:
@@ -600,7 +633,8 @@ def _build_diarized_segments(
         token = (w.get("punctuated_word") or w.get("word") or "").strip()
         last_char = token[-1:] if token else ""
         elapsed = float(bucket[-1]["end"]) - float(bucket[0]["start"])
-        if last_char in sentence_end or elapsed >= max_duration or len(bucket) >= max_words:
+        sentence_break = break_on_sentence_end and last_char in sentence_end
+        if sentence_break or elapsed >= max_duration or len(bucket) >= max_words:
             flush()
     flush()
 

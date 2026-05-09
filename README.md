@@ -479,7 +479,7 @@ local_scribe/
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 138 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 140 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -576,7 +576,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 138 tests, ~0.05s, no model loads
+venv/bin/python -m unittest discover -s tests   # 140 tests, ~0.05s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run
@@ -617,8 +617,18 @@ Look at `./run.sh logs`. If you see a line like
 `diarization returned 451 speakers (> MAX_SPEAKERS=12), treating as
 clustering blow-up; collapsing to single speaker_0`, the server already
 fell back to single-speaker mode for safety and Char *should* now render
-the transcript on the next Regenerate. If you'd rather have *some*
-diarization on long audio:
+the transcript on the next Regenerate.
+
+The server also chunks segments much more loosely in single-speaker mode
+(~30 s windows instead of breaking on every sentence) — this brings a
+2-hour file from ~1400 segments down to ~200, which Char's UI can
+actually convert and render without hanging. If a Char "Generate" comes
+back HTTP 200 in the log but the transcript still doesn't appear in the
+UI, the very last fallback is to delete `transcript.json` from the
+session folder under `~/Library/Application Support/hyprnote/sessions/`
+and click Generate one more time.
+
+If you'd rather have *some* diarization on long audio:
 
 - Set `NUM_SPEAKERS` to your known count (cheapest fix; gives clean labels)
 - Or raise `MAX_DIARIZE_SECONDS` to allow diarization on longer files
