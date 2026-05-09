@@ -456,7 +456,9 @@ All knobs are env vars; defaults are sensible.
 | `DIARIZE` | `1` | set `0` to disable diarization by default in `transcribe_file.py` |
 | `OPENAI_BATCH_DIARIZE` | `1` | set `0` to skip diarization in `POST /v1/audio/transcriptions` (Char's Generate flow) |
 | `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if known |
-| `CLUSTER_THRESHOLD` | `0.5` | sherpa-onnx fast-clustering threshold (raise to merge speakers, lower to split) |
+| `CLUSTER_THRESHOLD` | `0.5` short / `0.7` long | sherpa-onnx fast-clustering threshold. Auto-bumps to `0.7` for audio ≥ 10 min (long meetings have few speakers; tighter thresholds over-shard). Set this env var to lock a value. |
+| `MAX_DIARIZE_SECONDS` | `1800` | audio longer than this auto-skips diarization on `POST /v1/audio/transcriptions` (returns ASR transcript with single `speaker_0` placeholder). Sherpa-onnx clustering is O(N²) and Char's UI doesn't tolerate multi-minute Generate latencies. Set `0` to disable the cap. |
+| `MAX_SPEAKERS` | `12` | if sherpa-onnx returns more than this many distinct speakers, treat it as a clustering blow-up and collapse to single-speaker output rather than emit JSON Char can't render. Set `0` to disable the guard. |
 | `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_scribe/transcripts` | where the transcript cache lives |
 | `DIARIZATION_CACHE_DIR` | `~/.cache/local_scribe/diarization` | where sherpa-onnx model files live |
 | `PYTHON` | `python3.14` else `python3.12` else `python3` | which interpreter `run.sh` uses to build the venv |
@@ -477,7 +479,7 @@ local_scribe/
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 116 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 138 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -574,7 +576,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 116 tests, ~0.05s, no model loads
+venv/bin/python -m unittest discover -s tests   # 138 tests, ~0.05s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run
@@ -608,6 +610,23 @@ sherpa-onnx with default `CLUSTER_THRESHOLD=0.5` over-shards on short
 conversational audio. Set `NUM_SPEAKERS=2` (or your known count) before
 `./run.sh start` for exact, clean labels. Or `OPENAI_BATCH_DIARIZE=0` to
 skip diarization entirely if you don't need speaker labels.
+
+**Char shows nothing in the Transcript tab after clicking Generate on a long recording.**
+Look at `./run.sh logs`. If you see a line like
+`diarization auto-skipped: audio is 6848s > MAX_DIARIZE_SECONDS=1800s` or
+`diarization returned 451 speakers (> MAX_SPEAKERS=12), treating as
+clustering blow-up; collapsing to single speaker_0`, the server already
+fell back to single-speaker mode for safety and Char *should* now render
+the transcript on the next Regenerate. If you'd rather have *some*
+diarization on long audio:
+
+- Set `NUM_SPEAKERS` to your known count (cheapest fix; gives clean labels)
+- Or raise `MAX_DIARIZE_SECONDS` to allow diarization on longer files
+  (be aware: sherpa-onnx is O(N²) so a 2-hour meeting takes ~6 minutes
+  of clustering)
+- Or run `./run.sh transcribe FILE --diarize` outside Char to get the
+  full pipeline (ASR + diarization + LLM speaker-name inference) without
+  any UI timeout pressure
 
 **Char's note body looks fabricated / corporate-flavored on a short call.**
 That's not the transcription pipeline — Char runs a *separate* LLM call to

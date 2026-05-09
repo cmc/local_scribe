@@ -433,12 +433,45 @@ _OPENAI_BATCH_DIARIZE = os.getenv("OPENAI_BATCH_DIARIZE", "1").strip().lower() n
     "0", "false", "no", "off", "",
 }
 _NUM_SPEAKERS = int(os.getenv("NUM_SPEAKERS") or 0) or None
-_CLUSTER_THRESHOLD = float(os.getenv("CLUSTER_THRESHOLD") or 0.5)
+# The user-set CLUSTER_THRESHOLD (or None when unset). We hold the explicit
+# user override separately so the long-audio auto-bump only kicks in when
+# nothing was explicitly configured.
+_CLUSTER_THRESHOLD_OVERRIDE: float | None = (
+    float(os.environ["CLUSTER_THRESHOLD"]) if os.environ.get("CLUSTER_THRESHOLD") else None
+)
+_CLUSTER_THRESHOLD_DEFAULT = 0.5
+# Audio longer than this auto-skips diarization entirely (returns a single
+# `speaker_0` placeholder), because: (a) sherpa-onnx clustering is O(N^2) and
+# blows up past ~30 min, and (b) the resulting wall time would exceed Char's
+# UI patience. Set MAX_DIARIZE_SECONDS=0 to disable the auto-skip.
+_MAX_DIARIZE_SECONDS = int(os.getenv("MAX_DIARIZE_SECONDS") or 1800)
+# When sherpa-onnx returns more than this many distinct speakers we treat it
+# as a clustering blow-up (long mono recordings often produce 100+ phantom
+# speakers). The endpoint then collapses to a single speaker rather than
+# emitting unusable JSON. Set MAX_SPEAKERS=0 to disable the cap.
+_MAX_SPEAKERS = int(os.getenv("MAX_SPEAKERS") or 12)
+# Audio at or above this duration auto-bumps CLUSTER_THRESHOLD to the looser
+# default of 0.7 (long meetings have few speakers; tighter thresholds
+# over-shard). Skipped if the user explicitly set CLUSTER_THRESHOLD.
+_LONG_AUDIO_BUMP_AFTER_SECONDS = 600
+_LONG_AUDIO_CLUSTER_THRESHOLD = 0.7
+
+
+def _pick_cluster_threshold(duration: float | None) -> float:
+    """Decide which CLUSTER_THRESHOLD to use for this clip. Honours an
+    explicit env override; otherwise loosens for long files."""
+    if _CLUSTER_THRESHOLD_OVERRIDE is not None:
+        return _CLUSTER_THRESHOLD_OVERRIDE
+    if duration is not None and duration >= _LONG_AUDIO_BUMP_AFTER_SECONDS:
+        return _LONG_AUDIO_CLUSTER_THRESHOLD
+    return _CLUSTER_THRESHOLD_DEFAULT
 
 
 def _attach_speakers_to_words(
     audio_path: str,
     words: list[dict[str, Any]],
+    duration: float | None = None,
+    request_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Run sherpa-onnx diarization on `audio_path` and attach a speaker
     label to each word. Returns (words_with_speaker, num_speakers).
@@ -446,35 +479,77 @@ def _attach_speakers_to_words(
     On any failure (model load issue, audio decode failure, etc.) we
     log and fall back to a single anonymous speaker so Char's parser
     still gets a valid response.
+
+    Also enforces the duration cap (`MAX_DIARIZE_SECONDS`) and speaker-count
+    cap (`MAX_SPEAKERS`) -- both fall back to single-speaker output rather
+    than emit a response Char's UI can't render.
     """
+    log_id = f"[openai {request_id}] " if request_id else ""
+
     if not _OPENAI_BATCH_DIARIZE or not words:
         return [dict(w, speaker="speaker_0") for w in words], 1
+
+    if (
+        _MAX_DIARIZE_SECONDS > 0
+        and duration is not None
+        and duration > _MAX_DIARIZE_SECONDS
+    ):
+        logger.warning(
+            "%sdiarization auto-skipped: audio is %.0fs > MAX_DIARIZE_SECONDS=%ds. "
+            "Returning ASR-only transcript with a single speaker_0 placeholder. "
+            "Override with MAX_DIARIZE_SECONDS=0 (no cap) or run "
+            "`./run.sh transcribe FILE` for the full local pipeline.",
+            log_id, duration, _MAX_DIARIZE_SECONDS,
+        )
+        return [dict(w, speaker="speaker_0") for w in words], 1
+
     try:
         import diarization_backend as dz
+
+        threshold = _pick_cluster_threshold(duration)
+        if threshold != _CLUSTER_THRESHOLD_DEFAULT and _CLUSTER_THRESHOLD_OVERRIDE is None:
+            logger.info(
+                "%susing CLUSTER_THRESHOLD=%.2f (auto-bumped from %.2f for "
+                "audio >= %ds; set CLUSTER_THRESHOLD env var to override)",
+                log_id, threshold, _CLUSTER_THRESHOLD_DEFAULT,
+                _LONG_AUDIO_BUMP_AFTER_SECONDS,
+            )
 
         turns = dz.diarize(
             Path(audio_path),
             num_clusters=_NUM_SPEAKERS,
-            cluster_threshold=_CLUSTER_THRESHOLD,
+            cluster_threshold=threshold,
         )
         if not turns:
             return [dict(w, speaker="speaker_0") for w in words], 1
         diarized = dz.attach_speaker_to_words(words, turns)
-        # Normalise sherpa-onnx labels (SPEAKER_03, SPEAKER_11, ...) to a
-        # dense, lowercase, zero-indexed sequence (speaker_0, speaker_1, ...)
-        # in encounter order, which is what Char's UI displays.
         order: list[str] = []
         for w in diarized:
             label = w.get("speaker") or "SPEAKER_00"
             if label not in order:
                 order.append(label)
+
+        # Sherpa-onnx blow-up guard: if the clustering returns way more
+        # speakers than makes sense for a meeting, bail to single-speaker
+        # rather than emit unusable JSON. This is the one that bit us on a
+        # 114-min recording where it produced 451 phantom speakers.
+        if _MAX_SPEAKERS > 0 and len(order) > _MAX_SPEAKERS:
+            logger.warning(
+                "%sdiarization returned %d speakers (> MAX_SPEAKERS=%d), "
+                "treating as clustering blow-up; collapsing to single speaker_0. "
+                "Try a higher CLUSTER_THRESHOLD, or set NUM_SPEAKERS to your "
+                "known count, or MAX_SPEAKERS=0 to disable this guard.",
+                log_id, len(order), _MAX_SPEAKERS,
+            )
+            return [dict(w, speaker="speaker_0") for w in words], 1
+
         remap = {label: f"speaker_{i}" for i, label in enumerate(order)}
         return (
             [dict(w, speaker=remap[w.get("speaker") or "SPEAKER_00"]) for w in diarized],
             len(order),
         )
     except Exception:
-        logger.exception("diarization failed; falling back to single speaker")
+        logger.exception("%sdiarization failed; falling back to single speaker", log_id)
         return [dict(w, speaker="speaker_0") for w in words], 1
 
 
@@ -815,7 +890,7 @@ async def openai_audio_transcriptions(request: Request):
                 "[openai %s] running diarization (sherpa-onnx) ...", request_id,
             )
             words, num_speakers = await asyncio.to_thread(
-                _attach_speakers_to_words, tmp.name, words,
+                _attach_speakers_to_words, tmp.name, words, duration, request_id,
             )
 
     elapsed = time.time() - started

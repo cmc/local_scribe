@@ -248,6 +248,129 @@ class AttachSpeakersTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
 
+    def test_long_audio_auto_skips_diarization(self):
+        """Audio over MAX_DIARIZE_SECONDS should bail to single-speaker
+        rather than chew through 5+ minutes of clustering."""
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 100.0},
+        ]
+        with mock.patch.object(asr_server, "_MAX_DIARIZE_SECONDS", 1800), \
+             mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            # 31 minutes -> over the cap -> diarize() must NOT be called
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS, duration=1860.0,
+            )
+        self.assertEqual(n, 1)
+        self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
+        fake_dz.diarize.assert_not_called()
+
+    def test_blowup_more_than_max_speakers_collapses_to_single(self):
+        """If sherpa-onnx returns more than MAX_SPEAKERS distinct labels we
+        treat that as a clustering blow-up (this is the 451-speakers-on-114-min
+        bug) and collapse to single-speaker rather than emit junk JSON."""
+        # Synthesize 15 words each assigned to a distinct phantom speaker.
+        many_words = [
+            {"word": f"w{i}", "punctuated_word": f"w{i}",
+             "start": float(i), "end": float(i) + 0.5, "confidence": 0.9}
+            for i in range(15)
+        ]
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": f"SPEAKER_{i:02d}", "start": float(i), "end": float(i)+0.5}
+            for i in range(15)
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(w, speaker=f"SPEAKER_{i:02d}") for i, w in enumerate(many_words)
+        ]
+        with mock.patch.object(asr_server, "_MAX_SPEAKERS", 12), \
+             mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", many_words, duration=600.0,
+            )
+        self.assertEqual(n, 1)
+        self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
+
+    def test_max_speakers_zero_disables_blowup_guard(self):
+        """MAX_SPEAKERS=0 lets the original behavior (one segment per
+        clustered speaker) through unchanged."""
+        many_words = [
+            {"word": f"w{i}", "punctuated_word": f"w{i}",
+             "start": float(i), "end": float(i) + 0.5, "confidence": 0.9}
+            for i in range(15)
+        ]
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": f"SPEAKER_{i:02d}", "start": float(i), "end": float(i)+0.5}
+            for i in range(15)
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(w, speaker=f"SPEAKER_{i:02d}") for i, w in enumerate(many_words)
+        ]
+        with mock.patch.object(asr_server, "_MAX_SPEAKERS", 0), \
+             mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", many_words, duration=600.0,
+            )
+        self.assertEqual(n, 15)
+
+    def test_long_audio_bumps_cluster_threshold(self):
+        """Without an explicit env override, long audio should bump the
+        threshold to 0.7 so sherpa-onnx doesn't over-shard."""
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 100.0},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(w, speaker="SPEAKER_00") for w in CANNED_WORDS
+        ]
+        # No explicit override (None), and short-audio default is 0.5.
+        with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", None), \
+             mock.patch.object(asr_server, "_MAX_DIARIZE_SECONDS", 0), \
+             mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS, duration=900.0,
+            )
+        kwargs = fake_dz.diarize.call_args.kwargs
+        self.assertAlmostEqual(kwargs["cluster_threshold"], 0.7)
+
+    def test_explicit_threshold_override_wins_over_long_audio_bump(self):
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 100.0},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(w, speaker="SPEAKER_00") for w in CANNED_WORDS
+        ]
+        with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", 0.42), \
+             mock.patch.object(asr_server, "_MAX_DIARIZE_SECONDS", 0), \
+             mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS, duration=900.0,
+            )
+        kwargs = fake_dz.diarize.call_args.kwargs
+        self.assertAlmostEqual(kwargs["cluster_threshold"], 0.42)
+
+
+class PickClusterThresholdTests(unittest.TestCase):
+    def test_short_audio_no_override_uses_default(self):
+        with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", None):
+            self.assertAlmostEqual(asr_server._pick_cluster_threshold(60.0), 0.5)
+
+    def test_long_audio_no_override_bumps_to_0_7(self):
+        with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", None):
+            self.assertAlmostEqual(asr_server._pick_cluster_threshold(700.0), 0.7)
+
+    def test_unknown_duration_uses_default(self):
+        with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", None):
+            self.assertAlmostEqual(asr_server._pick_cluster_threshold(None), 0.5)
+
+    def test_explicit_override_always_wins(self):
+        with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", 0.33):
+            self.assertAlmostEqual(asr_server._pick_cluster_threshold(60.0), 0.33)
+            self.assertAlmostEqual(asr_server._pick_cluster_threshold(7200.0), 0.33)
+            self.assertAlmostEqual(asr_server._pick_cluster_threshold(None), 0.33)
+
 
 class TimestampFormatTests(unittest.TestCase):
     def test_srt_timestamp_uses_comma_decimal(self):
