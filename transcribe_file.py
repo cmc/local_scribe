@@ -1,5 +1,5 @@
 """
-local_transcriber - manual transcribe-and-summarize CLI.
+local_scribe - manual transcribe-and-summarize CLI.
 
 Use case: when Char doesn't auto-transcribe an audio file you dragged
 into it, run this script to (1) transcribe the audio using either
@@ -33,12 +33,12 @@ Usage:
     python transcribe_file.py --clear-cache                       # wipe the cache
 
 Caching & bulk analysis:
-    Transcripts are cached to ~/.cache/local_transcriber/transcripts/<sha256>.json
+    Transcripts are cached to ~/.cache/local_scribe/transcripts/<sha256>.json
     keyed by the audio file's content hash. Each cache entry embeds a `_source`
     block with original path, file mtime, hash, transcribed-at timestamp, and
     detected duration - so bulk analysis is a simple glob:
 
-        for f in ~/.cache/local_transcriber/transcripts/*.json:
+        for f in ~/.cache/local_scribe/transcripts/*.json:
             data = json.load(open(f))
             print(data["_source"]["path"], data["_source"]["transcribed_at_human"])
 
@@ -52,7 +52,7 @@ Env overrides:
     LLM_URL              default http://127.0.0.1:1234/v1/chat/completions
     LLM_MODEL            default qwen3-30b-a3b-instruct-2507
     LLM_MAX_TOKENS       default 4096
-    TRANSCRIPT_CACHE_DIR default ~/.cache/local_transcriber/transcripts
+    TRANSCRIPT_CACHE_DIR default ~/.cache/local_scribe/transcripts
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "qwen3-30b-a3b-instruct-2507")
 DEFAULT_LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 DEFAULT_CACHE_DIR = Path(
     os.getenv("TRANSCRIPT_CACHE_DIR")
-    or (Path.home() / ".cache" / "local_transcriber" / "transcripts")
+    or (Path.home() / ".cache" / "local_scribe" / "transcripts")
 )
 
 

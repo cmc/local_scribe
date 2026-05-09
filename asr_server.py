@@ -1,5 +1,5 @@
 """
-local_transcriber - Deepgram-compatible ASR server.
+local_scribe - Deepgram-compatible ASR server.
 
 Implements the two pieces of Deepgram's /v1/listen contract that real clients
 (including Char with BYOK Deepgram + a custom base URL) actually use:
@@ -64,7 +64,7 @@ from fastapi import FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-logger = logging.getLogger("local_transcriber")
+logger = logging.getLogger("local_scribe")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -138,7 +138,7 @@ _mlx_executor.submit(lambda: None).result()
 
 logger.info("model ready (backend=%s, model=%s)", ASR_BACKEND, MODEL_NAME)
 
-app = FastAPI(title="local-transcriber-asr", version="0.3.0")
+app = FastAPI(title="local-scribe-asr", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

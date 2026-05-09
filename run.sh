@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# local_transcriber - service manager for the local ASR + LLM pipeline.
+# local_scribe - service manager for the local ASR + LLM pipeline.
 #
 # Services managed:
 #   - LM Studio API @ :1234            (started via `lms server start`)
@@ -270,7 +270,7 @@ def check(repo, label):
     except Exception:
         print(f"  {Y}\u25cb{Z} {label:30s} not yet downloaded")
 check("$PARAKEET_MODEL",      "parakeet ($ASR_BACKEND_DEFAULT default)")
-diar = Path.home() / ".cache" / "local_transcriber" / "diarization"
+diar = Path.home() / ".cache" / "local_scribe" / "diarization"
 seg  = diar / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 emb  = diar / "nemo_en_titanet_small.onnx"
 mark = lambda b: f"{G}\u25cf{Z}" if b else f"{Y}\u25cb{Z}"

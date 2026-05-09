@@ -20,10 +20,39 @@ env/
 .vscode/
 
 # Local model caches and transcript caches live under
-# ~/.cache/local_transcriber/, but if anyone ever drops them in the repo,
+# ~/.cache/local_scribe/, but if anyone ever drops them in the repo,
 # ignore them too.
 models/
 transcripts/
+
+# === Privacy: never commit audio recordings or generated transcripts ===
+# Audio files (recordings, samples)
+*.mp3
+*.m4a
+*.wav
+*.ogg
+*.flac
+*.aac
+*.opus
+*.aiff
+*.aif
+*.wma
+*.webm
+*.mp4
+*.mov
+*.mkv
+
+# Generated transcripts / summaries / diarized outputs
+# (transcribe_file.py --save defaults to .md / .txt / .json next to the audio)
+*.transcript.json
+*.transcript.txt
+*.transcript.md
+*.summary.md
+*.summary.txt
+*.diarized.txt
+*.diarized.md
+out/
+outputs/
 
 # Outputs
 *.log

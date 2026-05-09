@@ -1,4 +1,4 @@
-# local_transcriber
+# local_scribe
 
 Local, private, Apple-Silicon-native transcription + summarization pipeline.
 Drops in as a Deepgram-compatible endpoint behind [Char](https://char.so) and
@@ -58,7 +58,7 @@ On a freshly cloned repo:
 
 ```bash
 git clone <this repo>
-cd local_transcriber
+cd local_scribe
 ./run.sh bootstrap        # venv + pip deps + ASR + diarization models
 # (do the manual installs above if you haven't already)
 ./run.sh start            # boot ASR server + LM Studio + tail the log
@@ -172,7 +172,7 @@ read-only and produces a report like:
 doctor — validating local pipeline
 
 python:
-  ● venv at /…/local_transcriber/venv (Python 3.14.3)
+  ● venv at /…/local_scribe/venv (Python 3.14.3)
 
 python packages:
   ● fastapi            0.136.1
@@ -184,8 +184,8 @@ python packages:
 
 models:
   ● parakeet (parakeet default)   cached at ~/.cache/huggingface/hub/…
-  ● pyannote segmentation         ~/.cache/local_transcriber/diarization/…/model.onnx
-  ● NeMo TitaNet embedding        ~/.cache/local_transcriber/diarization/nemo_en_titanet_small.onnx
+  ● pyannote segmentation         ~/.cache/local_scribe/diarization/…/model.onnx
+  ● NeMo TitaNet embedding        ~/.cache/local_scribe/diarization/nemo_en_titanet_small.onnx
 
 services:
   ● ASR server   :8000   reachable
@@ -223,8 +223,8 @@ All knobs are env vars; defaults are sensible.
 | `DIARIZE` | `1` | set `0` to disable diarization by default |
 | `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if known |
 | `CLUSTER_THRESHOLD` | `0.5` | sherpa-onnx fast-clustering threshold |
-| `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_transcriber/transcripts` | where the transcript cache lives |
-| `DIARIZATION_CACHE_DIR` | `~/.cache/local_transcriber/diarization` | where sherpa-onnx model files live |
+| `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_scribe/transcripts` | where the transcript cache lives |
+| `DIARIZATION_CACHE_DIR` | `~/.cache/local_scribe/diarization` | where sherpa-onnx model files live |
 | `PYTHON` | `python3.14` else `python3.12` else `python3` | which interpreter `run.sh` uses to build the venv |
 
 Switch to whisper for, say, a Mandarin call:
@@ -236,7 +236,7 @@ ASR_BACKEND=whisper WHISPER_LANGUAGE=zh ./run.sh restart
 ## Project layout
 
 ```
-local_transcriber/
+local_scribe/
 ├── asr_server.py            # FastAPI server (Deepgram-compatible)
 ├── transcribe_file.py       # CLI for manual files
 ├── parakeet_backend.py      # parakeet-mlx wrapper, BPE -> Deepgram words
@@ -251,8 +251,8 @@ Caches (gitignored, safe to delete to free disk):
 
 ```
 ~/.cache/huggingface/hub/                                # Parakeet, faster-whisper
-~/.cache/local_transcriber/diarization/                  # sherpa-onnx ONNX models
-~/.cache/local_transcriber/transcripts/<sha256>.json     # cached ASR results
+~/.cache/local_scribe/diarization/                  # sherpa-onnx ONNX models
+~/.cache/local_scribe/transcripts/<sha256>.json     # cached ASR results
 ```
 
 ## API surface (for non-Char clients)
