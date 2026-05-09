@@ -233,84 +233,54 @@ no audio leaves your laptop.
 
 ## Hardware requirements
 
-This is a fully local pipeline — *all* model inference happens on your Mac,
-nothing is shipped to a cloud API. Sizing is therefore dominated by the LLM,
-not the ASR (Parakeet 0.6B uses ~1.2 GB, irrelevant in comparison).
+This repo was developed and end-to-end-tested against an **Apple M3 Max,
+16-core (12P+4E), 128 GB unified memory, macOS 15.0** — the "comfortable"
+tier in the table below. Everything in the pipeline is Apple Silicon
+native (Parakeet via MLX, sherpa-onnx via CoreML, Qwen via LM Studio's
+MLX runtime); there is no Intel or Linux build.
 
-### Tested-against rig
+| tier | CPU / RAM | LLM | what works | trade-offs |
+|---|---|---|---|---|
+| **Comfortable** *(reference)* | M2 Pro / M3 / M4 family, **64 GB+ unified memory**, ≥40 GB free disk | `qwen3-30b-a3b-instruct-2507` (32 GB MLX) | live recording, batch Generate, full-quality summaries, all `transcribe_file.py` features | none |
+| **Acceptable** | M1 / M2 / M3, **24–48 GB unified memory**, ≥10 GB free disk | `qwen/qwen3-4b` (2.3 GB MLX) — auto-selected by bootstrap on this tier | everything works; summaries are visibly less detailed and reasoning steps occasionally falter on long calls | swap pressure during 2h+ recordings |
+| **Minimum** | M1, **16 GB unified memory** | (none — Parakeet only) | live transcription via Char, manual `./run.sh transcribe` | summary step in Char will fail (no LLM) — use the LM Studio chat UI manually instead, or skip summaries |
+| **Won't run** | Intel Mac, Linux, Windows, M1 with <16 GB | n/a | n/a | Parakeet-MLX is Apple Silicon-only; CoreML diarization same |
 
-| | spec |
+Always-on disk usage at "comfortable" tier with everything pulled:
+
+| component | size |
 |---|---|
-| Mac | MacBook Pro 16" (Apple Silicon) |
-| SoC | Apple **M3 Max** |
-| Unified memory | **128 GB** |
-| macOS | 15.0 (Sequoia) or newer |
+| Parakeet TDT 0.6B v3 (MLX) | 1.2 GB |
+| sherpa-onnx diarization (pyannote 3.0 + TitaNet) | 45 MB |
+| Qwen3-30B-A3B-Instruct-2507 (MLX) | 32 GB |
+| LM Studio.app | 600 MB |
+| Char.app | 350 MB |
+| Python venv + pip deps | 2.5 GB |
+| **Total** | **~37 GB** |
 
-Everything in this README is reproducible against that machine. Every
-benchmark you'll see (Parakeet at ~80x realtime, Qwen3-30B at ~110 tok/s,
-the full Maus 114-min E2E in ~7 minutes) was measured here.
+Add ≈1.6 GB if you also opt into faster-whisper (`ASR_BACKEND=whisper`)
+as a fallback engine. Recordings + transcripts live in Char's directory
+and grow with usage (a 1-hour 192 kbps mp3 is ≈85 MB; transcript JSON
+≈2 MB; summary markdown <10 KB).
 
-### Minimum / recommended
+## Prerequisites — install these manually once
 
-| Tier | RAM | Notes | LLM you should pick |
+Most prerequisites are now installed automatically by `./run.sh
+bootstrap` (see [§ Bootstrap automation](#bootstrap-automation) below).
+The two things you still need to bring yourself:
+
+| | what | how | why |
 |---|---|---|---|
-| **Won't work** | <16 GB | even Parakeet + a 4B model will swap | n/a |
-| Minimum | 16 GB | tight; no other heavy apps open | `qwen3-4b` (≈3 GB MLX) |
-| Comfortable | 32 GB | Char + ASR server + 14B LLM concurrently | `qwen3-14b` (≈9 GB MLX) |
-| **Recommended** | 64 GB+ | the full default config; spare headroom for browser, etc. | `qwen3-30b-a3b-instruct-2507` (≈18 GB MLX) |
-| Overkill | 128 GB+ | room for larger context windows, multi-model setups | same — fits easily |
+| 1 | macOS on Apple Silicon | — | Parakeet-MLX, MLX-Qwen, and CoreML diarization are all Apple-Silicon-only |
+| 2 | Python 3.12 or 3.14 | `brew install python@3.14` | runs the server + CLI; `bootstrap` auto-builds the venv |
+| 3 | [Homebrew](https://brew.sh) (recommended) | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` | how `bootstrap` installs LM Studio.app + Char.app unattended |
 
-To use a smaller model, set `LLM_MODEL` and re-bootstrap:
-
-```bash
-LLM_MODEL=qwen3-14b ./run.sh install-llm
-```
-
-(Re-run `./run.sh configure-char` afterwards if you also want the LLM
-selected in Char's UI to match.)
-
-Apple Silicon is required (Parakeet-MLX has no CUDA/CPU fallback). Intel
-Macs can still run faster-whisper via `ASR_BACKEND=whisper`, but the LLM
-side will be much slower without MLX-native execution.
-
-### Storage
-
-| | size | when |
-|---|---|---|
-| Parakeet-TDT 0.6B v3 (MLX) | ≈1.2 GB | bootstrap |
-| sherpa-onnx diarization bundle | ≈45 MB | bootstrap |
-| faster-whisper large-v3-turbo (optional) | ≈1.6 GB | only if `ASR_BACKEND=whisper` |
-| LM Studio.app | ≈600 MB | bootstrap |
-| Qwen3-30B MLX 4-bit | **≈18 GB** | bootstrap (the dominant download) |
-| Char.app | ≈400 MB | bootstrap |
-
-Total fresh-install footprint: **≈21 GB** with the recommended LLM.
-
-## Prerequisites
-
-The only thing you need to install yourself is Python (and Homebrew, so
-the script can install LM Studio for you). Everything else — Char.app,
-LM Studio.app, the `lms` CLI, the Qwen model, and the ASR/diarization
-weights — is handled by `./run.sh bootstrap`.
-
-| | what | how | when |
-|---|---|---|---|
-| 1 | macOS on Apple Silicon | — | always |
-| 2 | Python 3.12 or 3.14 | `brew install python@3.14` | always |
-| 3 | [Homebrew](https://brew.sh) | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` | so bootstrap can `brew install --cask lm-studio` |
-
-Bootstrap fetches automatically, with a Yes/No prompt before every
-network-fetching step (so you can opt out of any stage):
-
-| | what | size | how |
-|---|---|---|---|
-| 4 | Python pip deps (FastAPI, parakeet-mlx, sherpa-onnx, …) | ≈700 MB | `./run.sh bootstrap` |
-| 5 | Parakeet-TDT 0.6B v3 ASR weights | ≈1.2 GB | `./run.sh bootstrap` |
-| 6 | sherpa-onnx diarization models | ≈45 MB | `./run.sh bootstrap` |
-| 7 | [LM Studio.app](https://lmstudio.ai) | ≈600 MB | `./run.sh install-llm` (called by bootstrap) — Homebrew Cask |
-| 8 | LM Studio CLI: `lms` | ≈0 MB | `./run.sh install-llm` — runs `~/.lmstudio/bin/lms bootstrap` |
-| 9 | LM Studio model: **`qwen3-30b-a3b-instruct-2507`** | ≈18 GB MLX | `./run.sh install-llm` — runs `lms get` |
-| 10 | [Char.app](https://char.com) v1.0.24 (source: [fastrepl/anarlog](https://github.com/fastrepl/anarlog), MIT) | ≈400 MB | `./run.sh install-char` (called by bootstrap) — pinned DMG, SHA256-verified |
+Everything else — **LM Studio.app**, the **Qwen3 model**, the **`lms`
+CLI**, **Char.app** at the pinned version, **Parakeet ASR weights**,
+**sherpa-onnx diarization models**, and the **Python venv** — is
+installed by `./run.sh bootstrap` with one or two y/N prompts (one per
+multi-GB download you'd want to pre-approve). See the bootstrap section
+below for what each step does.
 
 ## Quick start
 
@@ -319,51 +289,110 @@ On a freshly cloned repo:
 ```bash
 git clone <this repo>
 cd local_scribe
-./run.sh bootstrap        # full install: pip deps, ASR + diarization models,
-                          #   LM Studio + lms CLI + Qwen, Char + auto-config
-./run.sh start            # boot ASR server + LM Studio, tail the log
+./run.sh bootstrap        # one-shot setup: venv + pip + ASR/diar models +
+                          # LM Studio + Qwen LLM + Char.app + auto-config
+./run.sh start            # boot ASR server, ensure LM Studio is up + model
+                          # loaded, tail the log
 ```
 
-`bootstrap` runs five steps. Every step that downloads anything from the
-network prompts Yes/No first, so you can opt out of any stage and run it
-later via the matching subcommand:
+## Bootstrap automation
 
-1. **Python venv + pip deps** — builds `venv/`, installs FastAPI,
-   parakeet-mlx, sherpa-onnx, etc. (~700 MB).
-2. **Parakeet ASR weights** — `mlx-community/parakeet-tdt-0.6b-v3` from
-   Hugging Face (~1.2 GB).
-3. **sherpa-onnx diarization models** — pyannote 3.0 segmentation +
-   NeMo TitaNet embedding (~45 MB).
-4. **LM Studio + `lms` CLI + Qwen model** (rerunnable as
-   `./run.sh install-llm`):
-    - If LM Studio.app isn't in `/Applications` → offer to install via
-      `brew install --cask lm-studio` (~600 MB).
-    - Run `~/.lmstudio/bin/lms bootstrap` to put `lms` on your `$PATH`.
-    - Start LM Studio's HTTP API on `:1234` (`lms server start`).
-    - If the configured `$LLM_MODEL` (default `qwen3-30b-a3b-instruct-2507`)
-      isn't downloaded → run `lms get <model>@mlx` (~18 GB) — this opens
-      LM Studio's interactive download prompt; answer Yes.
-    - `lms load` the model with `--context-length 65536`.
-5. **Char.app** (rerunnable as `./run.sh install-char` and
-   `./run.sh configure-char`):
-    - If Char isn't installed → offer to download the **pinned version**
-      (`v1.0.24`, the build this repo was tested against) from the
-      [`fastrepl/anarlog` GitHub Release](https://github.com/fastrepl/anarlog/releases/tag/desktop_v1.0.24),
-      verify SHA256, and install it to `/Applications`. See
-      [§ Char version pin](#char-version-pin) for what we pin and why.
-    - If Char *is* installed at a different version → warn that the
-      pinned version is the only build the auto-config has been validated
-      against, and offer to replace (default *No* — your call).
-    - Then, regardless of the above, prompt to wire Char's OpenAI
-      transcriber at this server (equivalent to `./run.sh configure-char`).
+`./run.sh bootstrap` is a single command that takes a clean machine
+(macOS + Python + Homebrew) all the way to a working pipeline. It runs
+**five idempotent steps** — already-done steps short-circuit with a
+green checkmark, so re-running on a fully set-up machine prints the
+state and exits without changing anything.
 
-`bootstrap` is idempotent — re-runs are a no-op when everything is
-cached and installed; declined steps just leave a trail of "follow-ups"
-at the end with the exact subcommand to run later.
+```text
+(1/5) python venv + pip deps          ─── creates .venv/ if missing,
+                                          installs requirements.txt
+(2/5) parakeet ASR weights            ─── ~1.2 GB MLX bundle from
+                                          mlx-community/parakeet-tdt-0.6b-v3
+(3/5) sherpa-onnx diarization models  ─── ~45 MB ONNX (pyannote 3.0
+                                          segmentation + TitaNet embedding)
+(4/5) LM Studio.app + Qwen LLM        ─── see breakdown below
+(5/5) Char.app — install + auto-config
+```
 
-`start` runs preflight first (so even if you skipped `bootstrap` it Just Works),
-then brings up the services and tails the ASR log. `Ctrl+C` detaches without
-stopping anything.
+### Step (4/5) — LM Studio.app + Qwen LLM, in detail
+
+This is the step that handles your local LLM host end-to-end. It is
+**fully unattended past two y/N prompts** (one for the brew cask
+install, one for the multi-GB model download — you wouldn't want either
+to start without confirmation).
+
+1. **Install LM Studio.app** if `/Applications/LM Studio.app` is missing,
+   via `brew install --cask lm-studio` (so it auto-updates and is signed).
+   We pin `LMSTUDIO_KNOWN_GOOD_VERSION = 0.4.12` — installed versions
+   that match get a "matches pinned" stamp; later versions get a soft
+   "usually compatible" note (LM Studio's `lms` CLI surface is stable
+   across patch releases). Build suffixes like `0.4.12+1` are normalised
+   for the comparison.
+2. **Bootstrap the `lms` CLI** by finding the binary inside the app
+   bundle (`/Applications/LM Studio.app/Contents/Resources/.../lms`) and
+   running `lms bootstrap`. This symlinks it into
+   `~/.cache/lm-studio/bin/lms` so it's on your `PATH` for subsequent
+   invocations and for `./run.sh start` to use. (Without this step, the
+   `lms` symlink only gets created the first time you GUI-launch LM
+   Studio.)
+3. **Start the LM Studio HTTP server** on `:1234` (`lms server start
+   --port 1234`). If it's already running, skipped.
+4. **Pick the right model for your hardware.** Reads `sysctl -n
+   hw.memsize`:
+   - **≥48 GB unified memory** → recommends `qwen/qwen3-30b-a3b-instruct-2507`
+     (32 GB MLX, ~36 GB loaded with the default 65 K context).
+   - **<48 GB unified memory** → falls back to `qwen/qwen3-4b`
+     (2.3 GB MLX, ~3 GB loaded). The threshold is configurable via
+     `LLM_MIN_RAM_GB`; the model identifiers are `LLM_MODEL_REPO` and
+     `LLM_MODEL_SMALL_REPO`.
+5. **Download the chosen model** via `lms get <repo> --mlx -y` if it's
+   not already in your local store. Skipped if `/api/v0/models` already
+   reports the model id (or a `<owner>/<id>` variant) as known. The
+   `--mlx` flag forces the Apple Silicon native variant; `-y`
+   auto-accepts the default quantisation.
+6. **Load the model** into RAM via `lms load <model> -y --context-length
+   65536`, or skip if `/api/v0/models` reports it as `state=loaded`.
+   The context length is configurable via `LLM_CONTEXT`.
+
+After step 6, LM Studio is fully ready: server on `:1234`, model loaded,
+OpenAI-compatible API at `/v1/chat/completions` waiting for Char to call.
+
+### Step (5/5) — Char.app, in detail
+
+Same shape as the LM Studio step, with one extra wrinkle (the OpenAI
+transcriber config patch):
+
+- If Char isn't installed → offer to download the **pinned version**
+  (`v1.0.24`, the build this repo was tested against) from the
+  [`fastrepl/anarlog` GitHub Release](https://github.com/fastrepl/anarlog/releases/tag/desktop_v1.0.24),
+  verify SHA256, and install it to `/Applications`. See
+  [§ Char version pin](#char-version-pin) for what we pin and why.
+- If Char *is* installed at a different version → warn that the
+  pinned version is the only build the auto-config has been validated
+  against, and offer to replace (default *No* — your call).
+- Then, regardless of the above, prompt to wire Char's OpenAI
+  transcriber at this server (equivalent to `./run.sh configure-char`).
+  See [§ How the integration works](#how-the-integration-works-aka-the-hack)
+  for the four `settings.json` keys this rewrites.
+
+### What you still have to click manually
+
+After bootstrap finishes there's exactly **one tab in Char** left to
+configure that we don't auto-write — Char's *Intelligence* (LLM)
+provider. Open Char → **Settings → Intelligence**, set:
+
+- **Provider**: LM Studio
+- **Base URL**: `http://127.0.0.1:1234`
+- **Model**: `qwen3-30b-a3b-instruct-2507` (or `qwen/qwen3-4b` on smaller
+  hardware — whichever bootstrap downloaded for you)
+
+That's it. From there, every recording you take and every audio file
+you Generate runs through Parakeet + Qwen on your laptop with no
+network egress.
+
+`./run.sh start` runs preflight first (so even if you skipped
+`bootstrap` it Just Works), then brings up the services and tails the
+ASR log. `Ctrl+C` detaches without stopping anything.
 
 ### What `start` will print
 
@@ -613,13 +642,10 @@ Useful flags (full list: `./run.sh transcribe --help`):
 ## Health & diagnostics
 
 ```bash
-./run.sh doctor          # full report: python, deps, models, services, Char-config hints (read-only)
-./run.sh status          # quick PIDs + ports + which model
-./run.sh health          # one-shot HTTP probe of both services (exit non-zero if down)
-./run.sh setup           # force reinstall pip deps + redownload models
-./run.sh install-llm     # install/repair LM Studio + lms CLI + Qwen download/load
-./run.sh install-char    # download + install the pinned Char.app DMG (SHA256-verified)
-./run.sh configure-char  # rewrite Char's settings.json to point its OpenAI transcriber here
+./run.sh doctor      # full report: python, deps, models, services, Char-config hints (read-only)
+./run.sh status      # quick PIDs + ports + which model
+./run.sh health      # one-shot HTTP probe of both services (exit non-zero if down)
+./run.sh setup       # force reinstall pip deps + redownload models
 ```
 
 `./run.sh doctor` is the first thing to run if anything misbehaves. It's
@@ -719,8 +745,9 @@ All knobs are env vars; defaults are sensible.
 | `WHISPER_DEVICE` | `auto` | `cpu` / `cuda` / `auto` for the whisper backend |
 | `WHISPER_LANGUAGE` | unset | ISO-639 code; force a language (whisper only) |
 | `LMSTUDIO_PORT` | `1234` | LM Studio HTTP API port |
-| `LLM_MODEL` | `qwen3-30b-a3b-instruct-2507` | the model `lms load` will bring up |
-| `LLM_MODEL_DOWNLOAD` | `${LLM_MODEL}@mlx` | what `lms get` will fetch during `bootstrap` / `install-llm`. The `@mlx` suffix forces an Apple-Silicon-native quant; remove it to pick a GGUF (CPU-only, much slower). |
+| `LLM_MODEL` | `qwen3-30b-a3b-instruct-2507` | model id `lms load` brings up (also used as the `model` field in chat completions) |
+| `LLM_MODEL_REPO` | `qwen/qwen3-30b-a3b-instruct-2507` | repo path passed to `lms get` during bootstrap |
+| `LLM_MIN_RAM_GB` | `48` | bootstrap auto-falls back to the smaller `qwen/qwen3-4b` (≈2.3 GB) below this unified-memory threshold |
 | `LLM_CONTEXT` | `65536` | context length to load Qwen with |
 | `LLM_URL` | `http://127.0.0.1:1234/v1/chat/completions` | full chat endpoint URL |
 | `LLM_MAX_TOKENS` | `4096` | upper bound for summary completion |
@@ -858,13 +885,18 @@ in milliseconds without any models present.
 ## Troubleshooting
 
 **`./run.sh start` shows "PARTIALLY ready" with `LM Studio NOT REACHABLE`.**
-Open LM Studio.app and turn on Developer → Local Server. After that, install
-the `lms` CLI with `~/.lmstudio/bin/lms bootstrap` so future `./run.sh start`
-calls can keep it up automatically.
+Run `./run.sh bootstrap` — step (4/5) installs LM Studio.app via Homebrew
+cask, bootstraps the `lms` CLI to `~/.cache/lm-studio/bin/lms`, and starts
+the local server on `:1234`. If `lms` is already installed but not on
+`PATH`, the bootstrap step's "lms CLI present at …" line will tell you
+where to find it.
 
 **`./run.sh start` shows "PARTIALLY ready" with `<model> NOT LOADED`.**
-Open LM Studio.app → Discover → search for `qwen3-30b-a3b-instruct-2507`
-and download it. Then `./run.sh restart`.
+Run `./run.sh bootstrap` again — step (4/5) is idempotent and will detect
+the missing model, prompt you to download it (`lms get
+qwen/qwen3-30b-a3b-instruct-2507 --mlx -y`, ≈32 GB), and `lms load` it.
+On Macs with <48 GB unified memory it offers `qwen/qwen3-4b` (≈2.3 GB)
+instead.
 
 **Char shows `unauthorized`.**
 Char insists on a non-empty API key. Anything works — `local`, `dummy`, `x` —

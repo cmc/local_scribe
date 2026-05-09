@@ -12,11 +12,9 @@
 #
 # First-time setup on a freshly cloned repo:
 #   ./run.sh bootstrap      one-shot: build venv, install pip deps, download
-#                            ASR + diarization model weights, install
-#                            LM Studio.app + lms CLI + Qwen model (~18 GB),
-#                            install + auto-configure Char.app. Safe to re-run;
-#                            each network-fetching step is gated behind a
-#                            Yes/No prompt so you can opt out per stage.
+#                            ASR + diarization model weights, then print
+#                            "next steps" (Char + LM Studio + Qwen). Safe to
+#                            re-run; skips work that's already done.
 #   ./run.sh start          run preflight (auto-install anything bootstrap
 #                            missed), start LM Studio + ASR server, tail the
 #                            ASR log. Ctrl+C detaches; services keep running.
@@ -34,10 +32,6 @@
 #                            Releases, verify SHA256, install to /Applications.
 #                            Refuses to clobber a different installed version
 #                            without confirmation.
-#   ./run.sh install-llm    install LM Studio.app (via Homebrew Cask), bootstrap
-#                            the lms CLI, start its HTTP server, download the
-#                            chosen Qwen model (~18 GB MLX), and load it.
-#                            Idempotent; skips any step already completed.
 #   ./run.sh configure-char point Char's OpenAI transcriber at this server
 #                            (interactive; offers to back up existing API key).
 #                            Bootstrap calls install-char + configure-char in
@@ -74,39 +68,36 @@ PARAKEET_MODEL="${PARAKEET_MODEL:-mlx-community/parakeet-tdt-0.6b-v3}"
 WHISPER_MODEL="${WHISPER_MODEL:-large-v3-turbo}"
 ASR_PORT="${ASR_PORT:-8000}"
 LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
+
+# Default LLM (recommended for ≥48 GB unified memory).
 LLM_MODEL="${LLM_MODEL:-qwen3-30b-a3b-instruct-2507}"
+LLM_MODEL_REPO="${LLM_MODEL_REPO:-qwen/qwen3-30b-a3b-instruct-2507}"
+
+# Smaller fallback offered automatically on Macs with <48 GB unified memory.
+# Uses the repo-path form (qwen/qwen3-4b) which is what `lms ls`, `lms load`,
+# and LM Studio's /api/v0/models all report for this model.
+LLM_MODEL_SMALL="qwen/qwen3-4b"
+LLM_MODEL_SMALL_REPO="qwen/qwen3-4b"
+
+# Minimum unified memory (GB) before we'll auto-pull the 30B model. Below
+# this threshold the bootstrap step offers the 4B fallback instead.
+LLM_MIN_RAM_GB="${LLM_MIN_RAM_GB:-48}"
+
 LLM_CONTEXT="${LLM_CONTEXT:-65536}"
 
-# --- LM Studio.app + Qwen download config ---------------------------------
+# --- LM Studio.app version pin --------------------------------------------
 #
-# `bootstrap` (and the standalone `install-llm` subcommand) can install the
-# whole LLM stack end-to-end: download LM Studio.app, install the `lms` CLI,
-# start its local API server, and download the chosen Qwen model. The
-# constants below pin where each piece comes from.
+# Same rationale as Char: this script's auto-install + auto-download path
+# uses the `lms` CLI, whose subcommand surface (e.g. `lms get --mlx -y`,
+# `lms load -y --context-length`) has shifted across LM Studio releases.
+# We track the version this repo was end-to-end-validated against and just
+# warn (not hard-fail) on drift, since most patches are backwards compatible.
 #
-# LMSTUDIO_HOMEBREW_CASK is the canonical install path on macOS; if Homebrew
-# isn't available we fall back to printing the lmstudio.ai download URL.
-# LMSTUDIO_DOWNLOAD_URL is shown in messaging only, not fetched directly.
-#
-# LLM_MODEL_DOWNLOAD is the exact identifier `lms get` accepts; we always
-# pass the @mlx tag so an Apple-Silicon-native MLX quant is selected
-# instead of GGUF (which would force CPU + much slower).
-LMSTUDIO_APP="/Applications/LM Studio.app"
-LMSTUDIO_HOMEBREW_CASK="lm-studio"
-LMSTUDIO_DOWNLOAD_URL="https://lmstudio.ai/download"
-LLM_MODEL_DOWNLOAD="${LLM_MODEL_DOWNLOAD:-${LLM_MODEL}@mlx}"
-
-# LM Studio has shipped the `lms` binary in two different locations across
-# versions; we probe both. Newer builds (>= 0.3.x) bootstrap it into
-# ~/.lmstudio/bin/lms, older builds dropped it into ~/.cache/lm-studio/bin/lms.
-# `command -v lms` (i.e. whatever's on $PATH) wins over both.
-_lms_cli_locate() {
-  if command -v lms >/dev/null 2>&1; then command -v lms; return 0; fi
-  for p in "$HOME/.lmstudio/bin/lms" "$HOME/.cache/lm-studio/bin/lms"; do
-    [[ -x "$p" ]] && { echo "$p"; return 0; }
-  done
-  return 1
-}
+# To bump: install the new LM Studio.app, run `./run.sh bootstrap` end-to-end
+# (verify model download + load + a Char Generate flow that hits LM Studio),
+# then update the constant below.
+LMSTUDIO_KNOWN_GOOD_VERSION="0.4.12"
+LMSTUDIO_APP_PATH="/Applications/LM Studio.app"
 
 # --- Char.app version pin --------------------------------------------------
 #
@@ -265,183 +256,20 @@ PY
 # Friendly check for the LM Studio CLI. Not strictly required (you can run
 # LM Studio.app's local server manually) but the auto-load convenience needs it.
 ensure_lms_cli() {
-  if command -v lms >/dev/null 2>&1; then
+  if lms_path >/dev/null; then
     return 0
-  fi
-  local lms_bin
-  if lms_bin="$(_lms_cli_locate)"; then
-    say "linking lms CLI onto PATH ..."
-    "$lms_bin" bootstrap >/dev/null 2>&1 || true
-    if command -v lms >/dev/null 2>&1; then
-      say "${c_green}lms CLI ready${c_reset}"
-      return 0
-    fi
-    # Bootstrap didn't update this shell's PATH cache; many users haven't
-    # restarted their shell yet. Inform them; subsequent run.sh invocations
-    # will pick it up.
-    say "${c_yellow}lms CLI installed but not on PATH for this shell${c_reset}"
-    say "  open a new terminal and re-run, or:  ${c_bold}export PATH=\"\$(dirname $lms_bin):\$PATH\"${c_reset}"
-    return 1
   fi
   say "${c_yellow}lms CLI not found${c_reset}"
-  say "  to enable auto-start of LM Studio + Qwen, run:"
-  say "    ~/.lmstudio/bin/lms bootstrap   (after installing LM Studio.app)"
-  say "  or open LM Studio.app and turn on Developer > Local Server manually"
-  return 0  # not fatal
+  say "  bootstrap will install LM Studio.app + the lms CLI for you;"
+  say "  or run \`./run.sh bootstrap\` to do it now"
+  return 0  # not fatal — bootstrap step (4/5) handles full install
 }
 
-# --- LM Studio.app install ------------------------------------------------
-#
-# Detect whether LM Studio.app exists on disk. We don't rely on `mdfind` here
-# (Spotlight can be disabled / out-of-date); a presence check on /Applications
-# is what every install path ultimately drops it into.
-lmstudio_app_installed() {
-  [[ -d "$LMSTUDIO_APP" ]]
-}
-
-# Try to install LM Studio.app via Homebrew Cask. We prefer this path because:
-#   - the cask is maintained by LM Studio's team (auto-updated)
-#   - it handles the DMG mount + copy + ad-hoc signing dance
-#   - on already-installed users it's a no-op
-# Returns 0 on success, 1 if brew is missing or the cask install fails.
-lmstudio_install_app() {
-  if lmstudio_app_installed; then
-    say "${c_green}LM Studio.app already installed${c_reset}"
-    return 0
-  fi
-  if ! command -v brew >/dev/null 2>&1; then
-    say "${c_yellow}Homebrew not found; can't auto-install LM Studio.app${c_reset}"
-    say "  download manually:  ${c_bold}${LMSTUDIO_DOWNLOAD_URL}${c_reset}"
-    say "  install Homebrew:   /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-    return 1
-  fi
-  say "installing LM Studio.app via Homebrew Cask (~600 MB) ..."
-  if ! brew install --cask "$LMSTUDIO_HOMEBREW_CASK"; then
-    say "${c_yellow}brew install --cask $LMSTUDIO_HOMEBREW_CASK failed${c_reset}"
-    say "  download manually instead:  ${c_bold}${LMSTUDIO_DOWNLOAD_URL}${c_reset}"
-    return 1
-  fi
-  if ! lmstudio_app_installed; then
-    say "${c_yellow}brew said it succeeded but LM Studio.app isn't at $LMSTUDIO_APP${c_reset}"
-    return 1
-  fi
-  say "${c_green}LM Studio.app installed${c_reset}"
-  say "  ${c_dim}note: macOS may quarantine first launch; if Char's summary step${c_reset}"
-  say "  ${c_dim}fails the first time, open LM Studio.app once to grant permissions${c_reset}"
-  return 0
-}
-
-# --- Qwen model download --------------------------------------------------
-#
-# Detect whether the LLM model is already downloaded into LM Studio's local
-# cache. `lms ls` lists models on disk; we grep for the bare identifier
-# (without the quant suffix) since `lms ls` prints the loaded quant on its
-# own column.
-lms_model_downloaded() {
-  command -v lms >/dev/null 2>&1 || return 1
-  lms ls 2>/dev/null | grep -q -F "$LLM_MODEL"
-}
-
-# Download the configured Qwen model via `lms get`. This is the only step in
-# the install pipeline that's truly interactive: `lms get` opens its own TUI
-# to pick the quant + confirm the download. We pass the exact `@mlx` tag so
-# the prompt is short (just "y" to confirm), but the user is still in front
-# of a terminal at bootstrap time so this is fine.
-ensure_qwen_model() {
-  if ! command -v lms >/dev/null 2>&1; then
-    say "${c_yellow}skipping Qwen download — lms CLI not on PATH${c_reset}"
-    return 1
-  fi
-  if lms_model_downloaded; then
-    say "${c_green}$LLM_MODEL already downloaded${c_reset}"
-    return 0
-  fi
-  say "downloading $LLM_MODEL_DOWNLOAD (~18 GB on first install)"
-  say "  ${c_dim}lms will print a confirmation prompt — answer Yes${c_reset}"
-  printf "\n"
-  if ! lms get "$LLM_MODEL_DOWNLOAD"; then
-    say "${c_yellow}lms get failed or was cancelled${c_reset}"
-    say "  retry later:  ${c_bold}lms get $LLM_MODEL_DOWNLOAD${c_reset}"
-    say "  or open LM Studio.app and search for: ${c_bold}$LLM_MODEL${c_reset}"
-    return 1
-  fi
-  printf "\n"
-  if ! lms_model_downloaded; then
-    say "${c_yellow}download finished but $LLM_MODEL not found by \`lms ls\`${c_reset}"
-    say "  check LM Studio.app's My Models tab to verify"
-    return 1
-  fi
-  say "${c_green}$LLM_MODEL downloaded${c_reset}"
-  return 0
-}
-
-# --- LM Studio full-install orchestrator ----------------------------------
-#
-# Walks the user through the full LLM stack install in the right order, with
-# Yes/No prompts at each network-fetching step so they can opt out per stage:
-#   1. install LM Studio.app (~600 MB, brew)
-#   2. install + bootstrap the lms CLI
-#   3. start LM Studio's HTTP server
-#   4. download the configured Qwen model (~18 GB)
-#   5. load it with the configured context length
-# Returns 0 only if everything ended in a runnable state.
-install_lm_stack() {
-  local rc=0
-
-  if ! lmstudio_app_installed; then
-    if ask_yn "  Install LM Studio.app via Homebrew (~600 MB)?" y; then
-      lmstudio_install_app || rc=1
-    else
-      say "  skipped — install manually from ${LMSTUDIO_DOWNLOAD_URL}"
-      return 1
-    fi
-  else
-    say "${c_green}LM Studio.app already installed${c_reset}"
-  fi
-
-  ensure_lms_cli || rc=1
-
-  if [[ $rc -ne 0 ]] || ! command -v lms >/dev/null 2>&1; then
-    say "${c_yellow}lms CLI unavailable; skipping model download/load${c_reset}"
-    say "  open LM Studio.app once, then re-run:  ${c_bold}./run.sh install-llm${c_reset}"
-    return 1
-  fi
-
-  if ! lmstudio_running; then
-    say "starting LM Studio HTTP server on :$LMSTUDIO_PORT ..."
-    lms server start --port "$LMSTUDIO_PORT" >/dev/null 2>&1 || true
-    for _ in {1..15}; do
-      lmstudio_running && break
-      sleep 1
-    done
-  fi
-  if ! lmstudio_running; then
-    say "${c_yellow}LM Studio server didn't come up on :$LMSTUDIO_PORT${c_reset}"
-    say "  open LM Studio.app once to grant permissions, then retry"
-    return 1
-  fi
-  say "${c_green}LM Studio API up on :$LMSTUDIO_PORT${c_reset}"
-
-  if ! lms_model_downloaded; then
-    if ask_yn "  Download $LLM_MODEL (~18 GB MLX) now?" y; then
-      ensure_qwen_model || rc=1
-    else
-      say "  skipped — download later from LM Studio.app or run:"
-      say "    ${c_bold}lms get $LLM_MODEL_DOWNLOAD${c_reset}"
-      return 1
-    fi
-  fi
-
-  if ! lmstudio_model_loaded "$LLM_MODEL"; then
-    say "loading $LLM_MODEL with context-length=$LLM_CONTEXT ..."
-    if ! lms load "$LLM_MODEL" --context-length "$LLM_CONTEXT" >/dev/null 2>&1; then
-      say "${c_yellow}failed to load $LLM_MODEL${c_reset}"
-      say "  re-run later:  ${c_bold}lms load $LLM_MODEL --context-length $LLM_CONTEXT${c_reset}"
-      return 1
-    fi
-  fi
-  say "${c_green}$LLM_MODEL loaded — LLM stack ready${c_reset}"
-  return $rc
+# Total system RAM in whole GB. macOS-only; falls back to 0 on failure.
+machine_ram_gb() {
+  local b
+  b="$(sysctl -n hw.memsize 2>/dev/null)" || { echo 0; return; }
+  echo $(( b / 1024 / 1024 / 1024 ))
 }
 
 # Top-level preflight. Returns non-zero if anything *required* is broken.
@@ -531,10 +359,12 @@ PY
     fi
   else
     printf "  "; bad; printf "LM Studio    :%s   not running\n" "$LMSTUDIO_PORT"
-    if command -v lms >/dev/null 2>&1; then
+    if lms_path >/dev/null 2>&1; then
       printf "         (./run.sh start will auto-start it)\n"
+    elif lmstudio_app_installed; then
+      printf "         LM Studio.app present, lms CLI not bootstrapped — run \`./run.sh bootstrap\`\n"
     else
-      printf "         install LM Studio.app and run \`lms bootstrap\`\n"
+      printf "         not installed — run \`./run.sh bootstrap\` to install via brew\n"
     fi
   fi
 
@@ -606,8 +436,11 @@ cmd_bootstrap() {
   printf "\n%s(3/5) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
   ensure_diarization_models   || true   # best-effort
 
-  printf "\n%s(4/5) LM Studio.app + lms CLI + Qwen model%s\n" "$c_bold" "$c_reset"
-  install_lm_stack            || say "${c_yellow}LLM stack incomplete; rerun later with ./run.sh install-llm${c_reset}"
+  printf "\n%s(4/5) LM Studio.app + Qwen LLM%s\n" "$c_bold" "$c_reset"
+  if ! lmstudio_full_bootstrap; then
+    say "${c_yellow}LM Studio bootstrap incomplete — Char's summary step will fail${c_reset}"
+    say "  fix the issues above (or load the model from LM Studio.app), then re-run"
+  fi
 
   printf "\n%s(5/5) Char.app — install + auto-config%s\n" "$c_bold" "$c_reset"
   if ! char_installed; then
@@ -652,48 +485,21 @@ cmd_bootstrap() {
 
   printf "\n%s════════ bootstrap complete ════════%s\n\n" "$c_green" "$c_reset"
 
-  # Render any follow-ups dynamically based on what's still missing. Most of
-  # the time on a fresh machine everything got auto-installed and we have
-  # nothing to add here — we only nag about the bits that genuinely need
-  # the user's attention (e.g. they declined a download prompt above).
-  local need_followups=0
-  if ! char_installed; then need_followups=1; fi
-  if ! lmstudio_app_installed; then need_followups=1; fi
-  if ! command -v lms >/dev/null 2>&1; then need_followups=1; fi
-  if command -v lms >/dev/null 2>&1 && ! lms_model_downloaded; then need_followups=1; fi
-  if ! command -v lms >/dev/null 2>&1; then
-    # If we don't have lms we can't tell whether Qwen is downloaded; assume not
-    need_followups=1
-  fi
+  # Anything we couldn't fully automate gets flagged here. Bootstrap covers:
+  #   - Python venv + pip deps
+  #   - Parakeet ASR weights + sherpa-onnx diarization models
+  #   - LM Studio.app (homebrew cask) + lms CLI + Qwen download + load
+  #   - Char.app (pinned DMG) + auto-config of Char's settings.json
+  # The only thing that's reliably *not* automated is wiring Char's
+  # Intelligence (LLM) provider in the Char UI — that one tab needs a click.
+  printf "%sFinal touch — wire Char's LLM tab (one click):%s\n" "$c_bold" "$c_reset"
+  printf "  Char → Settings → Intelligence → provider = %sLM Studio%s,\n" "$c_bold" "$c_reset"
+  printf "  base URL = %shttp://127.0.0.1:%s%s, model = %s%s%s\n" \
+         "$c_bold" "$LMSTUDIO_PORT" "$c_reset" "$c_bold" "$LLM_MODEL" "$c_reset"
 
-  if [[ $need_followups -eq 1 ]]; then
-    printf "%sFollow-ups (some pieces aren't fully set up yet):%s\n" "$c_bold" "$c_reset"
-    if ! char_installed; then
-      printf "  • Char.app not installed → install from %shttps://char.com%s,\n" "$c_bold" "$c_reset"
-      printf "    then run %s./run.sh configure-char%s\n" "$c_bold" "$c_reset"
-    fi
-    if ! lmstudio_app_installed; then
-      printf "  • LM Studio.app not installed → run %s./run.sh install-llm%s\n" "$c_bold" "$c_reset"
-      printf "    or download manually from %s%s%s\n" "$c_bold" "$LMSTUDIO_DOWNLOAD_URL" "$c_reset"
-    elif ! command -v lms >/dev/null 2>&1; then
-      local lms_bin
-      if lms_bin="$(_lms_cli_locate)"; then
-        printf "  • lms CLI not on PATH → run %s%s bootstrap%s, then open a new terminal\n" \
-               "$c_bold" "$lms_bin" "$c_reset"
-      else
-        printf "  • lms CLI not found → open LM Studio.app once, then run %s./run.sh install-llm%s\n" \
-               "$c_bold" "$c_reset"
-      fi
-    elif ! lms_model_downloaded; then
-      printf "  • Qwen model not downloaded → run %s./run.sh install-llm%s\n" \
-             "$c_bold" "$c_reset"
-      printf "    (downloads %s, ~18 GB MLX)\n" "$LLM_MODEL"
-    fi
-    printf "\n"
-  fi
-
-  printf "%sStart the pipeline:%s    %s./run.sh start%s\n" "$c_bold" "$c_reset" "$c_bold" "$c_reset"
-  printf "%sVerify health:%s         %s./run.sh doctor%s\n\n" "$c_bold" "$c_reset" "$c_bold" "$c_reset"
+  printf "\n%sStart the pipeline:%s\n" "$c_bold" "$c_reset"
+  printf "    %s./run.sh start%s\n" "$c_bold" "$c_reset"
+  printf "\nVerify any time with: %s./run.sh doctor%s\n\n" "$c_bold" "$c_reset"
 }
 
 # --- Char configuration ---
@@ -1026,12 +832,6 @@ cmd_install_char() {
   char_install_pinned
 }
 
-cmd_install_llm() {
-  printf "%sinstall-llm%s — install LM Studio.app + lms CLI + download/load %s\n\n" \
-         "$c_bold" "$c_reset" "$LLM_MODEL"
-  install_lm_stack
-}
-
 # --- ASR server ---
 
 asr_pid() {
@@ -1092,6 +892,73 @@ asr_stop() {
 
 # --- LM Studio ---
 
+# Path to the `lms` CLI binary. LM Studio.app stages it in two different
+# spots depending on the version it shipped with:
+#   - ~/.cache/lm-studio/bin/lms   (current; 0.4.x)
+#   - ~/.lmstudio/bin/lms          (legacy; 0.3.x and earlier)
+# Both are populated by `lms bootstrap`, which the .app runs on first launch
+# (or which we run explicitly during `./run.sh bootstrap`).
+# Returns 0 on found, prints the path on stdout.
+lms_path() {
+  if command -v lms >/dev/null 2>&1; then command -v lms; return 0; fi
+  for c in "$HOME/.cache/lm-studio/bin/lms" "$HOME/.lmstudio/bin/lms"; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+lmstudio_app_installed() { [[ -d "$LMSTUDIO_APP_PATH" ]]; }
+
+lmstudio_app_version() {
+  defaults read "$LMSTUDIO_APP_PATH/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null
+}
+
+# Install LM Studio.app via Homebrew cask (preferred — auto-updating, signed,
+# small DMG-equivalent). Returns 1 if Homebrew isn't available so the caller
+# can point the user at the manual download.
+lmstudio_install_app() {
+  if ! command -v brew >/dev/null 2>&1; then
+    say "${c_yellow}Homebrew not installed${c_reset}"
+    say "  install Homebrew (https://brew.sh) and re-run, or download LM Studio"
+    say "  manually from https://lmstudio.ai/download"
+    return 1
+  fi
+  say "installing LM Studio.app via 'brew install --cask lm-studio' ..."
+  if ! brew install --cask lm-studio; then
+    say "${c_red}brew install --cask lm-studio failed${c_reset}"
+    return 1
+  fi
+  say "${c_green}LM Studio.app installed${c_reset}"
+  return 0
+}
+
+# Symlink the bundled lms binary into ~/.cache/lm-studio/bin/ so it's on
+# PATH. This is what LM Studio.app does on first GUI launch; we run it
+# explicitly so bootstrap doesn't require the user to open the app first.
+lmstudio_bootstrap_cli() {
+  if lms_path >/dev/null; then return 0; fi
+  if ! lmstudio_app_installed; then
+    say "${c_red}LM Studio.app not installed; can't bootstrap lms CLI${c_reset}"
+    return 1
+  fi
+  # Path inside the bundle has shifted across versions; this glob covers
+  # every layout we've seen from 0.3.x through 0.4.x.
+  local bundled
+  bundled="$(find "$LMSTUDIO_APP_PATH/Contents/Resources" -type f -name 'lms' -perm -u+x 2>/dev/null | head -1)"
+  if [[ -z "$bundled" ]]; then
+    say "${c_yellow}couldn't find lms inside LM Studio.app bundle${c_reset}"
+    say "  open LM Studio.app once (it auto-symlinks lms on first launch), then re-run"
+    return 1
+  fi
+  if ! "$bundled" bootstrap >/dev/null 2>&1; then
+    say "${c_yellow}'$bundled bootstrap' failed${c_reset}"
+    say "  fall back: open LM Studio.app once, then re-run \`./run.sh bootstrap\`"
+    return 1
+  fi
+  say "${c_green}lms CLI bootstrapped → $(lms_path)${c_reset}"
+  return 0
+}
+
 lmstudio_running() {
   curl -sf "http://127.0.0.1:$LMSTUDIO_PORT/v1/models" >/dev/null 2>&1
 }
@@ -1113,19 +980,166 @@ sys.exit(1)
 " "$model"
 }
 
+# Has $1=model been downloaded into LM Studio's local store on disk?
+# Different from lmstudio_model_loaded() which checks if it's in RAM right now.
+#
+# Uses LM Studio's HTTP API (/api/v0/models) rather than parsing the human-
+# friendly `lms ls` table output, since the API gives us clean model keys
+# regardless of whether they came in as a repo path ("qwen/qwen3-4b") or
+# as a flat identifier ("qwen3-30b-a3b-instruct-2507"). Requires the LM
+# Studio HTTP server to be running — which the bootstrap step ensures
+# before calling us.
+lmstudio_model_downloaded() {
+  local model="$1"
+  curl -s "http://127.0.0.1:$LMSTUDIO_PORT/api/v0/models" 2>/dev/null \
+    | "$VENV_PY" -c "
+import json, sys
+m = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for entry in data.get('data', []):
+    eid = entry.get('id') or ''
+    # Match either an exact id or a repo-prefixed variant ('qwen/' + key).
+    if eid == m or eid.endswith('/' + m) or m.endswith('/' + eid):
+        sys.exit(0)
+sys.exit(1)
+" "$model"
+}
+
+# Download $1=model_repo (e.g. "qwen/qwen3-30b-a3b-instruct-2507") via lms.
+# Always pulls the MLX variant since we're on Apple Silicon. -y auto-accepts
+# the variant prompt so this is non-interactive.
+lmstudio_model_download() {
+  local repo="$1" lms
+  lms="$(lms_path)" || return 1
+  say "downloading $repo (MLX) — large file, will take a few minutes ..."
+  if ! "$lms" get "$repo" --mlx -y; then
+    say "${c_red}lms get $repo failed${c_reset}"
+    return 1
+  fi
+  return 0
+}
+
+# End-to-end LM Studio + Qwen bootstrap. Idempotent — each step short-circuits
+# with a green checkmark when nothing's needed.
+#
+# Steps:
+#   1. Install LM Studio.app via brew cask (skipped if /Applications/LM Studio.app exists).
+#   2. Bootstrap the lms CLI (skipped if `lms` is on PATH).
+#   3. Start the local HTTP server on $LMSTUDIO_PORT (skipped if already up).
+#   4. Choose a model based on system RAM:
+#        - ≥$LLM_MIN_RAM_GB GB → $LLM_MODEL_REPO (default: qwen3-30b-a3b-instruct-2507, ~32 GB)
+#        - <$LLM_MIN_RAM_GB GB → offer $LLM_MODEL_SMALL_REPO (~2.3 GB) instead
+#      Confirm the download (size-aware prompt) before pulling.
+#   5. Load the chosen model with $LLM_CONTEXT context length.
+#
+# Returns 0 if everything ended up in a usable state, non-zero otherwise.
+lmstudio_full_bootstrap() {
+  if ! lmstudio_app_installed; then
+    printf "  LM Studio.app not installed at %s.\n" "$LMSTUDIO_APP_PATH"
+    if ask_yn "  Install LM Studio.app via 'brew install --cask lm-studio' now?" y; then
+      lmstudio_install_app || return 1
+    else
+      say "  skipped — install manually from https://lmstudio.ai/download then re-run"
+      return 1
+    fi
+  else
+    local v v_short
+    v="$(lmstudio_app_version)"
+    # CFBundleShortVersionString sometimes carries a build suffix
+    # (e.g. "0.4.12+1"); strip it for a friendlier match against our pin.
+    v_short="${v%%+*}"; v_short="${v_short%%-*}"
+    if [[ -z "$v" ]]; then
+      printf "  LM Studio.app installed at %s.\n" "$LMSTUDIO_APP_PATH"
+    elif [[ "$v_short" == "$LMSTUDIO_KNOWN_GOOD_VERSION" ]]; then
+      printf "  LM Studio.app %s already installed (matches pinned %s).\n" \
+             "$v" "$LMSTUDIO_KNOWN_GOOD_VERSION"
+    else
+      printf "  LM Studio.app %s installed (pinned %s — usually compatible).\n" \
+             "$v" "$LMSTUDIO_KNOWN_GOOD_VERSION"
+    fi
+  fi
+
+  if ! lms_path >/dev/null; then
+    printf "  bootstrapping lms CLI ...\n"
+    lmstudio_bootstrap_cli || return 1
+  else
+    printf "  lms CLI present at %s\n" "$(lms_path)"
+  fi
+  local LMS; LMS="$(lms_path)"
+
+  if lmstudio_running; then
+    printf "  LM Studio HTTP server already up on :%s\n" "$LMSTUDIO_PORT"
+  else
+    say "  starting LM Studio HTTP server on :$LMSTUDIO_PORT ..."
+    "$LMS" server start --port "$LMSTUDIO_PORT" >/dev/null 2>&1 || true
+    for _ in {1..15}; do lmstudio_running && break; sleep 1; done
+    if ! lmstudio_running; then
+      say "${c_red}  LM Studio API didn't come up on :$LMSTUDIO_PORT${c_reset}"
+      return 1
+    fi
+    say "${c_green}  LM Studio HTTP server up on :$LMSTUDIO_PORT${c_reset}"
+  fi
+
+  local ram; ram="$(machine_ram_gb)"
+  printf "  detected %s GB unified memory.\n" "$ram"
+  if [[ "$ram" -gt 0 && "$ram" -lt $LLM_MIN_RAM_GB && "$LLM_MODEL" != "$LLM_MODEL_SMALL" ]]; then
+    if lmstudio_model_downloaded "$LLM_MODEL_SMALL"; then
+      printf "  ${c_yellow}<%s GB unified memory; using smaller %s (already downloaded).${c_reset}\n" \
+             "$LLM_MIN_RAM_GB" "$LLM_MODEL_SMALL"
+      LLM_MODEL="$LLM_MODEL_SMALL"
+    elif ask_yn "  $ram GB RAM is below the ${LLM_MIN_RAM_GB} GB threshold for the 30B; download $LLM_MODEL_SMALL_REPO (~2.3 GB) instead?" y; then
+      LLM_MODEL="$LLM_MODEL_SMALL"
+      lmstudio_model_download "$LLM_MODEL_SMALL_REPO" || return 1
+    fi
+  fi
+
+  if ! lmstudio_model_downloaded "$LLM_MODEL"; then
+    local repo size
+    if [[ "$LLM_MODEL" == "$LLM_MODEL_SMALL" ]]; then
+      repo="$LLM_MODEL_SMALL_REPO"; size="2.3 GB"
+    else
+      repo="$LLM_MODEL_REPO"; size="32 GB"
+    fi
+    if ask_yn "  Download $repo (~$size MLX) into LM Studio now?" y; then
+      lmstudio_model_download "$repo" || return 1
+    else
+      say "  skipped — load it later from LM Studio.app's Discover tab"
+      return 1
+    fi
+  else
+    printf "  %s already downloaded.\n" "$LLM_MODEL"
+  fi
+
+  if lmstudio_model_loaded "$LLM_MODEL"; then
+    printf "  %s already loaded into RAM.\n" "$LLM_MODEL"
+  else
+    say "  loading $LLM_MODEL (context=$LLM_CONTEXT) ..."
+    if ! "$LMS" load "$LLM_MODEL" -y --context-length "$LLM_CONTEXT" >/dev/null 2>&1; then
+      say "${c_red}  lms load $LLM_MODEL failed — try loading it from LM Studio.app${c_reset}"
+      return 1
+    fi
+    say "${c_green}  $LLM_MODEL loaded${c_reset}"
+  fi
+
+  return 0
+}
+
 # Bring LM Studio + Qwen up. Returns:
 #   0 - LM Studio reachable AND $LLM_MODEL loaded (fully ready)
 #   1 - LM Studio not reachable
 #   2 - LM Studio reachable but $LLM_MODEL not loaded
 # Callers use the exit code to decide how to render the readiness banner.
 lmstudio_start() {
-  local has_lms=0
-  command -v lms >/dev/null 2>&1 && has_lms=1
+  local LMS=""
+  LMS="$(lms_path 2>/dev/null)" || true
 
   if ! lmstudio_running; then
-    if [[ $has_lms -eq 1 ]]; then
+    if [[ -n "$LMS" ]]; then
       say "starting LM Studio HTTP server ..."
-      lms server start --port "$LMSTUDIO_PORT" >/dev/null 2>&1 || true
+      "$LMS" server start --port "$LMSTUDIO_PORT" >/dev/null 2>&1 || true
       for _ in {1..15}; do
         lmstudio_running && break
         sleep 1
@@ -1133,9 +1147,9 @@ lmstudio_start() {
     fi
     if ! lmstudio_running; then
       say "${c_red}LM Studio API not reachable on :$LMSTUDIO_PORT${c_reset}"
-      if [[ $has_lms -eq 0 ]]; then
-        say "  install the lms CLI:  ~/.lmstudio/bin/lms bootstrap"
-        say "  or open LM Studio.app and turn on Developer > Local Server"
+      if [[ -z "$LMS" ]]; then
+        say "  run \`./run.sh bootstrap\` to install LM Studio.app + the lms CLI"
+        say "  (or open LM Studio.app and turn on Developer > Local Server)"
       else
         say "  is LM Studio.app installed? open it once to grant permissions"
       fi
@@ -1149,18 +1163,17 @@ lmstudio_start() {
     return 0
   fi
 
-  if [[ $has_lms -eq 0 ]]; then
+  if [[ -z "$LMS" ]]; then
     say "${c_yellow}$LLM_MODEL not loaded${c_reset}"
-    say "  install lms CLI to auto-load, or load it from LM Studio.app's UI"
+    say "  run \`./run.sh bootstrap\` to install + load it, or load it from LM Studio.app's UI"
     return 2
   fi
 
   say "loading $LLM_MODEL with context-length=$LLM_CONTEXT (this can take a minute) ..."
-  if ! lms load "$LLM_MODEL" --context-length "$LLM_CONTEXT" >/dev/null 2>&1; then
+  if ! "$LMS" load "$LLM_MODEL" -y --context-length "$LLM_CONTEXT" >/dev/null 2>&1; then
     say "${c_red}failed to load $LLM_MODEL via lms${c_reset}"
-    say "  is it downloaded? run \`lms ls\` to check"
-    say "  in LM Studio.app's model browser, search for and download:"
-    say "    $LLM_MODEL"
+    say "  is it downloaded? run \`./run.sh bootstrap\` (it'll fetch + load it)"
+    say "  or check with: $LMS ls"
     return 2
   fi
   say "${c_green}$LLM_MODEL loaded${c_reset}"
@@ -1300,8 +1313,6 @@ case "${1:-}" in
               cmd_configure_char ;;
   install-char|install_char)
               cmd_install_char ;;
-  install-llm|install_llm|install-lmstudio|install_lmstudio)
-              cmd_install_llm ;;
   transcribe) cmd_transcribe "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
