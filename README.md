@@ -357,6 +357,10 @@ to start without confirmation).
 After step 6, LM Studio is fully ready: server on `:1234`, model loaded,
 OpenAI-compatible API at `/v1/chat/completions` waiting for Char to call.
 
+The same orchestrator is exposed standalone as `./run.sh install-llm`,
+so you can repair an LM Studio install or pull a different model later
+without re-running the full bootstrap.
+
 ### Step (5/5) — Char.app, in detail
 
 Same shape as the LM Studio step, with one extra wrinkle (the OpenAI

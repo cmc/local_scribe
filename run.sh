@@ -28,6 +28,12 @@
 #   ./run.sh doctor         deep preflight report - python, deps, models,
 #                            services, Char-config hints. Safe any time.
 #   ./run.sh setup          force-reinstall pip deps + (re)download models
+#   ./run.sh install-llm    install LM Studio.app (via Homebrew Cask), bootstrap
+#                            the lms CLI, start its HTTP server, download the
+#                            chosen Qwen model (~32 GB MLX for the 30B, or
+#                            ~2.3 GB MLX for the 4B fallback on <48 GB Macs),
+#                            and load it. Idempotent; skips any step already
+#                            completed. Bootstrap step (4/5) calls this.
 #   ./run.sh install-char   download the pinned Char.app DMG from GitHub
 #                            Releases, verify SHA256, install to /Applications.
 #                            Refuses to clobber a different installed version
@@ -832,6 +838,18 @@ cmd_install_char() {
   char_install_pinned
 }
 
+cmd_install_llm() {
+  printf "%sinstall-llm%s — install LM Studio.app + lms CLI + download/load %s\n\n" \
+         "$c_bold" "$c_reset" "$LLM_MODEL"
+  if lmstudio_full_bootstrap; then
+    printf "\n%sLM Studio + Qwen ready.%s\n" "$c_green" "$c_reset"
+    return 0
+  fi
+  printf "\n%sLLM stack incomplete; fix the issues above and re-run.%s\n" \
+         "$c_yellow" "$c_reset"
+  return 1
+}
+
 # --- ASR server ---
 
 asr_pid() {
@@ -1313,6 +1331,8 @@ case "${1:-}" in
               cmd_configure_char ;;
   install-char|install_char)
               cmd_install_char ;;
+  install-llm|install_llm|install-lmstudio|install_lmstudio)
+              cmd_install_llm ;;
   transcribe) cmd_transcribe "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
