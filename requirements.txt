@@ -1,0 +1,24 @@
+# Local transcription + summarization pipeline.
+# Tested on macOS 14+ (Apple Silicon) with Python 3.12-3.14.
+
+# --- HTTP server (whisper_server.py) ---
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+
+# --- ASR backends ---
+# Parakeet TDT v3 (default, Apple-Silicon native via MLX)
+parakeet-mlx>=0.5,<1.0
+# faster-whisper as an alternative backend (multilingual)
+faster-whisper>=1.1,<2.0
+
+# --- Speaker diarization ---
+sherpa-onnx>=1.13,<2.0
+
+# --- Audio I/O / DSP ---
+numpy>=1.26
+soundfile>=0.12
+librosa>=0.10
+
+# --- HTTP + HuggingFace download utilities ---
+requests>=2.31
+huggingface_hub>=0.24
