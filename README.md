@@ -157,7 +157,7 @@ you can re-run it any time. It:
   | key | value |
   |---|---|
   | `ai.current_stt_provider` | `openai` |
-  | `ai.current_stt_model` | `gpt-4o-transcribe-diarize` (non-streaming, with diarization) |
+  | `ai.current_stt_model` | `gpt-4o-transcribe` (progressive/SSE — bypasses Char's 60-second non-streaming idle abort, supports any audio length) |
   | `ai.stt.openai.base_url` | `http://127.0.0.1:8000/v1` |
   | `ai.stt.openai.api_key` | `local` |
 
@@ -195,15 +195,21 @@ point Char's bundled OpenAI provider at us.
 
 | field | value |
 |---|---|
-| **Model selector** | `gpt-4o-transcribe-diarize` *(not* `gpt-4o-transcribe` — that variant uses SSE streaming which we don't speak)* |
+| **Model selector** | `gpt-4o-transcribe` *(progressive/SSE — bypasses Char's 60-second non-streaming idle abort that breaks long files; this is the model `configure-char` writes by default)* |
 | **Configure Providers → OpenAI → API Key** | any non-empty string |
 | **Configure Providers → OpenAI → Advanced → Base URL** | `http://127.0.0.1:8000/v1` |
 
-Char defaults to model `gpt-4o-transcribe-diarize` with
-`response_format=diarized_json`; we honour that and run real sherpa-onnx
-speaker diarization on every Generate (default ON, ~3-4s of extra latency
-on a 60s clip). `verbose_json`, `json`, `text`, `srt`, and `vtt` are all
-supported too.
+`gpt-4o-transcribe` triggers Char's progressive batch path, which streams
+SSE deltas and resets its idle timer on each one. Our endpoint also
+accepts `gpt-4o-transcribe-diarize` for short files where you want the
+structured `segments[*].speaker` shape, but anything that takes more
+than 60s to transcribe must use `gpt-4o-transcribe`.
+
+For short files, our streaming endpoint still runs sherpa-onnx
+diarization and inlines `Speaker N: …` prefixes into the streamed text
+(default ON, ~3-4s of extra latency on a 60s clip). `verbose_json`,
+`json`, `text`, `srt`, and `vtt` are all supported too on the
+non-streaming path.
 
 **Diarization tuning** — sherpa-onnx with the default `CLUSTER_THRESHOLD=0.5`
 tends to over-shard on short conversational audio (you may see 6-10 speakers
@@ -459,6 +465,7 @@ All knobs are env vars; defaults are sensible.
 | `CLUSTER_THRESHOLD` | `0.5` short / `0.7` long | sherpa-onnx fast-clustering threshold. Auto-bumps to `0.7` for audio ≥ 10 min (long meetings have few speakers; tighter thresholds over-shard). Set this env var to lock a value. |
 | `MAX_DIARIZE_SECONDS` | `1800` | audio longer than this auto-skips diarization on `POST /v1/audio/transcriptions` (returns ASR transcript with single `speaker_0` placeholder). Sherpa-onnx clustering is O(N²) and Char's UI doesn't tolerate multi-minute Generate latencies. Set `0` to disable the cap. |
 | `MAX_SPEAKERS` | `12` | if sherpa-onnx returns more than this many distinct speakers, treat it as a clustering blow-up and collapse to single-speaker output rather than emit JSON Char can't render. Set `0` to disable the guard. |
+| `STREAM_HEARTBEAT_SECONDS` | `20` | heartbeat interval (in seconds) for the SSE streaming branch of `POST /v1/audio/transcriptions`. Each heartbeat resets Char's hardcoded 60-second `BATCH_IDLE_TIMEOUT`; lower it on slower machines, raise it for less wire chatter. Must stay strictly less than 60. |
 | `TRANSCRIPT_CACHE_DIR` | `~/.cache/local_scribe/transcripts` | where the transcript cache lives |
 | `DIARIZATION_CACHE_DIR` | `~/.cache/local_scribe/diarization` | where sherpa-onnx model files live |
 | `PYTHON` | `python3.14` else `python3.12` else `python3` | which interpreter `run.sh` uses to build the venv |
@@ -479,7 +486,7 @@ local_scribe/
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 140 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 147 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -576,7 +583,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 140 tests, ~0.05s, no model loads
+venv/bin/python -m unittest discover -s tests   # 147 tests, ~0.05s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run
@@ -612,21 +619,42 @@ conversational audio. Set `NUM_SPEAKERS=2` (or your known count) before
 skip diarization entirely if you don't need speaker labels.
 
 **Char shows nothing in the Transcript tab after clicking Generate on a long recording.**
-Look at `./run.sh logs`. If you see a line like
-`diarization auto-skipped: audio is 6848s > MAX_DIARIZE_SECONDS=1800s` or
-`diarization returned 451 speakers (> MAX_SPEAKERS=12), treating as
-clustering blow-up; collapsing to single speaker_0`, the server already
-fell back to single-speaker mode for safety and Char *should* now render
-the transcript on the next Regenerate.
+Char's tauri-plugin-transcription has a hardcoded 60-second client-side
+`BATCH_IDLE_TIMEOUT` that aborts the transcription future if no progress
+event arrives for a full minute. The non-streaming `gpt-4o-transcribe-diarize`
+batch path only fires a single response event at the end, so any audio
+whose ASR exceeds 60s (i.e. anything longer than ~80 minutes against
+Parakeet on M3 Max, or anything at all on slower machines) silently
+fails with no error toast and no `transcript.json` written to disk.
 
-The server also chunks segments much more loosely in single-speaker mode
-(~30 s windows instead of breaking on every sentence) — this brings a
-2-hour file from ~1400 segments down to ~200, which Char's UI can
-actually convert and render without hanging. If a Char "Generate" comes
-back HTTP 200 in the log but the transcript still doesn't appear in the
-UI, the very last fallback is to delete `transcript.json` from the
-session folder under `~/Library/Application Support/hyprnote/sessions/`
-and click Generate one more time.
+`./run.sh configure-char` now sets `current_stt_model = gpt-4o-transcribe`
+(the non-diarize model name), which routes Char to its **progressive**
+SSE-streamed batch path. Our `/v1/audio/transcriptions` endpoint detects
+`stream=true` in the request and emits `transcript.text.delta` heartbeat
+events every `STREAM_HEARTBEAT_SECONDS` (default 20 s) while ASR runs,
+then a final `transcript.text.done` with the full transcript. Each delta
+resets Char's idle timer, so any duration of audio is supported.
+
+Trade-offs of the streaming model name:
+
+- The structured `segments[*].speaker` array isn't carried by the
+  progressive batch shape Char accepts; for short files where
+  diarization actually fires we inline `Speaker N: …` prefixes into the
+  streamed text instead. Long files auto-skip diarization anyway
+  (`MAX_DIARIZE_SECONDS`).
+- Per-word timestamps are dropped from Char's stored `transcript.json`
+  on the streaming path. If you want word-level timing for a specific
+  recording, run `./run.sh transcribe FILE` outside Char.
+
+If a "Generate" still doesn't render after a server restart:
+
+- Confirm `./run.sh status` shows `current_stt_model = gpt-4o-transcribe`
+  in `./run.sh doctor`'s `char.app:` block; if not, re-run `configure-char`.
+- Look for `streaming heartbeat (asr in flight, …)` lines in `./run.sh logs`.
+  Their absence means Char isn't sending `stream=true` (model misconfigured).
+- The very last fallback is to delete `transcript.json` from the session
+  folder under `~/Library/Application Support/hyprnote/sessions/` and click
+  Generate one more time.
 
 If you'd rather have *some* diarization on long audio:
 

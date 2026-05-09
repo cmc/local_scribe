@@ -20,6 +20,14 @@ Endpoints:
                                        Base URL = http://127.0.0.1:8000/v1.
                                        Honours response_format = diarized_json
                                        | verbose_json | json | text | srt | vtt.
+                                       Also honours `stream=true` and emits
+                                       OpenAI-style transcript.text.delta /
+                                       transcript.text.done SSE events
+                                       (Char's `gpt-4o-transcribe` progressive
+                                       batch path), with periodic delta
+                                       heartbeats so Char's 60-second
+                                       BATCH_IDLE_TIMEOUT doesn't fire while
+                                       long ASR jobs run.
   * GET   /health                    - liveness/readiness probe with backend info.
 
 Two ASR backends are pluggable via ASR_BACKEND:
@@ -822,6 +830,146 @@ def _openai_transcription_response(
     return {"text": transcript}
 
 
+# Char's BATCH_IDLE_TIMEOUT in tauri-plugin-transcription/listener2/ext.rs is
+# hardcoded at 60 seconds. The non-streaming `simple` batch path (used for
+# `gpt-4o-transcribe-diarize`) only emits its single BatchResponse event at
+# the very end, so any audio whose ASR takes >60s aborts on the client side
+# (no toast, no log -- the spawned future is just dropped). The progressive
+# path (used for `gpt-4o-transcribe`) resets that timer on every SSE delta,
+# so we keep it alive with a tiny heartbeat delta every N seconds.
+_OPENAI_STREAM_HEARTBEAT_SECONDS = float(os.getenv("STREAM_HEARTBEAT_SECONDS", "20"))
+
+
+def _sse(event: dict[str, Any]) -> str:
+    return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+
+def _compose_speaker_prefixed_text(
+    words: list[dict[str, Any]], fallback_text: str,
+) -> str:
+    """Inline `Speaker N: ...` prefixes for the streaming text response.
+
+    The progressive batch shape Char's UI accepts only carries plain text --
+    no segment array, no speaker-label objects -- so for short files where
+    diarization actually fires we fold the speaker label into the prose.
+    Lines from the same speaker stay contiguous; speaker turns get a blank
+    line between them so the transcript is readable in Char's note view.
+    """
+    if not words:
+        return fallback_text or ""
+
+    lines: list[str] = []
+    bucket_speaker: str | None = None
+    bucket_words: list[str] = []
+
+    def flush() -> None:
+        if not bucket_words:
+            return
+        text = " ".join(bucket_words).strip()
+        if text:
+            label = (bucket_speaker or "speaker_0").replace("_", " ").title()
+            lines.append(f"{label}: {text}")
+        bucket_words.clear()
+
+    for w in words:
+        spk = w.get("speaker") or "speaker_0"
+        if bucket_speaker is None:
+            bucket_speaker = spk
+        if spk != bucket_speaker:
+            flush()
+            bucket_speaker = spk
+        token = (w.get("punctuated_word") or w.get("word") or "").strip()
+        if token:
+            bucket_words.append(token)
+    flush()
+
+    if not lines:
+        return fallback_text or ""
+    return "\n\n".join(lines)
+
+
+async def _stream_openai_transcription(
+    request_id: str,
+    audio_path: str,
+    started: float,
+    do_diarize: bool,
+):
+    """SSE generator for Char's progressive (gpt-4o-transcribe) batch path.
+
+    Emits a `transcript.text.delta` heartbeat every
+    STREAM_HEARTBEAT_SECONDS while ASR runs, then a `transcript.text.done`
+    with the full transcript (with inlined `Speaker N:` prefixes when
+    diarization actually produced multiple speakers). Char's parser
+    accumulates deltas into `partial_text` but the non-empty `done.text`
+    replaces it, so the heartbeat spaces never reach the user.
+    """
+    try:
+        asr_task = asyncio.create_task(_run_asr_async(audio_path))
+
+        while True:
+            try:
+                transcript, words, lang, duration = await asyncio.wait_for(
+                    asyncio.shield(asr_task),
+                    timeout=_OPENAI_STREAM_HEARTBEAT_SECONDS,
+                )
+                break
+            except asyncio.TimeoutError:
+                logger.info(
+                    "[openai %s] streaming heartbeat (asr in flight, %.1fs elapsed)",
+                    request_id, time.time() - started,
+                )
+                yield _sse({
+                    "type": "transcript.text.delta",
+                    "delta": " ",
+                    "logprobs": [],
+                })
+
+        asr_done = time.time() - started
+        num_speakers = 0
+        if do_diarize and words:
+            logger.info(
+                "[openai %s] running diarization (sherpa-onnx) ...", request_id,
+            )
+            words, num_speakers = await asyncio.to_thread(
+                _attach_speakers_to_words, audio_path, words, duration, request_id,
+            )
+            if num_speakers > 1:
+                transcript = _compose_speaker_prefixed_text(words, transcript)
+
+        elapsed = time.time() - started
+        logger.info(
+            "[openai %s] stream done in %.2fs (asr=%.2fs, diar=%.2fs, "
+            "speakers=%d), %d chars, lang=%s",
+            request_id, elapsed, asr_done, max(0.0, elapsed - asr_done),
+            num_speakers, len(transcript or ""), lang,
+        )
+
+        yield _sse({
+            "type": "transcript.text.done",
+            "text": transcript or "",
+            "logprobs": [],
+            "usage": {
+                "type": "duration",
+                "seconds": int(round(float(duration or 0))),
+            },
+        })
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        logger.exception("[openai %s] streaming transcription failed", request_id)
+        yield _sse({
+            "type": "transcript.text.done",
+            "text": f"[Local transcription error: {exc}]",
+            "logprobs": [],
+            "usage": {"type": "duration", "seconds": 0},
+        })
+        yield "data: [DONE]\n\n"
+    finally:
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+
 @app.post("/v1/audio/transcriptions")
 async def openai_audio_transcriptions(request: Request):
     """OpenAI Whisper-API-compatible batch transcription.
@@ -832,12 +980,15 @@ async def openai_audio_transcriptions(request: Request):
       * language (optional)     - ISO-639-1 hint passed to faster-whisper
       * response_format         - json | text | srt | verbose_json | vtt | diarized_json
                                   (default: json; Char defaults to diarized_json)
+      * stream                  - "true" enables OpenAI-style SSE response
+                                  (transcript.text.delta + transcript.text.done).
+                                  Char's progressive batch path uses this for
+                                  `gpt-4o-transcribe` and we heartbeat the
+                                  delta channel so long files don't trip the
+                                  client-side 60-second idle abort.
       * temperature, prompt,
-        timestamp_granularities,
-        stream                  - silently ignored (we don't sample, prompt,
-                                  emit per-token granularity, or stream SSE
-                                  for this endpoint; transcribe_file.py and
-                                  /v1/listen/stream cover those use cases).
+        timestamp_granularities - silently ignored (we don't sample, prompt,
+                                  or emit per-token granularity).
 
     Auth: the Authorization: Bearer <key> header is accepted and ignored;
     no key is required and any value works.
@@ -882,6 +1033,7 @@ async def openai_audio_transcriptions(request: Request):
     suffix = os.path.splitext(upload.filename or "audio")[1] or ".bin"
     requested_model = (form.get("model") or "").strip()
     response_format = (form.get("response_format") or "json").strip().lower()
+    stream_flag = (form.get("stream") or "").strip().lower() in ("true", "1", "yes")
     if response_format not in _OPENAI_VALID_FORMATS:
         return JSONResponse(
             {"error": {
@@ -896,10 +1048,35 @@ async def openai_audio_transcriptions(request: Request):
         )
 
     logger.info(
-        "[openai %s] received %d bytes (model=%r, response_format=%s, filename=%r)",
+        "[openai %s] received %d bytes (model=%r, response_format=%s, "
+        "stream=%s, filename=%r)",
         request_id, len(audio_bytes), requested_model or "<unset>",
-        response_format, upload.filename or "<unset>",
+        response_format, stream_flag, upload.filename or "<unset>",
     )
+
+    if stream_flag:
+        # Persist the audio to a tempfile that outlives this handler; the
+        # streaming generator unlinks it in its finally block.
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        try:
+            os.write(fd, audio_bytes)
+        finally:
+            os.close(fd)
+        do_diarize = (
+            _OPENAI_BATCH_DIARIZE
+            and (response_format == "diarized_json"
+                 or requested_model.endswith("-diarize"))
+        )
+        return StreamingResponse(
+            _stream_openai_transcription(
+                request_id, tmp_path, started, do_diarize,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
         tmp.write(audio_bytes)

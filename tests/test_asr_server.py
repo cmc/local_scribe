@@ -12,7 +12,9 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import os
 import sys
 import unittest
@@ -779,6 +781,192 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         resp = self.client.post("/v1/audio/transcriptions", files=files)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"text": CANNED_TRANSCRIPT})
+
+    # ---- streaming SSE branch (Char's progressive `gpt-4o-transcribe` path) ----
+
+    def _parse_sse_events(self, body: str) -> list[dict[str, Any] | str]:
+        """Parse the `data: ...\\n\\n` blocks in an SSE response body."""
+        out: list[dict[str, Any] | str] = []
+        for chunk in body.split("\n\n"):
+            chunk = chunk.strip()
+            if not chunk.startswith("data:"):
+                continue
+            payload = chunk[len("data:"):].strip()
+            if payload == "[DONE]":
+                out.append("[DONE]")
+                continue
+            out.append(json.loads(payload))
+        return out
+
+    def test_stream_true_returns_sse_with_done_event(self):
+        # Char's `gpt-4o-transcribe` progressive path POSTs `stream=true`.
+        # We must reply with text/event-stream, end with `transcript.text.done`
+        # carrying the full transcript, and terminate with `[DONE]`.
+        resp = self._post(
+            model="gpt-4o-transcribe",
+            response_format=None,
+            extra_form={"stream": "true"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(
+            resp.headers["content-type"].startswith("text/event-stream"),
+            f"unexpected content-type: {resp.headers['content-type']}",
+        )
+        events = self._parse_sse_events(resp.text)
+        self.assertEqual(events[-1], "[DONE]")
+        done = events[-2]
+        self.assertIsInstance(done, dict)
+        self.assertEqual(done["type"], "transcript.text.done")
+        self.assertEqual(done["text"], CANNED_TRANSCRIPT)
+
+    def test_stream_emits_heartbeat_deltas_when_asr_is_slow(self):
+        # The whole point of the streaming branch: a long ASR run must
+        # produce delta heartbeats so Char's 60-second BATCH_IDLE_TIMEOUT
+        # doesn't fire. We force ASR to take longer than the heartbeat
+        # interval and assert at least one delta arrives before `done`.
+        slow_done = asyncio.Event()
+
+        async def slow_asr(audio_path, on_segment=None, on_start=None):
+            # Simulate a 0.4s ASR; with heartbeat=0.1s we expect ~3 heartbeats.
+            await asyncio.sleep(0.4)
+            slow_done.set()
+            return CANNED_TRANSCRIPT, CANNED_WORDS, CANNED_LANG, CANNED_DURATION
+
+        with mock.patch.object(asr_server, "_run_asr_async", side_effect=slow_asr), \
+             mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 0.1):
+            resp = self._post(
+                model="gpt-4o-transcribe",
+                response_format=None,
+                extra_form={"stream": "true"},
+            )
+        self.assertEqual(resp.status_code, 200)
+        events = self._parse_sse_events(resp.text)
+        deltas = [e for e in events if isinstance(e, dict)
+                  and e.get("type") == "transcript.text.delta"]
+        dones = [e for e in events if isinstance(e, dict)
+                 and e.get("type") == "transcript.text.done"]
+        self.assertGreaterEqual(len(deltas), 1,
+            "must emit at least one heartbeat delta during slow ASR")
+        # Heartbeat delta is a single space (non-empty so Char's parser
+        # actually emits a Progress event that resets last_activity_tx).
+        self.assertEqual(deltas[0]["delta"], " ")
+        self.assertEqual(len(dones), 1)
+        self.assertEqual(dones[0]["text"], CANNED_TRANSCRIPT)
+
+    def test_stream_with_diarization_inlines_speaker_prefixes(self):
+        # When diarization runs successfully and finds 2+ speakers, the
+        # streamed `done.text` must inline `Speaker N:` prefixes -- the
+        # progressive batch shape Char accepts on this path is text-only,
+        # so structural segments would be lost otherwise.
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.10},
+            {"speaker": "SPEAKER_01", "start": 1.20, "end": 2.30},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(CANNED_WORDS[0], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[1], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[2], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[3], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[4], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[5], speaker="SPEAKER_01"),
+        ]
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
+             mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", True):
+            resp = self._post(
+                model="gpt-4o-transcribe-diarize",  # triggers diarize
+                response_format="diarized_json",
+                extra_form={"stream": "true"},
+            )
+        self.assertEqual(resp.status_code, 200)
+        events = self._parse_sse_events(resp.text)
+        done = next(e for e in events if isinstance(e, dict)
+                    and e.get("type") == "transcript.text.done")
+        text = done["text"]
+        self.assertIn("Speaker 0:", text)
+        self.assertIn("Speaker 1:", text)
+        # The second speaker's lines must come AFTER the first speaker's
+        # lines, not interleaved.
+        self.assertLess(text.index("Speaker 0:"), text.index("Speaker 1:"))
+
+    def test_stream_handles_asr_failure_with_synthetic_done(self):
+        # If ASR explodes mid-stream we still must emit a `done` event so
+        # Char doesn't hang waiting forever. The done.text contains the
+        # human-readable error so the user sees what went wrong.
+        async def boom(*a, **kw):
+            raise RuntimeError("model exploded")
+
+        with mock.patch.object(asr_server, "_run_asr_async", side_effect=boom):
+            resp = self._post(
+                model="gpt-4o-transcribe",
+                response_format=None,
+                extra_form={"stream": "true"},
+            )
+        # Streaming response is always 200; errors are inlined into the
+        # final `done.text` (closer to OpenAI's actual SSE behavior).
+        self.assertEqual(resp.status_code, 200)
+        events = self._parse_sse_events(resp.text)
+        done = next(e for e in events if isinstance(e, dict)
+                    and e.get("type") == "transcript.text.done")
+        self.assertIn("model exploded", done["text"])
+        self.assertEqual(events[-1], "[DONE]")
+
+
+class ComposeSpeakerPrefixedTextTests(unittest.TestCase):
+    def test_groups_by_speaker_turn_with_blank_lines(self):
+        words = [
+            {"punctuated_word": "Hello.", "start": 0.0, "end": 0.3, "speaker": "SPEAKER_00"},
+            {"punctuated_word": "World.", "start": 0.4, "end": 0.7, "speaker": "SPEAKER_00"},
+            {"punctuated_word": "Hi", "start": 0.8, "end": 1.0, "speaker": "SPEAKER_01"},
+            {"punctuated_word": "back.", "start": 1.1, "end": 1.4, "speaker": "SPEAKER_01"},
+            {"punctuated_word": "OK?", "start": 1.5, "end": 1.7, "speaker": "SPEAKER_00"},
+        ]
+        text = asr_server._compose_speaker_prefixed_text(words, "")
+        self.assertIn("Speaker 00: Hello. World.", text)
+        self.assertIn("Speaker 01: Hi back.", text)
+        self.assertIn("Speaker 00: OK?", text)
+        # Each speaker turn separated by a blank line.
+        self.assertEqual(text.count("\n\n"), 2)
+
+    def test_falls_back_to_plain_transcript_when_no_words(self):
+        text = asr_server._compose_speaker_prefixed_text([], "raw fallback")
+        self.assertEqual(text, "raw fallback")
+
+    def test_single_speaker_collapses_to_one_line(self):
+        words = [
+            {"punctuated_word": "Hello.", "start": 0.0, "end": 0.3, "speaker": "speaker_0"},
+            {"punctuated_word": "World.", "start": 0.4, "end": 0.7, "speaker": "speaker_0"},
+        ]
+        text = asr_server._compose_speaker_prefixed_text(words, "")
+        self.assertEqual(text, "Speaker 0: Hello. World.")
+
+
+class OpenAIEndpointMiscTests(unittest.TestCase):
+    """Endpoint-level tests reusing the same fake ASR fixture."""
+
+    def setUp(self):
+        self.client = TestClient(asr_server.app)
+        self._patcher = mock.patch.object(
+            asr_server, "_run_asr_async", side_effect=_fake_run_asr_async,
+        )
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    def _post(self, *, response_format: str | None = None,
+              filename: str = "audio.m4a",
+              model: str | None = "gpt-4o-transcribe-diarize"):
+        files = {"file": (filename, io.BytesIO(b"FAKE_AUDIO" * 100), "audio/m4a")}
+        data: dict = {}
+        if model is not None:
+            data["model"] = model
+        if response_format is not None:
+            data["response_format"] = response_format
+        return self.client.post(
+            "/v1/audio/transcriptions",
+            files=files,
+            data=data,
+            headers={"Authorization": "Bearer test-key"},
+        )
 
     def test_backend_failure_returns_500_with_error_envelope(self):
         async def boom(*a, **kw):

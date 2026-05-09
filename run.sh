@@ -355,12 +355,12 @@ prov  = ai.get("current_stt_provider", "")
 model = ai.get("current_stt_model", "")
 url   = oai.get("base_url", "")
 expected_url = f"http://127.0.0.1:{expected_port}/v1"
-if prov == "openai" and model == "gpt-4o-transcribe-diarize" and url == expected_url:
+if prov == "openai" and model == "gpt-4o-transcribe" and url == expected_url:
     print(f"  {G}\u25cf{Z} Char transcriber configured for this server")
 else:
     print(f"  {Y}\u25cb{Z} Char transcriber NOT pointed here -- run `./run.sh configure-char`")
     print(f"      provider : {prov!r:<25s} (want 'openai')")
-    print(f"      model    : {model!r:<25s} (want 'gpt-4o-transcribe-diarize')")
+    print(f"      model    : {model!r:<25s} (want 'gpt-4o-transcribe')")
     print(f"      base_url : {url!r:<25s} (want '{expected_url}')")
 PY
     else
@@ -372,7 +372,7 @@ PY
 
   printf "\n%schar config hints (manual fallback):%s\n" "$c_bold" "$c_reset"
   printf "  Live recording  : Custom provider, Base URL http://127.0.0.1:%s\n" "$ASR_PORT"
-  printf "  Generate (file) : OpenAI provider, Model gpt-4o-transcribe-diarize, Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
+  printf "  Generate (file) : OpenAI provider, Model gpt-4o-transcribe, Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
   printf "  api key (both)  : any non-empty string (auth is ignored locally)\n"
   printf "  intelligence    : LM Studio @ http://127.0.0.1:%s   model=%s\n" "$LMSTUDIO_PORT" "$LLM_MODEL"
   printf "\n"
@@ -755,7 +755,15 @@ ai  = d.setdefault("ai", {})
 stt = ai.setdefault("stt", {})
 oai = stt.setdefault("openai", {})
 ai["current_stt_provider"] = "openai"
-ai["current_stt_model"]    = "gpt-4o-transcribe-diarize"
+# `gpt-4o-transcribe` triggers Char's progressive (SSE-streamed) batch path.
+# Char's tauri-plugin-transcription/listener2/ext.rs hardcodes a 60-second
+# BATCH_IDLE_TIMEOUT for the non-streaming `gpt-4o-transcribe-diarize` path,
+# which silently aborts the spawned future on any audio whose ASR takes
+# longer than 60s -- our local Parakeet pass is ~80x realtime so that's any
+# meeting longer than ~80 minutes. The progressive path resets the timer on
+# every SSE delta, and our /v1/audio/transcriptions endpoint emits heartbeat
+# deltas every STREAM_HEARTBEAT_SECONDS to keep it alive on long files.
+ai["current_stt_model"]    = "gpt-4o-transcribe"
 oai["base_url"]            = f"http://127.0.0.1:{port}/v1"
 oai["api_key"]             = "local"
 p.write_text(json.dumps(d, indent=2) + "\n")
@@ -767,7 +775,7 @@ PY
 
   printf "\n  %s● char configured%s\n" "$c_green" "$c_reset"
   printf "    current_stt_provider : openai\n"
-  printf "    current_stt_model    : gpt-4o-transcribe-diarize  (non-streaming, with speaker labels)\n"
+  printf "    current_stt_model    : gpt-4o-transcribe           (progressive/SSE -- no 60s client-side timeout)\n"
   printf "    stt.openai.base_url  : http://127.0.0.1:%s/v1\n" "$ASR_PORT"
   printf "    stt.openai.api_key   : local\n"
   if [[ -n "$key_backup_path" ]]; then
