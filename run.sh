@@ -179,11 +179,11 @@ cmd_start() {
   whisper_start
   printf "\n"
   printf "%s──── pipeline ready ────%s\n" "$c_bold" "$c_reset"
-  printf "  whisper server : %shttp://127.0.0.1:%s%s   (Char's transcription endpoint)\n" \
+  printf "  ASR server (Parakeet TDT v3) : %shttp://127.0.0.1:%s%s   (Char's transcription endpoint)\n" \
          "$c_green" "$WHISPER_PORT" "$c_reset"
-  printf "  LM Studio API  : %shttp://127.0.0.1:%s%s   (summary + speaker naming)\n" \
+  printf "  LM Studio API (Qwen3-30B)    : %shttp://127.0.0.1:%s%s   (summary + speaker naming)\n" \
          "$c_green" "$LMSTUDIO_PORT" "$c_reset"
-  printf "  log file       : %s\n" "$WHISPER_LOG_FILE"
+  printf "  log file                     : %s\n" "$WHISPER_LOG_FILE"
   printf "\n"
   printf "  on-demand:    %s./run.sh transcribe ~/Desktop/call.m4a%s\n" "$c_bold" "$c_reset"
   printf "  status:       %s./run.sh status%s\n" "$c_bold" "$c_reset"
@@ -204,10 +204,17 @@ cmd_stop() {
 cmd_status() {
   printf "%spipeline status%s\n" "$c_bold" "$c_reset"
   if whisper_pid >/dev/null; then
-    printf "  "; ok; printf "whisper server   pid=%-7s port=%s   log=%s\n" \
-                          "$(whisper_pid)" "$WHISPER_PORT" "$WHISPER_LOG_FILE"
+    local backend="?" model="?"
+    local health_json; health_json="$(curl -sf "http://127.0.0.1:$WHISPER_PORT/health" 2>/dev/null || true)"
+    if [[ -n "$health_json" ]]; then
+      backend="$(printf '%s' "$health_json" | "$VENV_PY" -c "import json,sys;print(json.load(sys.stdin).get('asr_backend','?'))" 2>/dev/null || echo "?")"
+      model="$(printf '%s' "$health_json"   | "$VENV_PY" -c "import json,sys;print(json.load(sys.stdin).get('model','?'))" 2>/dev/null || echo "?")"
+    fi
+    printf "  "; ok; printf "ASR server       pid=%-7s port=%s   backend=%s   model=%s\n" \
+                          "$(whisper_pid)" "$WHISPER_PORT" "$backend" "$model"
+    printf "                   log=%s\n" "$WHISPER_LOG_FILE"
   else
-    printf "  "; bad; printf "whisper server   not running\n"
+    printf "  "; bad; printf "ASR server       not running\n"
   fi
   if lmstudio_running; then
     printf "  "; ok; printf "LM Studio API    port=%s\n" "$LMSTUDIO_PORT"

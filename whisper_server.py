@@ -1,11 +1,19 @@
 """
-Local Deepgram-compatible Whisper server.
+Local Deepgram-compatible ASR server.
 
 Implements the two pieces of Deepgram's /v1/listen contract that real clients
 (including Char with BYOK Deepgram + a custom base URL) actually use:
 
   * POST  /v1/listen   - batch transcription with raw audio in the request body
   * WS    /v1/listen   - streaming transcription over WebSocket (linear16 PCM)
+
+Two ASR backends are pluggable via ASR_BACKEND:
+
+  * parakeet (default) - NVIDIA Parakeet-TDT 0.6B v3 via parakeet-mlx
+                         (top of the OpenASR leaderboard for English; runs
+                         natively on Apple Silicon)
+  * whisper            - faster-whisper large-v3-turbo (the original backend;
+                         multilingual)
 
 Char setup
 ----------
@@ -23,6 +31,8 @@ Run
 
 Configuration env vars
 ----------------------
+    ASR_BACKEND            (default: parakeet)        parakeet | whisper
+    PARAKEET_MODEL         (default: mlx-community/parakeet-tdt-0.6b-v3)
     WHISPER_MODEL          (default: large-v3-turbo)
                               tiny | base | small | medium | large-v3 | large-v3-turbo |
                               distil-large-v3 | distil-medium.en | distil-small.en
@@ -30,31 +40,30 @@ Configuration env vars
                                               int8_float16 | float16 (CUDA only)
     WHISPER_DEVICE         (default: auto)    cpu | cuda | auto
     WHISPER_LANGUAGE       (default: unset)   ISO-639 code; leave unset to autodetect
-
-Model recommendation: on Apple Silicon with >=16GB RAM, `large-v3-turbo` at int8
-gives near-`large-v3` accuracy while running ~5x faster than full large-v3.
-For absolute best quality on tricky / non-English audio, switch to `large-v3`.
+                                              (only respected by the whisper backend)
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
 import os
 import tempfile
-import threading
 import time
 import uuid
+import wave
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from faster_whisper import WhisperModel
 
 logger = logging.getLogger("whisper_server")
 logging.basicConfig(
@@ -62,17 +71,73 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+ASR_BACKEND = os.getenv("ASR_BACKEND", "parakeet").lower()
+if ASR_BACKEND not in {"parakeet", "whisper"}:
+    raise RuntimeError(
+        f"Unknown ASR_BACKEND={ASR_BACKEND!r}; use 'parakeet' or 'whisper'"
+    )
+
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 LANGUAGE = os.getenv("WHISPER_LANGUAGE") or None
+PARAKEET_MODEL_ID = os.getenv("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 
-logger.info(
-    "loading faster-whisper model=%s compute=%s device=%s",
-    MODEL_NAME, COMPUTE_TYPE, DEVICE,
+_whisper_model = None
+_arch: str
+if ASR_BACKEND == "whisper":
+    from faster_whisper import WhisperModel
+
+    logger.info(
+        "loading faster-whisper model=%s compute=%s device=%s",
+        WHISPER_MODEL_NAME, COMPUTE_TYPE, DEVICE,
+    )
+    _whisper_model = WhisperModel(
+        WHISPER_MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE
+    )
+    MODEL_NAME = WHISPER_MODEL_NAME
+    _arch = "whisper"
+else:
+    import mlx.core as mx  # noqa: E402
+
+    from parakeet_backend import (  # noqa: E402
+        load_model as _load_parakeet_model,
+        transcribe_to_deepgram as _parakeet_transcribe_to_deepgram,
+    )
+
+    MODEL_NAME = PARAKEET_MODEL_ID
+    _arch = "Parakeet-TDT"
+
+
+def _mlx_thread_init() -> None:
+    """MLX is thread-local: streams are per-thread, and crucially the model
+    weights also need to live on the same thread that runs inference. We
+    therefore both register a stream and lazy-load parakeet on the worker
+    thread itself rather than on the main thread at import time."""
+    if ASR_BACKEND != "parakeet":
+        return
+    mx.set_default_stream(mx.new_stream(mx.default_device()))
+    logger.info(
+        "[mlx-worker] loading parakeet-mlx model=%s ...", PARAKEET_MODEL_ID
+    )
+    _load_parakeet_model(PARAKEET_MODEL_ID)
+    logger.info("[mlx-worker] parakeet model ready")
+
+
+# All parakeet/MLX work runs on this single worker thread so the stream
+# stays warm and weights stay co-located. faster-whisper sticks with the
+# default executor; the initializer is a no-op in that case.
+_mlx_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="mlx",
+    initializer=_mlx_thread_init,
 )
-model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
-logger.info("model ready")
+
+# Force the worker thread (and the parakeet model load) to spin up now so
+# the first /v1/listen request doesn't pay the cold-load tax.
+_mlx_executor.submit(lambda: None).result()
+
+logger.info("model ready (backend=%s, model=%s)", ASR_BACKEND, MODEL_NAME)
 
 app = FastAPI(title="whisper-server", version="0.2.0")
 app.add_middleware(
@@ -104,26 +169,46 @@ def _avg_confidence(words: list[dict[str, Any]]) -> float:
     return round(sum(w["confidence"] for w in words) / len(words), 4)
 
 
-def _run_whisper(
+def _write_temp_wav(audio_f32: np.ndarray, sample_rate: int = 16000) -> str:
+    """parakeet-mlx wants a file path (it routes through librosa internally),
+    so when we have an in-memory numpy buffer (the WS path) we have to
+    materialize a temp wav. Returns the path; caller is responsible for
+    deleting it."""
+    pcm = np.clip(audio_f32, -1.0, 1.0)
+    pcm_i16 = (pcm * 32767.0).astype(np.int16)
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="ws_pcm_")
+    os.close(fd)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_i16.tobytes())
+    return path
+
+
+def _run_whisper_backend(
     audio: Any,
     on_segment=None,
     on_start=None,
 ) -> tuple[str, list[dict[str, Any]], str | None, float]:
-    """Synchronous transcription helper. `audio` is anything faster-whisper accepts:
-    a file path or a 1-D float32 numpy array sampled at 16 kHz.
+    """faster-whisper transcription. `audio` is a file path or a 1-D float32
+    numpy array sampled at 16 kHz. Callbacks are invoked from this thread:
 
-    Optional callbacks (invoked from this thread):
-        on_start(info)   - fired once after the audio is decoded and total duration is known
-        on_segment(seg)  - fired after each segment is produced; `seg` has .start, .end, .text
+        on_start(info)   - SimpleNamespace(duration, language, language_probability)
+        on_segment(seg)  - SimpleNamespace(id, start, end, text)
     """
-    segments, info = model.transcribe(
+    segments, info = _whisper_model.transcribe(
         audio,
         language=LANGUAGE,
         word_timestamps=True,
         vad_filter=True,
     )
     if on_start is not None:
-        on_start(info)
+        on_start(SimpleNamespace(
+            duration=float(getattr(info, "duration", 0.0) or 0.0),
+            language=info.language,
+            language_probability=float(info.language_probability),
+        ))
     text_parts: list[str] = []
     words: list[dict[str, Any]] = []
     for seg in segments:
@@ -132,10 +217,123 @@ def _run_whisper(
             for w in seg.words:
                 words.append(_build_word(w))
         if on_segment is not None:
-            on_segment(seg)
+            on_segment(SimpleNamespace(
+                id=int(getattr(seg, "id", 0) or 0),
+                start=float(seg.start),
+                end=float(seg.end),
+                text=seg.text.strip(),
+            ))
     transcript = " ".join(p.strip() for p in text_parts).strip()
     duration = float(getattr(info, "duration", 0.0) or 0.0)
     return transcript, words, info.language, duration
+
+
+def _run_parakeet_backend(
+    audio: Any,
+    on_segment=None,
+    on_start=None,
+) -> tuple[str, list[dict[str, Any]], str | None, float]:
+    """parakeet-mlx transcription with the same callback contract as the
+    whisper backend, so the FastAPI handlers don't have to branch.
+
+    Parakeet only consumes file paths, so when given a numpy buffer (the
+    WS path) we serialize a temp wav and clean it up after."""
+    cleanup_path: str | None = None
+    if isinstance(audio, np.ndarray):
+        path = _write_temp_wav(audio)
+        cleanup_path = path
+    else:
+        path = str(audio)
+
+    duration_holder = {"duration": 0.0}
+
+    def parakeet_on_start(duration_s: float, language: str) -> None:
+        duration_holder["duration"] = float(duration_s)
+        if on_start is not None:
+            on_start(SimpleNamespace(
+                duration=float(duration_s),
+                language=language,
+                language_probability=1.0,
+            ))
+
+    last_chunk_end = {"v": 0.0}
+
+    def parakeet_on_progress(progress: float, current_s: float, total_s: float) -> None:
+        # parakeet-mlx fires on_progress per processed chunk; we synthesize a
+        # whisper-shaped Segment so the streaming endpoint sees a uniform
+        # event stream regardless of backend. start = previous chunk end,
+        # end = current position.
+        if on_segment is None:
+            return
+        seg_start = last_chunk_end["v"]
+        seg_end = float(current_s)
+        last_chunk_end["v"] = seg_end
+        on_segment(SimpleNamespace(
+            id=0,
+            start=seg_start,
+            end=seg_end,
+            text="",
+        ))
+
+    try:
+        payload = _parakeet_transcribe_to_deepgram(
+            Path(path),
+            model_id=PARAKEET_MODEL_ID,
+            on_start=parakeet_on_start,
+            on_progress=parakeet_on_progress,
+        )
+    finally:
+        if cleanup_path:
+            try:
+                os.unlink(cleanup_path)
+            except OSError:
+                pass
+
+    alt = payload["results"]["channels"][0]["alternatives"][0]
+    transcript = (alt.get("transcript") or "").strip()
+    words = alt.get("words") or []
+    language = (alt.get("languages") or ["en"])[0]
+    duration = float(payload.get("metadata", {}).get("duration") or duration_holder["duration"])
+    return transcript, words, language, duration
+
+
+def _run_asr(
+    audio: Any,
+    on_segment=None,
+    on_start=None,
+) -> tuple[str, list[dict[str, Any]], str | None, float]:
+    """Dispatch to whichever ASR backend the server was started with."""
+    if ASR_BACKEND == "whisper":
+        return _run_whisper_backend(audio, on_segment=on_segment, on_start=on_start)
+    return _run_parakeet_backend(audio, on_segment=on_segment, on_start=on_start)
+
+
+async def _run_asr_async(audio: Any, on_segment=None, on_start=None):
+    """Schedule ASR off the event loop. Parakeet is pinned to the dedicated
+    MLX-stream-initialized worker; Whisper uses the default executor."""
+    loop = asyncio.get_running_loop()
+    if ASR_BACKEND == "parakeet":
+        return await loop.run_in_executor(
+            _mlx_executor, _run_asr, audio, on_segment, on_start,
+        )
+    return await asyncio.to_thread(
+        _run_asr, audio, on_segment, on_start,
+    )
+
+
+def _model_info_block() -> dict[str, Any]:
+    """Backend-aware Deepgram model_info block."""
+    return {
+        MODEL_NAME: {
+            "name": (
+                f"faster-whisper-{MODEL_NAME}"
+                if ASR_BACKEND == "whisper"
+                else MODEL_NAME
+            ),
+            "version": "local",
+            "arch": _arch,
+        }
+    }
 
 
 def _deepgram_batch_response(
@@ -156,13 +354,7 @@ def _deepgram_batch_response(
             "duration": round(duration_s, 3),
             "channels": 1,
             "models": [MODEL_NAME],
-            "model_info": {
-                MODEL_NAME: {
-                    "name": f"faster-whisper-{MODEL_NAME}",
-                    "version": "local",
-                    "arch": "whisper",
-                }
-            },
+            "model_info": _model_info_block(),
         },
         "results": {
             "channels": [
@@ -186,10 +378,12 @@ def _deepgram_batch_response(
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "asr_backend": ASR_BACKEND,
         "model": MODEL_NAME,
-        "compute_type": COMPUTE_TYPE,
-        "device": DEVICE,
-        "language": LANGUAGE or "auto",
+        "arch": _arch,
+        "compute_type": COMPUTE_TYPE if ASR_BACKEND == "whisper" else "mlx-bfloat16",
+        "device": DEVICE if ASR_BACKEND == "whisper" else "mlx",
+        "language": LANGUAGE or ("en" if ASR_BACKEND == "parakeet" else "auto"),
     }
 
 
@@ -235,7 +429,7 @@ async def listen(request: Request):
         tmp.write(audio_bytes)
         tmp.flush()
         try:
-            transcript, words, lang, duration = await asyncio.to_thread(_run_whisper, tmp.name)
+            transcript, words, lang, duration = await _run_asr_async(tmp.name)
         except Exception as exc:
             logger.exception("[batch %s] transcription failed", request_id)
             return JSONResponse(
@@ -349,7 +543,7 @@ async def listen_stream(request: Request):
 
             def producer() -> None:
                 try:
-                    transcript, words, lang, duration = _run_whisper(
+                    transcript, words, lang, duration = _run_asr(
                         tmp.name, on_segment=on_segment, on_start=on_start,
                     )
                     push({
@@ -370,7 +564,11 @@ async def listen_stream(request: Request):
                 finally:
                     push(None)
 
-            threading.Thread(target=producer, daemon=True).start()
+            # Reuse _mlx_executor so the parakeet/MLX stream initializer
+            # runs and the GPU isn't shared across concurrent threads. For
+            # the whisper backend this is just a regular worker thread; the
+            # initializer is a no-op when ASR_BACKEND != "parakeet".
+            _mlx_executor.submit(producer)
 
             while True:
                 event = await queue.get()
@@ -503,7 +701,7 @@ async def listen_ws(ws: WebSocket):
     )
 
     try:
-        transcript, words, lang, duration = await asyncio.to_thread(_run_whisper, audio_f32)
+        transcript, words, lang, duration = await _run_asr_async(audio_f32)
     except Exception as exc:
         logger.exception("[ws %s] transcription failed", request_id)
         try:
@@ -537,11 +735,7 @@ async def listen_ws(ws: WebSocket):
         },
         "metadata": {
             "request_id": request_id,
-            "model_info": {
-                "name": f"faster-whisper-{MODEL_NAME}",
-                "version": "local",
-                "arch": "whisper",
-            },
+            "model_info": _model_info_block()[MODEL_NAME],
             "model_uuid": MODEL_NAME,
         },
     }
