@@ -1109,9 +1109,33 @@ function renderSpeakerAirtime(speakers) {
   // descending. We tolerate an absent / empty array by just hiding
   // the panel — old archives + skipped-diarization runs have nothing
   // useful to show here.
+  //
+  // The explainer paragraph below the <h4> is intentionally short and
+  // hedged: speaker diarization is a best-effort clustering problem
+  // (TitaNet embeddings + silhouette-validated auto-K spectral
+  // clustering), not a deterministic identity check, so the UI has to
+  // set the expectation that two-similar-voices or talking-over-each-
+  // other will collapse / split speakers occasionally. The mean-
+  // confidence column on the right is the cluster confidence the
+  // model emitted for each speaker -- low values are usually the
+  // tell that the clustering wasn't sure.
   if (!speakers || !speakers.length) return '';
   let h = `<div class="airtime"><h4>Speaker airtime
-           <span class="meta">(of total speech time)</span></h4>`;
+           <span class="meta">(of total speech time)</span></h4>
+    <p class="meta" style="margin:0 0 0.6rem 0; max-width: 56rem;">
+      Speakers are auto-detected from voice fingerprints, not from any
+      identity database: each short turn is embedded into a 192-d
+      vector by NeMo TitaNet, and similar vectors are clustered with
+      silhouette-validated spectral clustering to pick the number of
+      speakers from the audio itself. It's an imperfect process —
+      two voices in the same pitch / accent range can collapse into
+      one row, the same person on a noisy line can split across rows,
+      and very short utterances ("yeah", "mm-hmm") sometimes attach
+      to whichever neighbour they're closest to. Use the confidence
+      column to spot weak clusters, and re-run with
+      <code>./run.sh redo-session SESSION --speakers N</code> if you
+      know the correct count.
+    </p>`;
   speakers.forEach(s => {
     const pct = Math.round((s.percent || 0) * 100);
     const meanConf = s.mean_confidence;
