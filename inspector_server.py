@@ -131,56 +131,130 @@ def _session_dir(cfg: Config, session_id: str) -> Path:
 
 def _flatten_transcript(raw: dict[str, Any]) -> dict[str, Any]:
     """Parse Char's ``transcript.json`` into a UI-friendly shape:
-    every word with its speaker, plus a denormalised plain-text view
-    grouped by speaker. Char's stored format keeps words in nested
-    ``transcripts[].words`` arrays with separate speaker_hints, so we
-    do the join here once on the server.
+    every word with its speaker + per-cluster-confidence, plus a
+    denormalised plain-text view grouped by speaker, plus the
+    per-speaker airtime aggregate.
+
+    ``local_scribe.diarization.word_confidences`` (if present) is a
+    parallel array indexed by word position into ``words[0].words``.
+    We join it back here so each paragraph carries a mean confidence
+    the UI can render as ``Speaker N (87%)``.
+
+    ``local_scribe.diarization.speakers`` (if present) carries the
+    server-side airtime aggregate — propagated straight to the UI so
+    the same numbers show up in both Inspector and ``transcript.txt``
+    without recomputing.
     """
     transcripts = raw.get("transcripts") or []
     speakers_by_word: dict[str, str] = {}
+
+    def _decode_speaker_value(hint: dict[str, Any]) -> str:
+        """Turn a Char speaker_hint into a human-readable label.
+
+        Char's persister stores two shapes here:
+          * ``type == "provider_speaker_index"`` (the prod path
+            ``char_persist.py`` writes) -> ``value`` is a JSON string
+            like ``{"provider":"openai","channel":2,"speaker_index":0}``.
+            Display as ``speaker_0``.
+          * ``type == "name"`` and arbitrary strings -> ``value`` is
+            the literal display name. Pass it through unchanged.
+
+        Falls back to the raw value on parse errors so we never hide a
+        legitimate label behind a flatten bug.
+        """
+        v = hint.get("value") or ""
+        if hint.get("type") == "provider_speaker_index" and v.startswith("{"):
+            try:
+                parsed = json.loads(v)
+                idx = parsed.get("speaker_index")
+                if isinstance(idx, int):
+                    return f"speaker_{idx}"
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        return v
+
     for t in transcripts:
         for hint in (t.get("speaker_hints") or []):
-            for wid in (hint.get("word_id") or []):
-                speakers_by_word[wid] = hint.get("value") or ""
+            wid_field = hint.get("word_id")
+            label = _decode_speaker_value(hint)
+            # Char's schema uses a SINGLE word_id string per hint, but
+            # this loader also tolerates list-valued hints from older
+            # code paths (and from the test fixtures that pre-date the
+            # production char_persist format).
+            if isinstance(wid_field, list):
+                for wid in wid_field:
+                    speakers_by_word[wid] = label
+            elif isinstance(wid_field, str):
+                speakers_by_word[wid_field] = label
+
+    ls_meta = raw.get("local_scribe") or {}
+    diar_meta = (ls_meta.get("diarization") or {}) if isinstance(ls_meta, dict) else {}
+    confidences_by_pos: list[float | None] = (
+        list(diar_meta.get("word_confidences") or [])
+        if isinstance(diar_meta, dict) else []
+    )
+    speakers_agg: list[dict[str, Any]] = (
+        list(diar_meta.get("speakers") or [])
+        if isinstance(diar_meta, dict) else []
+    )
 
     words: list[dict[str, Any]] = []
+    pos = 0
     for t in transcripts:
         for w in (t.get("words") or []):
             wid = w.get("id") or ""
+            conf = (
+                confidences_by_pos[pos]
+                if pos < len(confidences_by_pos) else None
+            )
             words.append({
                 "id": wid,
                 "text": w.get("text") or "",
                 "start": w.get("start"),
                 "end": w.get("end"),
                 "speaker": speakers_by_word.get(wid, ""),
+                "confidence": conf,
             })
+            pos += 1
 
-    # Group consecutive words by speaker into paragraphs.
     paragraphs: list[dict[str, Any]] = []
     cur_speaker: str | None = None
     cur_text: list[str] = []
     cur_start: float | None = None
-    for w in words:
-        sp = w["speaker"] or "?"
-        if sp != cur_speaker:
-            if cur_text:
-                paragraphs.append({
-                    "speaker": cur_speaker or "",
-                    "text": " ".join(cur_text),
-                    "start": cur_start,
-                })
-            cur_speaker = sp
-            cur_text = [w["text"]]
-            cur_start = w["start"]
-        else:
-            cur_text.append(w["text"])
-    if cur_text:
+    cur_conf_sum = 0.0
+    cur_conf_n = 0
+
+    def _flush() -> None:
+        if not cur_text:
+            return
+        mean_conf = (cur_conf_sum / cur_conf_n) if cur_conf_n else None
         paragraphs.append({
             "speaker": cur_speaker or "",
             "text": " ".join(cur_text),
             "start": cur_start,
+            "confidence": mean_conf,
         })
-    return {"word_count": len(words), "paragraphs": paragraphs}
+
+    for w in words:
+        sp = w["speaker"] or "?"
+        if sp != cur_speaker:
+            _flush()
+            cur_speaker = sp
+            cur_text = [w["text"]]
+            cur_start = w["start"]
+            cur_conf_sum = 0.0
+            cur_conf_n = 0
+        else:
+            cur_text.append(w["text"])
+        if w["confidence"] is not None:
+            cur_conf_sum += float(w["confidence"])
+            cur_conf_n += 1
+    _flush()
+    return {
+        "word_count": len(words),
+        "paragraphs": paragraphs,
+        "speakers": speakers_agg,
+    }
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
@@ -327,8 +401,36 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         lines = []
         for p in payload.get("paragraphs", []):
             sp = p.get("speaker") or "Speaker"
-            lines.append(f"{sp}: {p.get('text', '')}")
-        return PlainTextResponse("\n\n".join(lines))
+            # Inline confidence next to the speaker label so this txt
+            # file matches what the inspector + Char show. Skipped when
+            # diarization didn't produce confidence values (legacy
+            # archives, ``--no-diarize`` runs).
+            conf = p.get("confidence")
+            label = (
+                f"{sp} ({round(float(conf) * 100)}%)"
+                if conf is not None else sp
+            )
+            lines.append(f"{label}: {p.get('text', '')}")
+        body = "\n\n".join(lines)
+        # Trailing airtime summary so a downloaded ``.txt`` is
+        # standalone — no need to open the inspector to interpret it.
+        speakers = payload.get("speakers") or []
+        if speakers:
+            body += "\n\n--- Speaker airtime ---\n"
+            for s in speakers:
+                secs = float(s.get("seconds") or 0.0)
+                pct = round(float(s.get("percent") or 0.0) * 100)
+                mc = s.get("mean_confidence")
+                mc_str = (
+                    f"  · {round(float(mc) * 100)}% mean confidence"
+                    if mc is not None else ""
+                )
+                mins, rem = divmod(int(round(secs)), 60)
+                body += (
+                    f"{s.get('label', '?')}: {mins}m {rem:02d}s "
+                    f"({pct}%){mc_str}\n"
+                )
+        return PlainTextResponse(body)
 
     # ---------- Config ------------------------------------------------
 
@@ -525,6 +627,36 @@ th { color: var(--fg-dim); font-weight: 500; font-size: 0.85rem; }
 .badge.miss { color: var(--err); border-color: var(--err); }
 .transcript .speaker { color: var(--accent); font-weight: 600; }
 .transcript p { margin: 0.4rem 0; }
+/* Per-paragraph speaker-cluster confidence (silhouette-derived, see
+   diarization_backend._per_point_silhouette). Tones tuned for both
+   light and dark themes — pure colour, no background, so the tag
+   reads as metadata rather than a button. */
+.transcript .conf {
+  display: inline-block; font-size: 0.72rem; padding: 0 0.25rem;
+  border-radius: 3px; font-weight: 600; vertical-align: 1px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+.transcript .conf-high { color: var(--ok); }
+.transcript .conf-mid { color: var(--warn); }
+.transcript .conf-low { color: var(--err); }
+/* Per-session airtime panel: same card aesthetic as the History
+   section so it visually closes the transcript view. Bars are pure
+   CSS — width % is set inline from the speaker.percent value. */
+.airtime { margin-top: 1rem; }
+.airtime h4 { margin-bottom: 0.4rem; }
+.airtime .row-spk {
+  display: grid; grid-template-columns: 9rem 1fr 5rem 4rem;
+  align-items: center; gap: 0.6rem; padding: 0.25rem 0;
+  font-size: 0.85rem;
+}
+.airtime .label { font-weight: 600; color: var(--accent); }
+.airtime .bar { background: var(--card); border-radius: 4px; height: 0.7rem; }
+.airtime .bar > span {
+  display: block; background: var(--accent); height: 100%; border-radius: 4px;
+}
+.airtime .time { color: var(--fg-dim); text-align: right;
+                 font-family: ui-monospace, Menlo, monospace; }
+.airtime .conf { text-align: right; font-family: ui-monospace, Menlo, monospace; }
 .kv { display: grid; grid-template-columns: 12rem 1fr; gap: 0.3rem 1rem; }
 .kv label { color: var(--fg-dim); align-self: center; }
 .session-detail { padding-top: 1rem; border-top: 1px dashed var(--border); margin-top: 1rem; }
@@ -737,11 +869,27 @@ async function openSession(id) {
     if (s.transcript && s.transcript.paragraphs && s.transcript.paragraphs.length) {
       html += '<h4>Transcript</h4><div class="transcript">';
       s.transcript.paragraphs.forEach(p => {
-        html += `<p><span class="speaker">${escapeHtml(p.speaker || 'Speaker')}:</span>
+        // Per-paragraph mean speaker-cluster confidence in [0..1].
+        // We surface it next to the speaker name when available so
+        // the user knows which paragraphs the model is unsure about.
+        // The colour tints muted -> red below 50% so low-confidence
+        // attributions are visually obvious without needing to read
+        // every number. Above 80% gets a green tint to confirm "yep,
+        // we're confident this is speaker X".
+        let confTag = '';
+        if (p.confidence != null) {
+          const pct = Math.round(p.confidence * 100);
+          const tone = pct < 50 ? 'low' : (pct >= 80 ? 'high' : 'mid');
+          confTag = ` <span class="conf conf-${tone}" `
+                  + `title="cluster-membership confidence (silhouette-based, `
+                  + `0% = misclassified, 100% = perfectly inside its cluster)">${pct}%</span>`;
+        }
+        html += `<p><span class="speaker">${escapeHtml(p.speaker || 'Speaker')}:</span>${confTag}
                  ${escapeHtml(p.text)}
                  <span class="meta"> ${fmtDuration(p.start)}</span></p>`;
       });
       html += '</div>';
+      html += renderSpeakerAirtime(s.transcript.speakers || []);
     } else {
       html += '<p class="meta">no transcript yet</p>';
     }
@@ -764,6 +912,39 @@ async function openSession(id) {
     detail.innerHTML = '<div class="error-block">'
       + escapeHtml(e.message) + '</div>';
   }
+}
+
+function renderSpeakerAirtime(speakers) {
+  // Per-session airtime panel: one row per speaker with the talk-time
+  // bar + percentage + raw seconds + mean confidence. ``speakers`` is
+  // the array embedded in ``local_scribe.diarization.speakers`` by
+  // asr_server._compute_speaker_airtime, already sorted by seconds
+  // descending. We tolerate an absent / empty array by just hiding
+  // the panel — old archives + skipped-diarization runs have nothing
+  // useful to show here.
+  if (!speakers || !speakers.length) return '';
+  let h = `<div class="airtime"><h4>Speaker airtime
+           <span class="meta">(of total speech time)</span></h4>`;
+  speakers.forEach(s => {
+    const pct = Math.round((s.percent || 0) * 100);
+    const meanConf = s.mean_confidence;
+    let confDisplay = '<span class="conf">—</span>';
+    if (meanConf != null) {
+      const cp = Math.round(meanConf * 100);
+      const tone = cp < 50 ? 'conf-low' : (cp >= 80 ? 'conf-high' : 'conf-mid');
+      confDisplay = `<span class="conf ${tone}" `
+                  + `title="mean speaker-cluster confidence across this speaker's words">`
+                  + `${cp}%</span>`;
+    }
+    h += `<div class="row-spk">
+      <div class="label" title="${escapeHtml(s.label || '?')}">${escapeHtml(s.label || '?')}</div>
+      <div class="bar"><span style="width:${pct}%"></span></div>
+      <div class="time">${pct}% · ${fmtDuration(s.seconds || 0)}</div>
+      ${confDisplay}
+    </div>`;
+  });
+  h += '</div>';
+  return h;
 }
 
 function renderHistorySection(sessionId, hist) {

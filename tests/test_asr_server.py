@@ -99,6 +99,82 @@ async def _fake_run_asr_async(audio_path, on_segment=None, on_start=None):
 # Pure-function tests — segment grouping + subtitle formatting
 # ===========================================================================
 
+class ComputeSpeakerAirtimeTests(unittest.TestCase):
+    """``_compute_speaker_airtime`` aggregates the per-word stream into
+    one row per speaker. Used to populate the inspector's airtime
+    panel + the per-request "airtime:" log line.
+    """
+
+    def test_empty_words_returns_empty(self):
+        self.assertEqual(asr_server._compute_speaker_airtime([]), [])
+        self.assertEqual(asr_server._compute_speaker_airtime(None), [])
+
+    def test_two_speakers_aggregate_by_seconds_desc(self):
+        words = [
+            {"speaker": "speaker_0", "start": 0.0, "end": 1.0,
+             "speaker_confidence": 0.9},
+            {"speaker": "speaker_1", "start": 1.0, "end": 3.0,
+             "speaker_confidence": 0.6},
+            {"speaker": "speaker_0", "start": 3.0, "end": 4.0,
+             "speaker_confidence": 0.8},
+        ]
+        out = asr_server._compute_speaker_airtime(words)
+        # Sort: speaker_1 (2s) > speaker_0 (2s) — equal, but stable
+        # insertion order should put speaker_0 first in this case.
+        labels = [r["label"] for r in out]
+        self.assertEqual(sorted(labels), ["speaker_0", "speaker_1"])
+        seconds = {r["label"]: r["seconds"] for r in out}
+        self.assertAlmostEqual(seconds["speaker_0"], 2.0)
+        self.assertAlmostEqual(seconds["speaker_1"], 2.0)
+        # Percentages sum to 100% across speakers.
+        percs = sum(r["percent"] for r in out)
+        self.assertAlmostEqual(percs, 1.0)
+        # Mean confidence: speaker_0 is (0.9 + 0.8) / 2 = 0.85.
+        confs = {r["label"]: r["mean_confidence"] for r in out}
+        self.assertAlmostEqual(confs["speaker_0"], 0.85)
+        self.assertAlmostEqual(confs["speaker_1"], 0.6)
+
+    def test_no_confidence_field_means_none_mean_confidence(self):
+        words = [
+            {"speaker": "speaker_0", "start": 0.0, "end": 1.0},
+            {"speaker": "speaker_0", "start": 1.0, "end": 2.0},
+        ]
+        out = asr_server._compute_speaker_airtime(words)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["mean_confidence"])
+        self.assertEqual(out[0]["word_count"], 2)
+
+    def test_word_count_per_speaker(self):
+        words = [
+            {"speaker": "a", "start": 0.0, "end": 0.5},
+            {"speaker": "a", "start": 0.5, "end": 1.0},
+            {"speaker": "b", "start": 1.0, "end": 1.5},
+        ]
+        out = asr_server._compute_speaker_airtime(words)
+        counts = {r["label"]: r["word_count"] for r in out}
+        self.assertEqual(counts, {"a": 2, "b": 1})
+
+
+class FormatAirtimeLogTests(unittest.TestCase):
+    """Compact log-line formatting used in the per-request 'done' log."""
+
+    def test_empty_returns_empty_string(self):
+        self.assertEqual(asr_server._format_airtime_log([]), "")
+        self.assertEqual(asr_server._format_airtime_log(None), "")
+
+    def test_renders_label_percent_mins_seconds(self):
+        out = asr_server._format_airtime_log([
+            {"label": "speaker_0", "seconds": 75.0,
+             "percent": 0.5, "mean_confidence": 0.8},
+            {"label": "speaker_1", "seconds": 75.0,
+             "percent": 0.5, "mean_confidence": None},
+        ])
+        self.assertIn("speaker_0=50%", out)
+        self.assertIn("(1m 15s, 80% conf)", out)
+        # Missing confidence omits the conf chunk.
+        self.assertIn("speaker_1=50% (1m 15s)", out)
+
+
 class BuildOpenAISegmentsTests(unittest.TestCase):
     def test_empty_words_with_fallback_text_returns_single_segment(self):
         segs = asr_server._build_openai_segments([], "fallback transcript")

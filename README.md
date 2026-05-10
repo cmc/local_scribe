@@ -785,6 +785,80 @@ by default — generous enough for any plausible single-meeting recording
 while still bounding a runaway run on a 10-hour podcast. Set to `0` in
 `config.json` (or env) to remove the cap entirely.
 
+#### Speaker confidence + airtime
+
+When auto-K diarization finishes, every micro-cluster gets a per-point
+silhouette coefficient against its assigned final cluster
+(`diarization_backend._per_point_silhouette`). That scalar in [−1, 1]
+is then linearly mapped to a 0..1 *cluster-membership confidence* via
+`silhouette_to_confidence`:
+
+| silhouette | confidence | interpretation                                  |
+|-----------:|-----------:|-------------------------------------------------|
+| +1.0       | 100%       | this turn sits firmly inside its cluster        |
+| +0.5       |  75%       | well-separated; easy call                       |
+|  0.0       |  50%       | cluster boundary — could go either way          |
+| −0.5       |  25%       | likely misclassified                            |
+| −1.0       |   0%       | definitely the wrong speaker                    |
+
+The confidence is propagated end-to-end:
+
+* **diarization segments** carry `confidence` per turn
+* **words** carry `speaker_confidence` (copied from the turn they fall in)
+* **char_persist** writes them into `local_scribe.diarization.word_confidences`
+  as a parallel array indexed by word position (Char's word schema is
+  strict so we don't add a field to it directly)
+* **inspector UI** shows `Speaker N (87%)` next to each paragraph and
+  tints the percentage muted-red below 50%, amber 50–80%, green ≥80%
+* **`/transcript.txt`** download includes the percentage inline:
+  `speaker_0 (87%): hello world.`
+
+Per-session **speaker airtime** is computed by
+`asr_server._compute_speaker_airtime` and embedded as
+`local_scribe.diarization.speakers`:
+
+```json
+{
+  "speakers": [
+    {"label": "speaker_0", "seconds": 1820.5, "percent": 0.42,
+     "mean_confidence": 0.78, "word_count": 3214},
+    {"label": "speaker_1", "seconds": 1500.1, "percent": 0.34,
+     "mean_confidence": 0.81, "word_count": 2660},
+    {"label": "speaker_2", "seconds": 612.4,  "percent": 0.14,
+     "mean_confidence": 0.65, "word_count": 1180},
+    {"label": "speaker_3", "seconds": 440.9,  "percent": 0.10,
+     "mean_confidence": 0.61, "word_count": 850}
+  ]
+}
+```
+
+`percent` is share of *speech* time (silent gaps aren't attributed),
+so the values sum to 100% across the speakers who actually spoke.
+
+The inspector renders this as a "Speaker airtime" panel under each
+session's transcript with one bar per speaker. The same data ends up
+in the per-request server log so you can spot speaker-imbalance bugs
+without opening a UI:
+
+```
+[openai abc...] done in 71.42s (..., speakers=4), 78k chars, lang=en
+  airtime: speaker_0=42% (12m 30s, 78% conf), speaker_1=34% (10m 02s, 81% conf),
+           speaker_2=14% (4m 13s, 65% conf), speaker_3=10% (3m 02s, 61% conf)
+```
+
+If a cluster's mean confidence is in the red zone (below 50%) you've
+got a "K is technically right but one speaker is muddy" situation —
+usually two acoustically similar voices got split, or one speaker
+fragmented across two clusters. The numbers tell you to either re-run
+with `--speakers N` set to a known-good count, or accept the warning
+that *that particular speaker's lines* should be read with a grain of
+salt.
+
+The confidence field is intentionally omitted when diarization
+collapses to K=1 (single-speaker recordings + the airtime-fallback
+step-down path). With only one cluster there's no membership decision
+to be confident about, and emitting `1.0` there would be misleading.
+
 #### Transcript history (auto-backup on re-transcription)
 
 Every time `transcript.json` is overwritten — by `./run.sh redo-session`,
@@ -1233,7 +1307,7 @@ local_scribe/
 ├── config.py                # config loader (defaults <- file <- env)
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 272 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 294 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 

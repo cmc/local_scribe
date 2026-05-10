@@ -230,17 +230,26 @@ def _build_words_and_hints(
     provider: str,
     channel: int,
     speaker_for_index: Optional[list[int]] = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[Optional[float]]]:
     """Translate our internal word list into Char's
-    ``{words, speaker_hints}`` pair.
+    ``{words, speaker_hints}`` pair, plus a parallel array of per-word
+    speaker-cluster confidences.
 
     Each word becomes one entry under ``words`` with a fresh UUID id +
     ``start_ms`` / ``end_ms`` / ``text`` / ``channel``. Each word also
     spawns a parallel ``speaker_hints`` row of the
     ``provider_speaker_index`` shape Char's UI knows how to colour.
+
+    We DON'T add confidence to the word/hint structs directly because
+    Char's tinybase row schema is strict (``apps/desktop/.../tinybase/
+    persister/session/load/transcript.ts``). Instead we return a third
+    array, parallel to ``out_words`` by position, that the caller
+    stashes in ``local_scribe.diarization.word_confidences``. The
+    inspector joins them back up at render time.
     """
     out_words: list[dict[str, Any]] = []
     out_hints: list[dict[str, Any]] = []
+    out_confidences: list[Optional[float]] = []
     for i, w in enumerate(words):
         wid = str(uuid.uuid4())
         text_field = (
@@ -274,7 +283,11 @@ def _build_words_and_hints(
             ),
             "word_id": wid,
         })
-    return out_words, out_hints
+        c = w.get("speaker_confidence")
+        out_confidences.append(
+            None if c is None else round(float(c), 4)
+        )
+    return out_words, out_hints, out_confidences
 
 
 def _existing_transcript_id(session_dir: Path) -> Optional[str]:
@@ -341,13 +354,17 @@ def write_transcript_for_audio(
     if started_at_ms is None:
         started_at_ms = int(time.time() * 1000)
 
-    out_words, out_hints = _build_words_and_hints(
+    out_words, out_hints, out_confidences = _build_words_and_hints(
         words, provider=provider, channel=channel,
     )
 
     speaker_count = len({
         json.loads(h["value"]).get("speaker_index", 0) for h in out_hints
     })
+
+    # Only emit word_confidences when at least one word actually
+    # carried one — keeps the file small on diarize-skipped paths.
+    has_any_confidence = any(c is not None for c in out_confidences)
 
     payload: dict[str, Any] = {
         "transcripts": [
@@ -386,6 +403,16 @@ def write_transcript_for_audio(
     if metadata:
         for k, v in metadata.items():
             embedded_meta.setdefault(k, v)
+    # Splice the per-word confidence array into
+    # ``diarization.word_confidences`` so the inspector can join it
+    # back to ``words[]`` positionally at render time. Done after the
+    # caller's metadata merge so we don't accidentally overwrite a
+    # caller-supplied value, but before the write so the embedded
+    # block is self-contained.
+    if has_any_confidence:
+        diar = embedded_meta.setdefault("diarization", {})
+        if isinstance(diar, dict):
+            diar.setdefault("word_confidences", out_confidences)
     payload["local_scribe"] = embedded_meta
 
     # Archive the previous transcript.json (if any) BEFORE we

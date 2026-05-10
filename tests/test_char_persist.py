@@ -171,6 +171,51 @@ class WriteTranscriptTests(_Tmp):
         idx1 = json.loads(t["speaker_hints"][1]["value"])["speaker_index"]
         self.assertEqual({idx0, idx1}, {0, 1})
 
+    def test_word_confidences_threaded_into_local_scribe_metadata(self) -> None:
+        # When the ASR pipeline attaches a `speaker_confidence` to each
+        # word, char_persist should NOT add a field to Char's word
+        # schema (it's strict). Instead the confidences live in a
+        # parallel array under ``local_scribe.diarization.word_confidences``
+        # so the inspector can join them back by position.
+        audio = b"audio-conf"
+        sd = self._seed_session("ses-conf", audio)
+        upload = sd.parent.parent / "uploaded.mp3"
+        upload.write_bytes(audio)
+
+        words = [
+            {"word": "Hi", "punctuated_word": "Hi,", "start": 0.0, "end": 0.3,
+             "speaker": 0, "speaker_confidence": 0.91},
+            {"word": "world", "punctuated_word": "world.", "start": 0.3, "end": 0.8,
+             "speaker": 1, "speaker_confidence": 0.42},
+        ]
+        char_persist.write_transcript_for_audio(
+            upload, self.data_dir, words=words,
+            metadata={"diarization": {"algorithm": "auto_silhouette"}},
+        )
+        data = json.loads((sd / "transcript.json").read_text())
+        diar = data["local_scribe"]["diarization"]
+        self.assertEqual(diar["word_confidences"], [0.91, 0.42])
+        # Char's word schema must remain exactly the 5 documented fields.
+        for w in data["transcripts"][0]["words"]:
+            self.assertEqual(
+                set(w.keys()),
+                {"id", "text", "start_ms", "end_ms", "channel"},
+            )
+
+    def test_word_confidences_absent_when_no_word_has_one(self) -> None:
+        # Skip the array entirely when nothing meaningful would land
+        # in it — keeps the JSON small on diarize-skipped runs.
+        audio = b"audio-noconf"
+        sd = self._seed_session("ses-noconf", audio)
+        upload = sd.parent.parent / "uploaded.mp3"
+        upload.write_bytes(audio)
+        char_persist.write_transcript_for_audio(
+            upload, self.data_dir, words=self._basic_words(),
+        )
+        data = json.loads((sd / "transcript.json").read_text())
+        diar = data["local_scribe"].get("diarization") or {}
+        self.assertNotIn("word_confidences", diar)
+
     def test_returns_none_when_no_matching_session(self) -> None:
         self._seed_session("ses1", b"a")
         upload = Path(self._td.name) / "noaudio.mp3"

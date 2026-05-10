@@ -464,6 +464,71 @@ def _pick_k_eigengap(
     return k_chosen, eigvals.tolist()
 
 
+def _per_point_silhouette(
+    affinity: "np.ndarray", labels: "np.ndarray",
+) -> "np.ndarray":
+    """Per-point silhouette coefficients (length-n array in [−1, 1]).
+
+    Same definition as ``_silhouette_score`` but returns the *individual*
+    per-point scores instead of the mean across the dataset. Used as a
+    cluster-membership confidence signal: a point with s_i = 0.6 sits
+    much more firmly inside its cluster than a point with s_i = 0.05.
+
+    Singleton clusters (one point of that label) and singleton dataset
+    return ``s_i = 0.0`` for every point — silhouette is undefined
+    there but 0 is the canonical "no information" value.
+    """
+    import numpy as np
+
+    n = affinity.shape[0]
+    out = np.zeros(n, dtype=np.float64)
+    if n < 2:
+        return out
+    unique = np.unique(labels)
+    if len(unique) < 2:
+        return out
+
+    distance = 1.0 - np.clip(affinity, -1.0, 1.0)
+    for i in range(n):
+        own = labels[i]
+        own_mask = labels == own
+        if own_mask.sum() <= 1:
+            continue
+        own_mask = own_mask.copy()
+        own_mask[i] = False
+        a_i = float(np.mean(distance[i, own_mask]))
+
+        b_i = np.inf
+        for u in unique:
+            if u == own:
+                continue
+            other_mask = labels == u
+            if other_mask.any():
+                b_i = min(b_i, float(np.mean(distance[i, other_mask])))
+        if not np.isfinite(b_i):
+            continue
+        m = max(a_i, b_i)
+        out[i] = 0.0 if m == 0 else (b_i - a_i) / m
+    return out
+
+
+def silhouette_to_confidence(s: float) -> float:
+    """Map a silhouette coefficient in [−1, 1] to a 0..1 confidence.
+
+    Linear mapping ``(clamp(s, -1, 1) + 1) / 2`` so that
+        s = +1   ⇒ 1.00 (perfectly inside its cluster)
+        s =  0   ⇒ 0.50 (cluster boundary)
+        s = -1   ⇒ 0.00 (probably misclassified)
+
+    We chose linear over a sigmoid because users want a "how trustworthy
+    is this label" intuition; +0.3 silhouette being shown as 65% matches
+    the gut feel of "decent but not great" better than any non-linear
+    squash. Callers display this as a percentage; the underlying float
+    is retained at full precision for downstream aggregation.
+    """
+    return max(0.0, min(1.0, (max(-1.0, min(1.0, float(s))) + 1.0) / 2.0))
+
+
 def _silhouette_score(
     affinity: "np.ndarray", labels: "np.ndarray",
 ) -> float:
@@ -656,6 +721,8 @@ def _spectral_cluster(
 def _remap_segments(
     raw_segments: list[dict],
     centroid_to_label: dict[str, int],
+    *,
+    centroid_to_confidence: dict[str, float] | None = None,
 ) -> list[dict]:
     """Apply the {raw_speaker_label: int} mapping to segments and
     re-emit them in the canonical ``SPEAKER_NN`` shape.
@@ -665,13 +732,29 @@ def _remap_segments(
     neighbour by start time. We never silently drop segments — better
     to ship one mis-attributed word than to leave a hole in the
     transcript.
+
+    ``centroid_to_confidence`` (optional) maps each micro-cluster to a
+    0..1 cluster-membership confidence (derived from the silhouette
+    coefficient of the centroid in its final cluster). When supplied,
+    each output segment carries a ``confidence`` field; segments that
+    inherited a label via nearest-neighbour fill get the donor
+    micro-cluster's confidence so downstream renderers can flag both
+    the assignment AND the uncertainty introduced by the fill.
     """
     sorted_segs = sorted(raw_segments, key=lambda s: s["start"])
     labels: list[int | None] = []
+    raw_keys: list[str | None] = []
     for seg in sorted_segs:
-        labels.append(centroid_to_label.get(seg["speaker"]))
+        raw = seg.get("speaker")
+        raw_keys.append(raw)
+        labels.append(centroid_to_label.get(raw))
 
     n = len(labels)
+    confidences: list[float | None] = [
+        (centroid_to_confidence.get(k) if (centroid_to_confidence and k is not None)
+         else None)
+        for k in raw_keys
+    ]
     for i in range(n):
         if labels[i] is not None:
             continue
@@ -681,19 +764,27 @@ def _remap_segments(
             j_right = i + offset
             if j_left >= 0 and labels[j_left] is not None:
                 labels[i] = labels[j_left]
+                confidences[i] = confidences[j_left]
                 break
             if j_right < n and labels[j_right] is not None:
                 labels[i] = labels[j_right]
+                confidences[i] = confidences[j_right]
                 break
         else:
             labels[i] = 0
+            confidences[i] = None
 
-    return [
-        {"speaker": f"SPEAKER_{int(lbl):02d}",
-         "start": float(seg["start"]),
-         "end": float(seg["end"])}
-        for seg, lbl in zip(sorted_segs, labels)
-    ]
+    out = []
+    for seg, lbl, conf in zip(sorted_segs, labels, confidences):
+        item = {
+            "speaker": f"SPEAKER_{int(lbl):02d}",
+            "start": float(seg["start"]),
+            "end": float(seg["end"]),
+        }
+        if conf is not None:
+            item["confidence"] = float(conf)
+        out.append(item)
+    return out
 
 
 def diarize_auto(
@@ -823,7 +914,14 @@ def diarize_auto(
     k_attempted = k_final
     while k_attempted >= 1:
         if k_attempted == 1:
-            # All segments collapse to one speaker.
+            # All segments collapse to one speaker. We deliberately
+            # OMIT a ``confidence`` field on this path: with only one
+            # cluster there's no membership decision to be confident
+            # about, and emitting 1.0 here would mislead the user
+            # ("100% sure!" when in fact we just gave up on
+            # multi-speaker detection). The inspector treats absent
+            # confidence as "no information" and hides the per-
+            # paragraph percentage tag accordingly.
             return [
                 {"speaker": "SPEAKER_00",
                  "start": float(s["start"]), "end": float(s["end"])}
@@ -844,42 +942,81 @@ def diarize_auto(
             break
         k_attempted -= 1
 
-    # 5) Apply the {raw_speaker → final_label} mapping to segments.
-    return _remap_segments(raw_segments, centroid_to_label)
+    # 5) Per-centroid silhouette → membership confidence. This is the
+    #    "how trustworthy is this label" signal surfaced in the
+    #    transcript. We compute it on the SAME affinity matrix and
+    #    label vector spectral clustering picked, so confidence is
+    #    consistent with the clustering decision itself.
+    per_point = _per_point_silhouette(affinity, centroid_labels)
+    centroid_to_confidence = {
+        speaker_keys[i]: silhouette_to_confidence(float(per_point[i]))
+        for i in range(len(speaker_keys))
+    }
+    # Diagnostic: mean confidence per final cluster. Useful for
+    # spotting "K is right but one cluster is muddy" situations
+    # where the mean confidence on cluster B is significantly lower.
+    mean_by_label: dict[int, list[float]] = {}
+    for k, conf in centroid_to_confidence.items():
+        lbl = int(centroid_to_label[k])
+        mean_by_label.setdefault(lbl, []).append(conf)
+    log.info(
+        "%smean confidence by final cluster: %s",
+        log_id,
+        ", ".join(
+            f"SPEAKER_{lbl:02d}={(sum(v)/len(v))*100:.0f}%"
+            for lbl, v in sorted(mean_by_label.items())
+        ),
+    )
+
+    # 6) Apply the {raw_speaker → final_label} mapping to segments,
+    #    threading confidence through.
+    return _remap_segments(
+        raw_segments, centroid_to_label,
+        centroid_to_confidence=centroid_to_confidence,
+    )
 
 
 def attach_speaker_to_words(
     words: list[dict], turns: list[dict]
 ) -> list[dict]:
     """Given Deepgram-shaped `words` (each with start/end) and diarization
-    `turns` (start/end/speaker), return a new list of words with a
-    `speaker` field attached. A word is assigned to whichever turn
-    contains its midpoint; if no turn matches, the nearest turn wins."""
+    `turns` (start/end/speaker[/confidence]), return a new list of words
+    with a ``speaker`` field attached (and, when the turn carries one, a
+    ``speaker_confidence`` float in [0, 1]).
+
+    A word is assigned to whichever turn contains its midpoint; if no
+    turn matches, the nearest turn wins. The confidence comes from the
+    turn the word lands in — words from the same diarization segment
+    share a confidence, which is what we want (the cluster decision
+    was made at segment granularity, not word granularity).
+    """
     if not turns:
         return [dict(w, speaker="SPEAKER_00") for w in words]
 
     sorted_turns = sorted(turns, key=lambda t: t["start"])
 
-    def find_speaker(word_mid: float) -> str:
-        # exact-overlap fast path
+    def find_turn(word_mid: float) -> dict:
         for t in sorted_turns:
             if t["start"] <= word_mid <= t["end"]:
-                return t["speaker"]
-        # nearest-turn fallback (handles small gaps in diarization)
-        nearest = min(
+                return t
+        # Nearest-turn fallback (handles small gaps in diarization).
+        return min(
             sorted_turns,
             key=lambda t: min(
                 abs(t["start"] - word_mid), abs(t["end"] - word_mid)
             ),
         )
-        return nearest["speaker"]
 
     out = []
     for w in words:
         start = float(w.get("start", 0.0) or 0.0)
         end = float(w.get("end", start) or start)
         mid = (start + end) / 2.0
-        out.append(dict(w, speaker=find_speaker(mid)))
+        turn = find_turn(mid)
+        new = dict(w, speaker=turn["speaker"])
+        if "confidence" in turn and turn["confidence"] is not None:
+            new["speaker_confidence"] = float(turn["confidence"])
+        out.append(new)
     return out
 
 

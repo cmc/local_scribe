@@ -164,6 +164,87 @@ def _maybe_write_char_transcript(
         )
 
 
+def _compute_speaker_airtime(
+    words: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Aggregate per-speaker airtime + mean cluster confidence.
+
+    Returns a list of ``{label, seconds, percent, mean_confidence,
+    word_count}`` dicts sorted by ``seconds`` descending so the UI can
+    render them in talk-time order (largest contributor first, the
+    same ordering Otter / Granola / Otter use).
+
+    ``percent`` is share of *speech* time, not of clock time — silent
+    gaps between turns aren't allocated to any speaker, so the
+    percentages sum to 100% across the speakers who actually spoke
+    rather than to the wall-clock duration.
+
+    ``mean_confidence`` is the average of per-word
+    ``speaker_confidence`` values where available, expressed as a
+    float in [0, 1]. ``None`` when no word in that bucket carried a
+    confidence (single-speaker fallback path, or diarization
+    skipped). Inspector / transcript.txt rendering both look at this.
+    """
+    if not words:
+        return []
+    import collections
+    buckets: dict[str, dict[str, Any]] = collections.OrderedDict()
+    for w in words:
+        label = w.get("speaker") or "speaker_0"
+        start = float(w.get("start", 0.0) or 0.0)
+        end = float(w.get("end", start) or start)
+        dur = max(0.0, end - start)
+        b = buckets.setdefault(label, {
+            "label": label, "seconds": 0.0, "word_count": 0,
+            "_conf_sum": 0.0, "_conf_n": 0,
+        })
+        b["seconds"] += dur
+        b["word_count"] += 1
+        conf = w.get("speaker_confidence")
+        if conf is not None:
+            b["_conf_sum"] += float(conf)
+            b["_conf_n"] += 1
+    total_speech = sum(b["seconds"] for b in buckets.values()) or 0.0
+    out: list[dict[str, Any]] = []
+    for b in buckets.values():
+        n = b.pop("_conf_n")
+        s = b.pop("_conf_sum")
+        b["mean_confidence"] = (s / n) if n else None
+        b["percent"] = (
+            (b["seconds"] / total_speech) if total_speech > 0 else 0.0
+        )
+        b["seconds"] = round(b["seconds"], 3)
+        out.append(b)
+    out.sort(key=lambda d: d["seconds"], reverse=True)
+    return out
+
+
+def _format_airtime_log(speakers: list[dict[str, Any]] | None) -> str:
+    """Compact one-liner airtime summary appended to the per-request
+    'done' log. Empty string when there's nothing to show, so the
+    existing log shape is preserved for diarize-skipped runs.
+
+    Example output (single space prefix):
+        '  airtime: speaker_0=42% (12m 30s, 78% conf), speaker_1=58% ...'
+    """
+    if not speakers:
+        return ""
+    parts = []
+    for s in speakers:
+        secs = float(s.get("seconds") or 0.0)
+        pct = round(float(s.get("percent") or 0.0) * 100)
+        mins, rem = divmod(int(round(secs)), 60)
+        mc = s.get("mean_confidence")
+        mc_str = (
+            f", {round(float(mc) * 100)}% conf"
+            if mc is not None else ""
+        )
+        parts.append(
+            f"{s.get('label', '?')}={pct}% ({mins}m {rem:02d}s{mc_str})"
+        )
+    return "  airtime: " + ", ".join(parts)
+
+
 def _diarization_metadata(
     *,
     diarize_enabled: bool,
@@ -172,6 +253,7 @@ def _diarization_metadata(
     num_speakers_override: int | None,
     cluster_threshold_override: float | None,
     skipped_reason: str | None = None,
+    speakers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the ``local_scribe`` metadata block embedded in each
     transcript.json. Keeps a stable shape so the inspector UI can
@@ -181,6 +263,10 @@ def _diarization_metadata(
       * ``manual_ahc``  -- explicit num_speakers or cluster_threshold
       * ``auto_silhouette`` -- default ``diarize_auto`` path
       * ``skipped``     -- diarization globally off, audio over cap, or empty words
+
+    ``speakers`` is the per-label airtime + confidence aggregate from
+    ``_compute_speaker_airtime``. Surfaces in the inspector's
+    Transcript airtime panel.
     """
     if not diarize_enabled or skipped_reason:
         algorithm = "skipped"
@@ -201,6 +287,7 @@ def _diarization_metadata(
             "num_speakers_override": num_speakers_override,
             "cluster_threshold_override": cluster_threshold_override,
             "skipped_reason": skipped_reason,
+            "speakers": speakers or [],
         },
     }
 
@@ -1148,6 +1235,7 @@ async def _stream_openai_transcription(
         elif not words:
             skipped_reason = "empty_words"
 
+        speakers_agg = _compute_speaker_airtime(words)
         diar_meta = _diarization_metadata(
             diarize_enabled=do_diarize,
             duration=duration,
@@ -1155,6 +1243,7 @@ async def _stream_openai_transcription(
             num_speakers_override=num_speakers_override,
             cluster_threshold_override=cluster_threshold_override,
             skipped_reason=skipped_reason,
+            speakers=speakers_agg,
         )
 
         # Sidecar-write transcript.json into Char's session dir BEFORE
@@ -1171,9 +1260,10 @@ async def _stream_openai_transcription(
         elapsed = time.time() - started
         logger.info(
             "[openai %s] stream done in %.2fs (asr=%.2fs, diar=%.2fs, "
-            "speakers=%d), %d chars, lang=%s",
+            "speakers=%d), %d chars, lang=%s%s",
             request_id, elapsed, asr_done, max(0.0, elapsed - asr_done),
             num_speakers, len(transcript or ""), lang,
+            _format_airtime_log(speakers_agg),
         )
 
         yield _sse({
@@ -1370,6 +1460,7 @@ async def openai_audio_transcriptions(request: Request):
             elif not words:
                 skipped_reason = "empty_words"
 
+        speakers_agg = _compute_speaker_airtime(words)
         diar_meta = _diarization_metadata(
             diarize_enabled=diar_enabled,
             duration=duration,
@@ -1377,6 +1468,7 @@ async def openai_audio_transcriptions(request: Request):
             num_speakers_override=num_speakers_override,
             cluster_threshold_override=cluster_threshold_override,
             skipped_reason=skipped_reason,
+            speakers=speakers_agg,
         )
 
         # Mirror the streaming path's sidecar write: ensures the
@@ -1394,9 +1486,10 @@ async def openai_audio_transcriptions(request: Request):
     if num_speakers:
         logger.info(
             "[openai %s] done in %.2fs (asr=%.2fs, diar=%.2fs, "
-            "speakers=%d), %d chars, lang=%s, format=%s",
+            "speakers=%d), %d chars, lang=%s, format=%s%s",
             request_id, elapsed, asr_done, elapsed - asr_done,
             num_speakers, len(transcript or ""), lang, response_format,
+            _format_airtime_log(speakers_agg),
         )
     else:
         logger.info(

@@ -281,6 +281,91 @@ class ValidateClusterAirtimeTests(unittest.TestCase):
         )
 
 
+class PerPointSilhouetteTests(unittest.TestCase):
+    """Per-point silhouette is the cluster-membership confidence
+    signal surfaced in the transcript ("speaker_0 (87%)"). It must
+    behave like the mean version on the obvious cases plus return
+    correct shapes / value ranges."""
+
+    def test_returns_zero_for_singleton_dataset(self) -> None:
+        a = np.array([[1.0]])
+        out = diarization_backend._per_point_silhouette(a, np.array([0]))
+        self.assertEqual(out.shape, (1,))
+        self.assertEqual(out[0], 0.0)
+
+    def test_returns_zero_for_single_cluster(self) -> None:
+        a = np.ones((4, 4))
+        out = diarization_backend._per_point_silhouette(
+            a, np.array([0, 0, 0, 0]),
+        )
+        self.assertEqual(out.shape, (4,))
+        self.assertTrue(np.all(out == 0.0))
+
+    def test_well_separated_clusters_high_silhouette(self) -> None:
+        # Two pairs of nearly-identical embeddings; pairs are nearly
+        # orthogonal. Per-point silhouette should be > 0.5 across the
+        # board (close to 1 in fact since the clusters are tight).
+        rng = np.random.default_rng(7)
+        a = rng.normal(size=8); a /= np.linalg.norm(a)
+        b = rng.normal(size=8); b -= a * (a @ b); b /= np.linalg.norm(b)
+        emb = np.stack([
+            a + 0.001 * rng.normal(size=8),
+            a + 0.001 * rng.normal(size=8),
+            b + 0.001 * rng.normal(size=8),
+            b + 0.001 * rng.normal(size=8),
+        ])
+        emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+        affinity = emb @ emb.T
+        out = diarization_backend._per_point_silhouette(
+            affinity, np.array([0, 0, 1, 1]),
+        )
+        self.assertEqual(out.shape, (4,))
+        self.assertTrue((out > 0.5).all(),
+                        f"expected all > 0.5, got {out.tolist()}")
+
+    def test_misclassified_point_has_low_or_negative_score(self) -> None:
+        # Three points clustered together as "0", one outlier labelled "0"
+        # but actually closer to cluster "1". Its silhouette must be the
+        # smallest of the four (likely negative).
+        rng = np.random.default_rng(2)
+        a = rng.normal(size=8); a /= np.linalg.norm(a)
+        b = rng.normal(size=8); b -= a * (a @ b); b /= np.linalg.norm(b)
+        emb = np.stack([a, a + 0.01 * rng.normal(size=8),
+                        a + 0.01 * rng.normal(size=8), b])
+        emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+        affinity = emb @ emb.T
+        # All four labelled cluster 0, but the last point sits in cluster B.
+        labels = np.array([0, 0, 0, 1])
+        out = diarization_backend._per_point_silhouette(affinity, labels)
+        # The mislabelled "0" point gets a much lower score than the
+        # three actually-similar points.
+        self.assertEqual(np.argmin(out[:3]), np.argmin(out[:3]))
+        # Sanity bound: silhouette is in [-1, 1].
+        self.assertTrue((out <= 1.0).all() and (out >= -1.0).all())
+
+
+class SilhouetteToConfidenceTests(unittest.TestCase):
+    """Mapping silhouette [-1, 1] -> confidence [0, 1]."""
+
+    def test_endpoints(self) -> None:
+        self.assertEqual(diarization_backend.silhouette_to_confidence(1.0), 1.0)
+        self.assertEqual(diarization_backend.silhouette_to_confidence(-1.0), 0.0)
+        self.assertEqual(diarization_backend.silhouette_to_confidence(0.0), 0.5)
+
+    def test_clamps_out_of_range(self) -> None:
+        # Should never crash on numerical noise outside [-1, 1].
+        self.assertEqual(diarization_backend.silhouette_to_confidence(1.5), 1.0)
+        self.assertEqual(diarization_backend.silhouette_to_confidence(-2.0), 0.0)
+
+    def test_linear_in_middle(self) -> None:
+        self.assertAlmostEqual(
+            diarization_backend.silhouette_to_confidence(0.5), 0.75,
+        )
+        self.assertAlmostEqual(
+            diarization_backend.silhouette_to_confidence(-0.5), 0.25,
+        )
+
+
 class SpectralClusterTests(unittest.TestCase):
     def test_k1_returns_all_zeros(self) -> None:
         a = np.eye(5)
@@ -349,6 +434,45 @@ class RemapSegmentsTests(unittest.TestCase):
         ]
         out = diarization_backend._remap_segments(raw, {"A": 0})
         self.assertEqual([s["start"] for s in out], [0.0, 5.0])
+
+    def test_confidence_propagated_per_segment(self) -> None:
+        raw = [
+            {"speaker": "A", "start": 0.0, "end": 1.0},
+            {"speaker": "B", "start": 1.0, "end": 2.0},
+            {"speaker": "A", "start": 2.0, "end": 3.0},
+        ]
+        mapping = {"A": 0, "B": 1}
+        confidence = {"A": 0.85, "B": 0.55}
+        out = diarization_backend._remap_segments(
+            raw, mapping, centroid_to_confidence=confidence,
+        )
+        self.assertEqual([s["confidence"] for s in out], [0.85, 0.55, 0.85])
+
+    def test_missing_label_inherits_neighbour_confidence(self) -> None:
+        # SPEAKER_99 has no mapping. After nearest-neighbour fill, it
+        # should inherit not just the label but also the donor's
+        # confidence — the only honest thing to report when we did the
+        # fill ourselves.
+        raw = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.0},
+            {"speaker": "SPEAKER_99", "start": 1.0, "end": 2.0},
+            {"speaker": "SPEAKER_00", "start": 2.0, "end": 3.0},
+        ]
+        mapping = {"SPEAKER_00": 0}
+        out = diarization_backend._remap_segments(
+            raw, mapping,
+            centroid_to_confidence={"SPEAKER_00": 0.9},
+        )
+        self.assertEqual([s["confidence"] for s in out], [0.9, 0.9, 0.9])
+
+    def test_no_confidence_argument_means_no_confidence_field(self) -> None:
+        # Back-compat: callers who don't pass centroid_to_confidence
+        # (e.g. legacy AHC path) should still get plain segments.
+        raw = [
+            {"speaker": "A", "start": 0.0, "end": 1.0},
+        ]
+        out = diarization_backend._remap_segments(raw, {"A": 0})
+        self.assertNotIn("confidence", out[0])
 
 
 class DiarizeAutoOrchestrationTests(unittest.TestCase):

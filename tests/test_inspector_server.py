@@ -159,6 +159,111 @@ class SessionsTests(unittest.TestCase):
             self.assertIn("Bob:", r.text)
 
 
+class TranscriptConfidenceAndAirtimeTests(unittest.TestCase):
+    """``local_scribe.diarization.word_confidences`` + ``.speakers``
+    flow through the flatten step and surface in both /api/sessions/
+    {id} and /transcript.txt."""
+
+    def _seed(self, data_dir: Path, session_id: str, *,
+              word_confidences=None, speakers=None) -> None:
+        p = data_dir / "sessions" / session_id
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "_meta.json").write_text(json.dumps({
+            "id": session_id, "title": "Conf test",
+            "created_at": "2026-05-09T22:00:00.000Z",
+        }))
+        (p / "audio.mp3").write_bytes(b"x" * 10)
+        body = {
+            "transcripts": [{
+                "id": "t1", "session_id": session_id,
+                "words": [
+                    {"id": "w1", "text": "hello", "start": 0.0, "end": 0.5},
+                    {"id": "w2", "text": "world", "start": 0.5, "end": 1.0},
+                    {"id": "w3", "text": "again", "start": 1.0, "end": 1.5},
+                ],
+                "speaker_hints": [
+                    {"id": "h1", "type": "name", "value": "Alice", "word_id": "w1"},
+                    {"id": "h2", "type": "name", "value": "Alice", "word_id": "w2"},
+                    {"id": "h3", "type": "name", "value": "Bob", "word_id": "w3"},
+                ],
+            }],
+        }
+        diar = {}
+        if word_confidences is not None:
+            diar["word_confidences"] = word_confidences
+        if speakers is not None:
+            diar["speakers"] = speakers
+        if diar:
+            body["local_scribe"] = {"diarization": diar}
+        (p / "transcript.json").write_text(json.dumps(body))
+
+    def test_paragraph_confidence_is_mean_of_word_confidences(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed(data_dir, "s1",
+                       word_confidences=[0.9, 0.7, 0.4],
+                       speakers=[
+                           {"label": "Alice", "seconds": 1.0, "percent": 0.667,
+                            "mean_confidence": 0.8},
+                           {"label": "Bob", "seconds": 0.5, "percent": 0.333,
+                            "mean_confidence": 0.4},
+                       ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            data = client.get("/api/sessions/s1").json()
+            paragraphs = data["transcript"]["paragraphs"]
+            # Two paragraphs: Alice (mean of 0.9 and 0.7 = 0.8), Bob (0.4).
+            self.assertEqual(len(paragraphs), 2)
+            self.assertAlmostEqual(paragraphs[0]["confidence"], 0.8, places=6)
+            self.assertAlmostEqual(paragraphs[1]["confidence"], 0.4, places=6)
+            speakers = data["transcript"]["speakers"]
+            self.assertEqual(len(speakers), 2)
+            self.assertEqual(speakers[0]["label"], "Alice")
+
+    def test_paragraph_confidence_is_none_when_array_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed(data_dir, "s1")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            data = client.get("/api/sessions/s1").json()
+            for p in data["transcript"]["paragraphs"]:
+                self.assertIsNone(p["confidence"])
+            self.assertEqual(data["transcript"]["speakers"], [])
+
+    def test_transcript_txt_renders_confidence_and_airtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed(data_dir, "s1",
+                       word_confidences=[0.9, 0.9, 0.4],
+                       speakers=[
+                           {"label": "Alice", "seconds": 1.0, "percent": 0.667,
+                            "mean_confidence": 0.9},
+                           {"label": "Bob", "seconds": 0.5, "percent": 0.333,
+                            "mean_confidence": 0.4},
+                       ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            text = client.get("/api/sessions/s1/transcript.txt").text
+            # Speaker-prefixed lines now include "(NN%)".
+            self.assertIn("Alice (90%): hello world", text)
+            self.assertIn("Bob (40%): again", text)
+            # Trailing airtime block.
+            self.assertIn("--- Speaker airtime ---", text)
+            self.assertIn("Alice: 0m 01s", text)
+            self.assertIn("(67%)", text)
+            self.assertIn("90% mean confidence", text)
+
+    def test_transcript_txt_omits_airtime_when_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed(data_dir, "s1")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            text = client.get("/api/sessions/s1/transcript.txt").text
+            self.assertNotIn("--- Speaker airtime ---", text)
+
+
 class TranscriptHistoryEndpointTests(unittest.TestCase):
     """Endpoint tests for the new /api/sessions/{id}/history surface."""
 
