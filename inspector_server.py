@@ -586,6 +586,36 @@ def create_app(cfg: Config | None = None, *,
             filename=f"{session_id}.mp3",
         )
 
+    @app.delete("/api/sessions/{session_id}/audio")
+    async def session_audio_delete(session_id: str) -> dict[str, Any]:
+        """Permanently remove a session's ``audio.mp3``. Surfaced via
+        the inspector's typed-DELETE confirmation modal (the UI never
+        calls this without the user spelling out the word DELETE in
+        the prompt), but the server still treats it as a destructive
+        operation that's gated only by the inspector's bearer-token
+        middleware -- there's no soft-delete or trash, the file goes
+        away at the filesystem layer.
+        Idempotent: 404 when the file doesn't exist so the UI can
+        recover gracefully from a double-click race."""
+        path = _session_dir(cfg, session_id) / "audio.mp3"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="audio not found")
+        try:
+            bytes_removed = path.stat().st_size
+        except OSError:
+            bytes_removed = 0
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"unlink failed: {exc}",
+            ) from exc
+        return {
+            "deleted": "audio.mp3",
+            "session_id": session_id,
+            "bytes_removed": bytes_removed,
+        }
+
     @app.get("/api/sessions/{session_id}/history")
     async def session_history(session_id: str) -> dict[str, Any]:
         """List archived transcripts for a session, newest first.
@@ -921,9 +951,53 @@ th { color: var(--fg-dim); font-weight: 500; font-size: 0.85rem; }
 .error-block { color: var(--err); padding: 0.5rem; }
 audio { width: 100%; }
 code { background: var(--card); padding: 0.05rem 0.3rem; border-radius: 4px; }
+/* Typed-DELETE confirmation modal. Used for both archive-transcript
+   and audio deletions -- both are irreversible on disk so the UI
+   forces the user to type the literal word ``DELETE`` before the
+   confirm button enables. ``.modal`` is the dimmed full-viewport
+   backdrop, ``.modal-card`` is the centred dialog. */
+.modal {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+  display: none; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.modal.open { display: flex; }
+.modal-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 1.25rem; min-width: 26rem;
+  max-width: 36rem; box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+}
+.modal-card h3 { margin: 0 0 0.5rem; color: var(--err); font-size: 1rem; }
+.modal-card p  { margin: 0.3rem 0 0.6rem; }
+.modal-card code { background: var(--bg); color: var(--err); font-weight: 600; }
+.modal-card input[type=text] { margin-top: 0.4rem; }
+.modal-card .row { justify-content: flex-end; margin-top: 0.9rem; }
+.modal-card .btn.danger[disabled] {
+  opacity: 0.45; cursor: not-allowed;
+}
 </style>
 </head>
 <body>
+<!-- Typed-DELETE confirmation modal. Hidden by default; opened from
+     JS by ``confirmTypedDelete(title, description)`` which resolves
+     to true only after the user types the literal word ``DELETE``
+     and clicks Delete. Reused for archive-transcript and audio
+     deletions, both of which permanently remove bytes from disk. -->
+<div id="confirm-modal" class="modal" role="dialog" aria-modal="true"
+     aria-labelledby="confirm-modal-title"
+     aria-describedby="confirm-modal-desc">
+  <div class="modal-card">
+    <h3 id="confirm-modal-title">Confirm deletion</h3>
+    <p id="confirm-modal-desc"></p>
+    <p>Type <code>DELETE</code> to confirm. This cannot be undone.</p>
+    <input id="confirm-modal-input" type="text" autocomplete="off"
+           spellcheck="false" placeholder="DELETE" />
+    <div class="row">
+      <button id="confirm-modal-cancel" class="btn ghost">Cancel</button>
+      <button id="confirm-modal-ok"     class="btn danger" disabled>Delete</button>
+    </div>
+  </div>
+</div>
 <header>
   <h1>local_scribe <small>inspector</small></h1>
   <nav>
@@ -1089,10 +1163,16 @@ async function loadSessions() {
           <a class="btn ghost" href="/api/sessions/${s.id}/audio" download>Download audio</a>
           <a class="btn ghost" href="/api/sessions/${s.id}/transcript.txt"
              download="transcript-${escapeHtml(s.id)}.txt">Download transcript</a>
+          ${s.has_audio ? `<button class="btn ghost" data-audio-del="${escapeHtml(s.id)}">Delete audio</button>` : ''}
           <span class="meta" style="margin-left:auto">${escapeHtml(s.id)}</span>
         </div>`;
-      card.querySelector('button.btn').addEventListener('click',
+      card.querySelector('button.btn[data-id]').addEventListener('click',
         () => openSession(s.id));
+      const delAudio = card.querySelector('button[data-audio-del]');
+      if (delAudio) {
+        delAudio.addEventListener('click',
+          () => deleteSessionAudio(s.id, delAudio));
+      }
       list.appendChild(card);
     });
   } catch (e) {
@@ -1116,7 +1196,12 @@ async function openSession(id) {
       <div class="meta">${escapeHtml(s.id)} · ${fmtTs(s.meta.created_at)}</div>`;
     if (s.has_audio) {
       html += `<audio controls preload="metadata"
-        src="/api/sessions/${id}/audio"></audio>`;
+        src="/api/sessions/${id}/audio"></audio>
+        <div class="row" style="margin-top:0.3rem">
+          <a class="btn ghost" href="/api/sessions/${id}/audio" download>Download audio</a>
+          <button class="btn ghost" id="detail-del-audio"
+                  data-audio-del="${escapeHtml(id)}">Delete audio</button>
+        </div>`;
     }
     if (s.transcript && s.transcript.paragraphs && s.transcript.paragraphs.length) {
       html += '<h4>Transcript</h4><div class="transcript">';
@@ -1148,6 +1233,11 @@ async function openSession(id) {
     detail.innerHTML = html;
     $('#close-session').addEventListener('click', () => detail.style.display = 'none');
     wireHistoryButtons(id);
+    const detailDel = document.getElementById('detail-del-audio');
+    if (detailDel) {
+      detailDel.addEventListener('click',
+        () => deleteSessionAudio(id, detailDel));
+    }
     detail.scrollIntoView({behavior: 'smooth', block: 'start'});
   } catch (e) {
     detail.innerHTML = '<div class="error-block">'
@@ -1273,6 +1363,62 @@ function renderHistorySection(sessionId, hist) {
   return h;
 }
 
+function confirmTypedDelete(title, description) {
+  // Promise-based two-step confirmation modal: user must type the
+  // literal word ``DELETE`` (case-sensitive) before the danger button
+  // enables. Returns a Promise<boolean> -- ``true`` on confirmation,
+  // ``false`` on cancel / Escape / backdrop click.
+  //
+  // The modal nodes live in index.html (single instance reused for
+  // every prompt). On open we set the title/description, clear the
+  // input, hook the listeners; on resolution we tear them all back
+  // out so subsequent opens start clean and we don't leak listeners.
+  return new Promise(resolve => {
+    const modal = document.getElementById('confirm-modal');
+    const titleEl = document.getElementById('confirm-modal-title');
+    const descEl = document.getElementById('confirm-modal-desc');
+    const input  = document.getElementById('confirm-modal-input');
+    const cancel = document.getElementById('confirm-modal-cancel');
+    const ok     = document.getElementById('confirm-modal-ok');
+    titleEl.textContent = title || 'Confirm deletion';
+    descEl.textContent  = description || '';
+    input.value = '';
+    ok.disabled = true;
+
+    function close(result) {
+      modal.classList.remove('open');
+      input.removeEventListener('input', onInput);
+      input.removeEventListener('keydown', onKey);
+      cancel.removeEventListener('click', onCancel);
+      ok.removeEventListener('click', onOk);
+      modal.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onEsc);
+      resolve(result);
+    }
+    function onInput() { ok.disabled = (input.value !== 'DELETE'); }
+    function onKey(ev) {
+      if (ev.key === 'Enter' && !ok.disabled) { ev.preventDefault(); close(true); }
+    }
+    function onCancel() { close(false); }
+    function onOk()     { if (!ok.disabled) close(true); }
+    function onBackdrop(ev) { if (ev.target === modal) close(false); }
+    function onEsc(ev) { if (ev.key === 'Escape') close(false); }
+
+    input.addEventListener('input', onInput);
+    input.addEventListener('keydown', onKey);
+    cancel.addEventListener('click', onCancel);
+    ok.addEventListener('click', onOk);
+    modal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onEsc);
+
+    modal.classList.add('open');
+    // setTimeout 0 so the dialog is painted before the input
+    // grabs focus -- some browsers swallow .focus() on a node
+    // that just flipped from display:none.
+    setTimeout(() => input.focus(), 0);
+  });
+}
+
 function wireHistoryButtons(sessionId) {
   // Single delegated click handler -- cheaper than per-button listeners
   // and works after the DOM is mounted by innerHTML above.
@@ -1282,9 +1428,11 @@ function wireHistoryButtons(sessionId) {
     const btn = ev.target.closest('button[data-history-del]');
     if (!btn) return;
     const fname = btn.getAttribute('data-history-del');
-    if (!confirm('Delete archived transcript "' + fname + '"? This cannot be undone.')) {
-      return;
-    }
+    const okToDelete = await confirmTypedDelete(
+      'Delete archived transcript?',
+      'About to permanently delete the archive "' + fname + '".'
+    );
+    if (!okToDelete) return;
     btn.disabled = true;
     btn.textContent = 'deleting…';
     try {
@@ -1301,6 +1449,35 @@ function wireHistoryButtons(sessionId) {
       alert('Delete failed: ' + e.message);
     }
   });
+}
+
+async function deleteSessionAudio(sessionId, btn) {
+  // Typed-DELETE gated audio deletion. Called from the session-card
+  // ``Delete audio`` button. Idempotent on the wire (server returns
+  // 404 when the file is already gone, which we surface as a soft
+  // success because the UI's intent has been satisfied).
+  const okToDelete = await confirmTypedDelete(
+    'Delete audio recording?',
+    'About to permanently delete the audio.mp3 for session '
+    + sessionId + '. The transcript and notes are kept.'
+  );
+  if (!okToDelete) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'deleting…'; }
+  try {
+    const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId)
+                            + '/audio', {method: 'DELETE'});
+    if (!res.ok && res.status !== 404) throw new Error('HTTP ' + res.status);
+    // Refresh the session list (audio badge flips to "no audio") and
+    // re-open the detail panel if it's currently showing this session.
+    loadSessions();
+    const detail = document.getElementById('session-detail');
+    if (detail && detail.style.display !== 'none') {
+      openSession(sessionId);
+    }
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Delete audio'; }
+    alert('Delete failed: ' + e.message);
+  }
 }
 
 function escapeHtml(s) {

@@ -322,6 +322,100 @@ class TranscriptConfidenceAndAirtimeTests(unittest.TestCase):
             self.assertNotIn("--- Speaker airtime ---", text)
 
 
+class AudioDeleteEndpointTests(unittest.TestCase):
+    """``DELETE /api/sessions/{id}/audio`` permanently removes the
+    audio.mp3 file. The inspector UI gates this behind a typed-DELETE
+    confirmation modal, but on the wire it's a plain DELETE -- this
+    suite covers the bytes-on-disk side of the contract."""
+
+    def test_delete_audio_removes_file_and_returns_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = _seed_session(data_dir / "sessions", "del-aud")
+            audio_path = sd / "audio.mp3"
+            self.assertTrue(audio_path.is_file())
+            size_before = audio_path.stat().st_size
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.delete("/api/sessions/del-aud/audio")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertEqual(body["deleted"], "audio.mp3")
+            self.assertEqual(body["session_id"], "del-aud")
+            self.assertEqual(body["bytes_removed"], size_before)
+            self.assertFalse(audio_path.exists())
+
+    def test_delete_audio_404_when_missing(self):
+        # Second DELETE of the same audio (or a session that never had
+        # one) returns 404; the UI treats this as a soft success.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "del-aud", with_audio=False)
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.delete("/api/sessions/del-aud/audio")
+            self.assertEqual(r.status_code, 404)
+            # And the 404 path must NOT touch unrelated session files.
+            sd = data_dir / "sessions" / "del-aud"
+            self.assertTrue((sd / "transcript.json").is_file())
+            self.assertTrue((sd / "_meta.json").is_file())
+
+    def test_delete_audio_does_not_remove_transcript_or_notes(self):
+        # Transcript + notes belong to the session even after the audio
+        # has been wiped; verify we don't accidentally cascade.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = _seed_session(data_dir / "sessions", "del-aud")
+            (sd / "notes" / "n1.md").parent.mkdir(parents=True, exist_ok=True)
+            (sd / "notes" / "n1.md").write_text("keep me")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.delete("/api/sessions/del-aud/audio")
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue((sd / "transcript.json").is_file())
+            self.assertTrue((sd / "notes" / "n1.md").is_file())
+
+    def test_sessions_list_reflects_audio_removal(self):
+        # After the audio is gone the per-session aggregate must flip
+        # ``has_audio`` to false so the card hides the Delete-audio
+        # button on the next refresh.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "del-aud")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            before = client.get("/api/sessions").json()["sessions"][0]
+            self.assertTrue(before["has_audio"])
+            client.delete("/api/sessions/del-aud/audio").raise_for_status()
+            after = client.get("/api/sessions").json()["sessions"][0]
+            self.assertFalse(after["has_audio"])
+
+
+class ConfirmModalUITests(unittest.TestCase):
+    """The typed-DELETE confirmation flow lives client-side, but the
+    server must serve the modal DOM and the helper JS for it. These
+    smoke tests guard against accidental removal of either."""
+
+    def test_index_html_contains_confirm_modal_skeleton(self):
+        # Render the index page and assert the modal markup + helper
+        # function name are both present. Cheap regression net for
+        # someone refactoring _INDEX_HTML.
+        from inspector_server import _INDEX_HTML
+        # Modal skeleton (id used by confirmTypedDelete).
+        self.assertIn('id="confirm-modal"', _INDEX_HTML)
+        self.assertIn('id="confirm-modal-input"', _INDEX_HTML)
+        self.assertIn('id="confirm-modal-ok"', _INDEX_HTML)
+        # The user-facing instruction must remain literal "DELETE" --
+        # the click handler compares against the exact uppercase
+        # string, so a copy that says "delete" would silently lock
+        # users out.
+        self.assertIn('Type <code>DELETE</code>', _INDEX_HTML)
+        # JS helpers wiring it all up.
+        self.assertIn('function confirmTypedDelete(', _INDEX_HTML)
+        self.assertIn("input.value !== 'DELETE'", _INDEX_HTML)
+        self.assertIn('async function deleteSessionAudio(', _INDEX_HTML)
+
+
 class TranscriptDownloadHeadersTests(unittest.TestCase):
     """Both the live transcript.txt endpoint and the per-archive
     history transcript.txt endpoint must send a
