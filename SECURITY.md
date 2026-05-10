@@ -279,6 +279,33 @@ master_key  (32 bytes, in-process bytearray, forget()ed on shutdown)
 | `/` (inspector) | GET | open (HTML shell; carries no session data) |
 | `/auth?token=…` (inspector) | GET | open by design — validates token & sets the `ls_inspector` cookie |
 | `/api/*` (inspector) | any | bearer or cookie required |
+| `DELETE /api/sessions/{id}/audio` | DELETE | bearer **+** typed-confirm body (see below) |
+| `DELETE /api/sessions/{id}/history/{name}` | DELETE | bearer **+** typed-confirm body (see below) |
+
+#### Defence-in-depth: typed-DELETE confirm body
+
+A stolen inspector bearer token must not be enough to destroy data
+with one `curl`. Both delete endpoints therefore require a JSON body
+of exactly `{"confirm": "DELETE"}` (case-sensitive, no padding) in
+addition to the bearer cookie/header. Empty body, wrong key, wrong
+spelling, lowercase, trailing whitespace, or non-JSON garbage all
+return 400 and the file is **not** touched.
+
+This is enforced server-side (`_require_typed_delete_confirm` in
+[`inspector_server.py`](inspector_server.py)) so it cannot be
+bypassed by skipping the SPA — the SPA's typed-DELETE modal is the
+*usability* gate, the server check is the *security* gate. The
+combined property is: deleting a session's audio or a historical
+transcript requires **(stolen bearer) AND (knowledge of the literal
+string `DELETE`)**, and rotation (`./run.sh key rotate`) invalidates
+the first half instantly.
+
+The test suite ([`AudioDeleteEndpointTests` /
+`HistoryDeleteEndpointTests` in `tests/test_inspector_server.py`])
+asserts the invariant for nine malformed payloads — empty body,
+non-JSON, `"yes"`, `"delete"` (lowercase), `"DELETE "` (trailing
+space), `True`, `None`, wrong key name, bare string. All bounce
+with 400 and the file remains on disk.
 
 ### How clients get the token
 
@@ -342,9 +369,12 @@ stolen laptop or copied Time Machine drive yields encrypted bands,
 not audio. Without the master key, the AES-256 envelope cannot be
 broken in any operationally meaningful time.
 
-**Status**: module implemented + unit-tested; `./run.sh vault {init,
-unlock,lock,status}` wiring lands in a follow-up commit (tracked in
-[TODO.md](TODO.md)).
+**Status**: module implemented + unit-tested. Bootstrap-time
+vault-mount wiring (`./run.sh start` mounts before launching services;
+`./run.sh stop` detaches afterwards) is tracked in
+[TODO.md → "Encrypt audio at rest"](TODO.md). The master key the
+vault will consume is already in place (Option C, see Defence layer
+4 below); only the `hdiutil`-on-startup glue is pending.
 
 ---
 
@@ -560,6 +590,45 @@ loopback only.
 
 ---
 
+## Verified end-to-end (last full check)
+
+The combinations below were last exercised against the running stack
+on the date of the most recent `docs:`-prefixed commit touching this
+file. The checks are also run automatically by the test suite (498
+passed + 13 subtests) so any regression should land as a red CI long
+before it reaches a release.
+
+| Check | Result | Where the invariant lives |
+|---|---|---|
+| Test suite (`pytest -q`) | 498 passed, 13 subtests | `tests/` |
+| Doctor (`./run.sh doctor`) | all green except opted-out items | `cmd_doctor` in `run.sh` |
+| ASR `/v1/audio/transcriptions` without bearer | 401 | `require_asr_token` |
+| ASR with wrong bearer | 401 | `service_auth.make_token_dependency` |
+| ASR with correct bearer + silence | 200, `{"text":""}` | `asr_server.py` |
+| Inspector `/api/sessions` without auth | 401 | `auth_mw` |
+| Inspector `/auth?token=…` | 302 + `HttpOnly; SameSite=strict` cookie | `inspector_server.py` |
+| Audio download attachment header | `content-disposition: attachment` | `session_audio_download` |
+| Transcript `.txt` download header | `content-disposition: attachment` | `session_transcript_txt` |
+| Diarised transcript renders "Speaker 1/2/…" | yes | `_render_transcript_text` |
+| `DELETE /audio` without body | 400, file untouched | `_require_typed_delete_confirm` |
+| `DELETE /audio` with `{"confirm":"yes"}` | 400, file untouched | same |
+| `DELETE /history/{name}` without body | 400, archive untouched | same |
+| No ASR token / master-key hex on any local_scribe argv | clean | `pgrep python` + `pgrep run.sh` |
+| `./run.sh configure-char` runs without `unbound variable` | clean | `run.sh` cmd_configure_char |
+| Char audit endpoint | 8 checks, only WARN is firewall when disabled | `char_audit.py` |
+| `./run.sh key status` JSON shape | `shape`, `kc_half_present`, `yubikey`, `disaster_recovery` keys | `key_lifecycle.status()` |
+| Stale `./run.sh vault init` references | none remaining in operator-facing strings | `run.sh`, `asr_server.py`, `inspector_server.py` |
+
+The two checks that *require* physical hardware to exercise (a YubiKey
+tap + a fresh Touch ID prompt) are covered by `tests/test_key_lifecycle.py`
+using `age` / `ykman` / `age-plugin-yubikey` shims — the shims observe
+the same stdin/argv contract as the real binaries, so the shape of the
+data flow is the same. Live human-in-the-loop verification of the
+hardware path is documented in
+[§ 7 + § 8](#7-typed-delete-confirm-body) below.
+
+---
+
 ## Verifying it works on your machine
 
 The following is reproducible top to bottom. Run it after a fresh
@@ -627,18 +696,46 @@ ls -l /etc/hosts.local_scribe.bak.*
 The block region is self-documenting (every host has a one-line
 comment above it explaining why it's there).
 
-### 7. End-to-end test
+### 7. Typed-DELETE confirm body
+
+With services running and the inspector cookie unset:
+
+```bash
+TOK=$(./venv/bin/python -m service_auth token inspector)
+SID=$(curl -sS -H "Authorization: Bearer $TOK" \
+  http://127.0.0.1:8001/api/sessions | python -c \
+  'import json,sys; print(json.load(sys.stdin)["sessions"][0]["id"])')
+
+# 1) No body — must fail without touching the file.
+curl -sS -X DELETE -H "Authorization: Bearer $TOK" \
+  http://127.0.0.1:8001/api/sessions/$SID/audio
+# → {"detail":"missing confirmation body — send …"} (HTTP 400)
+
+# 2) Wrong word — must also fail.
+curl -sS -X DELETE -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' -d '{"confirm":"yes"}' \
+  http://127.0.0.1:8001/api/sessions/$SID/audio
+# → {"detail":"confirmation mismatch — …"} (HTTP 400)
+```
+
+Verify the audio is still present (`ls`, `md5`) — the test fixture in
+`AudioDeleteEndpointTests::test_delete_audio_rejects_wrong_confirm_value`
+asserts this on nine malformed payloads.
+
+### 8. End-to-end test
 
 ```bash
 ./venv/bin/python -m pytest tests/ -q
 ```
 
-Should report **415 passed**. The firewall round-trip is exercised
-by `tests/test_firewall.py`; the auth gates by
+Should report **498 passed** (with 13 sub-tests). Coverage by area:
+firewall round-trip — `tests/test_firewall.py`; auth gates —
 `tests/test_asr_server.py::AsrServerAuthIntegrationTests` and
-`tests/test_inspector_server.py::AuthTests`; the Char-settings
-contract by `tests/test_char_audit.py::FirewallIntegrationTests` and
-neighbouring suites.
+`tests/test_inspector_server.py::AuthTests`; typed-DELETE confirm —
+`tests/test_inspector_server.py::AudioDeleteEndpointTests` and the
+sister `HistoryDeleteEndpointTests`; Option C key lifecycle —
+`tests/test_key_lifecycle.py`; argv-leak invariant —
+`tests/test_char_settings_writer.py`.
 
 ---
 

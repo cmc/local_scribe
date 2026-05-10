@@ -1216,31 +1216,41 @@ flowchart LR
 
 ## 30. Key rotation flow
 
-`./run.sh vault rotate` (forward-looking — see TODO.md): when a
-Touch ID phish is suspected or a token leak has been observed,
-rotating the master key invalidates every derived bearer token in
-one shot. The sparse-bundle keybag is re-encrypted (O(few KB), not
-O(disk)); Char is reconfigured and the services restarted.
+`./run.sh key rotate`: when a Touch ID phish is suspected or a token
+leak has been observed, rotating the master key invalidates every
+derived bearer token in one shot. The mounted-vault keybag will be
+re-encrypted by the future `hdiutil chpass`-on-rotate wiring (O(few
+KB), not O(disk)); Char is reconfigured and the services restarted.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor U as User
     participant Rs as run.sh
-    participant SS as secret_store
+    participant KL as key_lifecycle
+    participant SS as secret_store (kc_half)
+    participant YK as yubikey_backup (yk_half)
     participant SA as service_auth
     participant V as vault.py
     participant Char as Char.app
 
-    U->>Rs: ./run.sh vault rotate
-    Rs->>SS: load_master_key() (Touch ID)
-    SS-->>Rs: old_key
-    Rs->>SS: generate_master_key()
-    SS-->>Rs: new_key
-    Rs->>V: rotate_password(old_key, new_key)
-    V->>V: hdiutil chpass -stdinpass -newstdinpass<br/>(stdin payload: old\nnew\nnew\n)
-    V-->>Rs: ok
-    Rs->>SS: store_master_key(new_key)
+    U->>Rs: ./run.sh key rotate
+    Rs->>KL: rotate_master_key()
+    KL->>SS: load kc_half (Touch ID)
+    KL->>YK: load yk_half (YubiKey tap)
+    SS-->>KL: kc_half
+    YK-->>KL: yk_half
+    Note over KL: old_key = kc_half XOR yk_half
+    KL->>KL: new_key = random(32)
+    KL->>KL: new_kc, new_yk = split(new_key)
+    KL->>SS: store new_kc_half (Touch ID)
+    KL->>YK: re-wrap new_yk_half to all enrolled YubiKey recipients
+    KL-->>Rs: new_key
+    opt vault mounted (forward-looking — see TODO.md)
+        Rs->>V: rotate_password(old_key, new_key)
+        V->>V: hdiutil chpass -stdinpass -newstdinpass<br/>(stdin payload: old\nnew\nnew\n)
+        V-->>Rs: ok
+    end
     Rs->>SA: derive new asr / inspector tokens<br/>(HKDF on new_key)
     SA-->>Rs: new tokens
     Rs->>Char: configure-char (rewrite settings.json<br/>with new api_key)

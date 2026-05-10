@@ -656,7 +656,7 @@ except Exception as exc:  # noqa: BLE001
 
 if not present:
     print(f"  {Y}\u25cb{Z} No master key in Keychain yet")
-    print(f"      run `./run.sh vault init` to generate one")
+    print(f"      run `./run.sh key init` to generate one (Option C split-key)")
     sys.exit(0)
 
 print(f"  {G}\u25cf{Z} master key present in Keychain (service=local_scribe / account=master_key)")
@@ -1076,18 +1076,20 @@ PY
   cp "$CHAR_SETTINGS" "$settings_backup"
   printf "  settings.json backup : %s\n" "$settings_backup"
 
-  # Fetch the current ASR token from the Keychain (prompts Touch ID
-  # the FIRST time we read it this shell session; cached by the kernel
-  # for subsequent reads). This is the bearer token every request to
-  # the ASR server must carry.
+  # Fetch the current ASR token by unlocking the Option C split-key
+  # (kc_half via Touch ID + yk_half via YubiKey tap) and HKDF-deriving
+  # the per-service token from the master in memory. Both prompts may
+  # appear on first call this shell session; Keychain ACL caches the
+  # Touch ID grant for subsequent reads within the cache window.
+  # This is the bearer token every request to the ASR server must carry.
   #
   # If the Keychain item doesn't exist yet, we surface a clear hint
-  # and bail -- the user needs to run `./run.sh vault init` first.
-  printf "  Fetching ASR bearer token from Keychain (Touch ID prompt may appear) ...\n"
+  # and bail -- the user needs to run `./run.sh key init` first.
+  printf "  Deriving ASR bearer token (Touch ID + YubiKey tap may be required) ...\n"
   local asr_token
   if ! asr_token="$("$VENV_PY" -m service_auth token asr 2>&1)"; then
     say "${c_red}failed to derive ASR token: $asr_token${c_reset}"
-    say "  run \`./run.sh vault init\` to create the Keychain master key first"
+    say "  run \`./run.sh key init\` to create the Keychain master key first"
     return 1
   fi
   if [[ -z "$asr_token" ]]; then
@@ -1168,8 +1170,8 @@ PY
   printf "    current_stt_provider : openai\n"
   printf "    current_stt_model    : gpt-4o-transcribe           (progressive/SSE -- no 60s client-side timeout)\n"
   printf "    stt.openai.base_url  : http://127.0.0.1:%s/v1\n" "$ASR_PORT"
-  printf "    stt.openai.api_key   : ls_asr_%s…  (Keychain-derived; fingerprint=%s)\n" \
-         "$(printf '%s' "${asr_token#ls_asr_}" | head -c 4)" "${asr_fp:-?}"
+  printf "    stt.openai.api_key   : ls_asr_…  (Keychain-derived; fingerprint=%s)\n" \
+         "${asr_fp:-?}"
   printf "    posthog analytics    : %s\n" "$analytics_status"
   if [[ -n "$key_backup_path" ]]; then
     printf "    previous key saved   : %s\n" "$key_backup_path"

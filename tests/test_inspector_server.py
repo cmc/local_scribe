@@ -322,11 +322,15 @@ class TranscriptConfidenceAndAirtimeTests(unittest.TestCase):
             self.assertNotIn("--- Speaker airtime ---", text)
 
 
+_DELETE_CONFIRM = {"confirm": "DELETE"}
+
+
 class AudioDeleteEndpointTests(unittest.TestCase):
     """``DELETE /api/sessions/{id}/audio`` permanently removes the
-    audio.mp3 file. The inspector UI gates this behind a typed-DELETE
-    confirmation modal, but on the wire it's a plain DELETE -- this
-    suite covers the bytes-on-disk side of the contract."""
+    audio.mp3 file. The endpoint requires a typed-DELETE confirm body
+    (``{"confirm": "DELETE"}``) on the wire as a defence-in-depth
+    check that complements the SPA's modal. These tests cover both
+    the bytes-on-disk happy path and the typed-confirm gate."""
 
     def test_delete_audio_removes_file_and_returns_bytes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -337,7 +341,10 @@ class AudioDeleteEndpointTests(unittest.TestCase):
             size_before = audio_path.stat().st_size
             cfg = _make_cfg(data_dir)
             client = TestClient(inspector_server.create_app(cfg))
-            r = client.delete("/api/sessions/del-aud/audio")
+            r = client.request(
+                "DELETE", "/api/sessions/del-aud/audio",
+                json=_DELETE_CONFIRM,
+            )
             self.assertEqual(r.status_code, 200)
             body = r.json()
             self.assertEqual(body["deleted"], "audio.mp3")
@@ -353,7 +360,10 @@ class AudioDeleteEndpointTests(unittest.TestCase):
             _seed_session(data_dir / "sessions", "del-aud", with_audio=False)
             cfg = _make_cfg(data_dir)
             client = TestClient(inspector_server.create_app(cfg))
-            r = client.delete("/api/sessions/del-aud/audio")
+            r = client.request(
+                "DELETE", "/api/sessions/del-aud/audio",
+                json=_DELETE_CONFIRM,
+            )
             self.assertEqual(r.status_code, 404)
             # And the 404 path must NOT touch unrelated session files.
             sd = data_dir / "sessions" / "del-aud"
@@ -370,7 +380,10 @@ class AudioDeleteEndpointTests(unittest.TestCase):
             (sd / "notes" / "n1.md").write_text("keep me")
             cfg = _make_cfg(data_dir)
             client = TestClient(inspector_server.create_app(cfg))
-            r = client.delete("/api/sessions/del-aud/audio")
+            r = client.request(
+                "DELETE", "/api/sessions/del-aud/audio",
+                json=_DELETE_CONFIRM,
+            )
             self.assertEqual(r.status_code, 200)
             self.assertTrue((sd / "transcript.json").is_file())
             self.assertTrue((sd / "notes" / "n1.md").is_file())
@@ -386,9 +399,74 @@ class AudioDeleteEndpointTests(unittest.TestCase):
             client = TestClient(inspector_server.create_app(cfg))
             before = client.get("/api/sessions").json()["sessions"][0]
             self.assertTrue(before["has_audio"])
-            client.delete("/api/sessions/del-aud/audio").raise_for_status()
+            client.request(
+                "DELETE", "/api/sessions/del-aud/audio",
+                json=_DELETE_CONFIRM,
+            ).raise_for_status()
             after = client.get("/api/sessions").json()["sessions"][0]
             self.assertFalse(after["has_audio"])
+
+    def test_delete_audio_rejects_empty_body(self):
+        # Defence-in-depth: a bare ``curl -X DELETE`` (no body) must
+        # NOT touch the file. This is the regression that previously
+        # let a stolen inspector token destroy data by-passing the
+        # client-side modal.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = _seed_session(data_dir / "sessions", "del-aud")
+            audio_path = sd / "audio.mp3"
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.delete("/api/sessions/del-aud/audio")
+            self.assertEqual(r.status_code, 400)
+            self.assertIn("confirm", r.json()["detail"].lower())
+            self.assertTrue(audio_path.is_file(),
+                            "audio.mp3 must still exist after a rejected DELETE")
+
+    def test_delete_audio_rejects_wrong_confirm_value(self):
+        # ``{"confirm": "yes"}`` / ``{"confirm": "delete"}`` (lowercase) /
+        # any spelling variant must be rejected. The word is exact +
+        # case-sensitive so accidental autocorrect doesn't count.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = _seed_session(data_dir / "sessions", "del-aud")
+            audio_path = sd / "audio.mp3"
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            for bad in [
+                {"confirm": "yes"},
+                {"confirm": "delete"},  # lowercase
+                {"confirm": "DELETE "},  # trailing space
+                {"confirm": True},
+                {"confirm": None},
+                {"other": "DELETE"},  # right value, wrong key
+                {},
+                [],  # not even a dict
+                "DELETE",  # bare string body
+            ]:
+                with self.subTest(bad=bad):
+                    r = client.request(
+                        "DELETE", "/api/sessions/del-aud/audio", json=bad,
+                    )
+                    self.assertEqual(r.status_code, 400, msg=f"payload={bad!r}")
+                    self.assertTrue(audio_path.is_file(),
+                                    msg=f"audio destroyed on payload={bad!r}")
+
+    def test_delete_audio_rejects_non_json_body(self):
+        # Garbage / non-JSON bodies must also bounce.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = _seed_session(data_dir / "sessions", "del-aud")
+            audio_path = sd / "audio.mp3"
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.request(
+                "DELETE", "/api/sessions/del-aud/audio",
+                content=b"not-json-at-all{{{",
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(r.status_code, 400)
+            self.assertTrue(audio_path.is_file())
 
 
 class ConfirmModalUITests(unittest.TestCase):
@@ -655,10 +733,12 @@ class TranscriptHistoryEndpointTests(unittest.TestCase):
             client = TestClient(inspector_server.create_app(cfg))
             listed = client.get("/api/sessions/abc-123/history").json()
             fname = listed["entries"][0]["filename"]
-            r = client.delete(f"/api/sessions/abc-123/history/{fname}")
+            r = client.request(
+                "DELETE", f"/api/sessions/abc-123/history/{fname}",
+                json=_DELETE_CONFIRM,
+            )
             self.assertEqual(r.status_code, 200)
             self.assertEqual(r.json()["deleted"], fname)
-            # Disk-level check.
             self.assertFalse((sd / ".local_scribe_history" / fname).exists())
 
     def test_history_file_delete_404_when_missing(self):
@@ -667,7 +747,10 @@ class TranscriptHistoryEndpointTests(unittest.TestCase):
             _seed_session(data_dir / "sessions", "abc-123")
             cfg = _make_cfg(data_dir)
             client = TestClient(inspector_server.create_app(cfg))
-            r = client.delete("/api/sessions/abc-123/history/no-such.json")
+            r = client.request(
+                "DELETE", "/api/sessions/abc-123/history/no-such.json",
+                json=_DELETE_CONFIRM,
+            )
             self.assertEqual(r.status_code, 404)
 
     def test_history_file_delete_rejects_traversal(self):
@@ -681,10 +764,59 @@ class TranscriptHistoryEndpointTests(unittest.TestCase):
             # /history collection), so the meaningful traversal cases
             # are filenames that contain ".." as a substring.
             for bad in ["..foo.json", "....json", "foo..json"]:
-                r = client.delete(f"/api/sessions/abc-123/history/{bad}")
+                r = client.request(
+                    "DELETE", f"/api/sessions/abc-123/history/{bad}",
+                    json=_DELETE_CONFIRM,
+                )
                 self.assertEqual(
                     r.status_code, 400, f"{bad} -> {r.status_code}",
                 )
+
+    def test_history_file_delete_rejects_empty_body(self):
+        # Defence-in-depth: typed-DELETE confirm body is required.
+        # A bare ``curl -X DELETE`` (no body) must NOT remove the archive.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = self._seed_with_history(data_dir, "abc-123", archives=[
+                {"transcripts": [], "local_scribe": {"asr_model": "x"}},
+            ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            listed = client.get("/api/sessions/abc-123/history").json()
+            fname = listed["entries"][0]["filename"]
+            r = client.delete(f"/api/sessions/abc-123/history/{fname}")
+            self.assertEqual(r.status_code, 400)
+            self.assertTrue(
+                (sd / ".local_scribe_history" / fname).exists(),
+                "archive must still exist after a rejected DELETE",
+            )
+
+    def test_history_file_delete_rejects_wrong_confirm_value(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = self._seed_with_history(data_dir, "abc-123", archives=[
+                {"transcripts": [], "local_scribe": {"asr_model": "x"}},
+            ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            listed = client.get("/api/sessions/abc-123/history").json()
+            fname = listed["entries"][0]["filename"]
+            for bad in [
+                {"confirm": "yes"},
+                {"confirm": "delete"},
+                {"confirm": "DELETE "},
+                {},
+            ]:
+                with self.subTest(bad=bad):
+                    r = client.request(
+                        "DELETE", f"/api/sessions/abc-123/history/{fname}",
+                        json=bad,
+                    )
+                    self.assertEqual(r.status_code, 400)
+                    self.assertTrue(
+                        (sd / ".local_scribe_history" / fname).exists(),
+                        msg=f"archive destroyed on payload={bad!r}",
+                    )
 
 
 class ConfigEndpointTests(unittest.TestCase):

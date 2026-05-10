@@ -3,10 +3,14 @@
 Design summary
 --------------
 
-When the user runs ``./run.sh vault init`` (or implicitly on bootstrap):
+Forward-looking design (this module is implemented + unit-tested but
+the ``./run.sh start`` wiring that mounts the vault on demand is still
+pending — see TODO.md → "Encrypt audio at rest"):
 
-1.  A 256-bit master key is generated and stored in the Keychain
-    (see ``secret_store.py``).
+1.  The 256-bit master key is the Option C split-key reconstituted via
+    ``key_lifecycle.unlock_master_key()`` -- ``kc_half`` from Keychain
+    (Touch ID) XOR ``yk_half`` from an age-encrypted file (YubiKey tap).
+    See ``key_lifecycle.py`` and ``key_split.py``.
 2.  An AES-256 sparse bundle is created via ``hdiutil`` at
     ``~/Library/Application Support/local_scribe-vault.sparsebundle``.
     The sparse-bundle format only consumes disk space as data is written,
@@ -15,10 +19,11 @@ When the user runs ``./run.sh vault init`` (or implicitly on bootstrap):
     is moved *into* the mounted vault and replaced with a symlink. Char
     -- a Tauri app that uses bog-standard Foundation FS APIs -- follows
     symlinks transparently, so it never knows anything happened.
-4.  ``./run.sh vault lock`` runs ``hdiutil detach`` and the disk goes
-    back to looking like an opaque encrypted blob. ``./run.sh vault
-    unlock`` (or implicitly on ``./run.sh start``) prompts Touch ID,
-    pulls the key from the Keychain, and remounts.
+4.  Locking calls ``hdiutil detach``; unlocking calls ``key_lifecycle.
+    unlock_master_key()`` (Touch ID + YubiKey tap) then ``hdiutil
+    attach -stdinpass``. The password is piped in via stdin so it
+    never appears on argv -- mirroring the same defence as
+    ``char_settings_writer``.
 
 Why a sparse bundle rather than per-file encryption:
     A FUSE/userspace overlay would be far more invasive and require code
@@ -298,7 +303,9 @@ def mount(password: bytes) -> Path:
     mount path. Idempotent: returns immediately if already mounted."""
     if not exists():
         raise VaultMissingError(
-            f"no vault at {_paths.bundle} (run `./run.sh vault init`)"
+            f"no vault at {_paths.bundle} (call vault.create() first; "
+            "the operator-facing `./run.sh start` wiring that creates "
+            "the sparse bundle on demand is still pending — see TODO.md)"
         )
     if is_mounted():
         logger.info("vault already mounted at %s; no-op", _paths.mount)
@@ -374,7 +381,7 @@ def unmount() -> None:
 def rotate_password(old_password: bytes, new_password: bytes) -> None:
     """Re-encrypt the bundle's keybag with a new password. The data
     itself isn't re-encrypted (that would be O(disk)); only the keybag
-    (~few KB) is. Used when the user re-runs ``./run.sh vault init`` or
+    (~few KB) is. Used when the user runs ``./run.sh key rotate`` or
     rotates a YubiKey backup.
 
     ``hdiutil chpass`` *requires* the bundle to be unmounted, so we

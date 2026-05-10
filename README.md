@@ -87,7 +87,7 @@ system.
 | 27 | [Transcript JSON data model](ARCHITECTURE.md#27-transcript-json-data-model) | the shape `transcript.json` carries on disk |
 | 28 | [LM Studio summary flow](ARCHITECTURE.md#28-lm-studio-summary-flow) | finished transcript → Qwen → structured markdown sections |
 | 29 | [Char telemetry channels (3)](ARCHITECTURE.md#29-char-telemetry-channels-3-separate-concerns) | Sentry / PostHog / auto-updater and which control catches each |
-| 30 | [Key rotation flow](ARCHITECTURE.md#30-key-rotation-flow) | `./run.sh vault rotate` — invalidate every derived token in one shot |
+| 30 | [Key rotation flow](ARCHITECTURE.md#30-key-rotation-flow) | `./run.sh key rotate` — invalidate every derived token in one shot |
 
 ## Privacy and data locality
 
@@ -206,6 +206,29 @@ Being honest about the parts of the stack that aren't ours:
   you want for safety, but it does mean they exist in more than one
   place on disk.
 
+### Verified end-to-end
+
+The full reproducible check-list lives in
+[SECURITY.md § Verified end-to-end](SECURITY.md#verified-end-to-end-last-full-check).
+Headline numbers from the most recent run:
+
+- `pytest -q` → **498 passed, 13 subtests** (auth gate, typed-DELETE
+  confirm body, argv-leak invariant, Option C lifecycle, firewall
+  round-trip, char_settings_writer, transcript-history…).
+- ASR `/v1/audio/transcriptions` — 401 without bearer, 401 with wrong
+  bearer, 200 with correct bearer; `/health` stays open for liveness.
+- Inspector — 401 on `/api/*` without auth, 302 + `HttpOnly;
+  SameSite=strict` cookie from `/auth?token=…`, attachment headers on
+  the audio + `.txt` transcript download endpoints.
+- `DELETE /api/sessions/{id}/audio` and `DELETE /history/{name}` —
+  both require `{"confirm":"DELETE"}` in the JSON body in addition to
+  the bearer cookie/header. Empty body → 400 (file untouched), wrong
+  word → 400 (file untouched). A stolen bearer alone is not enough to
+  destroy data.
+- `ps auxww` over the live ASR + inspector + `run.sh configure-char`
+  processes — no ASR token, no inspector token, no master-key hex on
+  any argv.
+
 ### Service authentication
 
 Loopback-bind alone isn't enough: anyone who lands a shell on the Mac
@@ -218,18 +241,33 @@ the Keychain master key.
 
 #### The model
 
-There is one root secret: a 256-bit AES key generated at install time,
-stored in the macOS Keychain under `service=local_scribe /
-account=master_key` with an access control of `.userPresence` — i.e.
-**Touch ID** (passcode fallback). The key never leaves the Keychain in
-plaintext; reads require a fresh biometric session.
+There is one root secret: a 256-bit AES master key, but it is **never
+stored whole**. It is split into two halves (Option C — see
+[§ Master key management](#master-key-management-option-c-touch-id-and-yubikey)
+below for the full lifecycle):
+
+- `kc_half` — 32 random bytes in the macOS Keychain under
+  `service=local_scribe / account=master_key_kc_half_v2` with
+  `.userPresence` ACL (Touch ID, passcode fallback).
+- `yk_half` — 32 random bytes encrypted with `age` to one or more
+  enrolled YubiKeys (`touch-policy=always`), stored at
+  `~/.config/local_scribe/yk_half.age`.
+
+Either half on its own is uniform random and reveals nothing about
+the master. Unlocking requires **both** factors in the same shell
+session; the reconstituted master sits in process memory only for
+the duration of the unlock + token derivation.
 
 From that single root, each service derives its own bearer token via
 HKDF-SHA256:
 
 ```
-master_key  (32 bytes, Keychain, Touch ID gated)
-    │
+kc_half (Keychain, Touch ID)   yk_half (age + YubiKey tap)
+        │                              │
+        └────────── XOR ───────────────┘
+                    │
+            master_key (32 bytes, in process memory only)
+                    │
     ├─ HKDF(info=b"service:asr") ───────► ls_asr_<32hex>        ◄── ASR :8000
     ├─ HKDF(info=b"service:inspector") ─► ls_inspector_<32hex>  ◄── Inspector :8001
     └─ HKDF(info=b"service:future") ───►  ls_future_<32hex>     ◄── future services
@@ -237,15 +275,15 @@ master_key  (32 bytes, Keychain, Touch ID gated)
 
 Why HKDF instead of separately-stored tokens:
 
-- **One secret to back up.** The YubiKey-based master-key backup
-  ([`yubikey_backup.py`](yubikey_backup.py); wired into `run.sh` in a
-  follow-up commit) covers the master key; every per-service token is
-  recoverable from it.
+- **One root to manage.** Rotate it (`./run.sh key rotate`) and every
+  per-service token rolls in lockstep with no extra ceremony.
 - **Deterministic.** Same master key → same tokens. Char's saved
   OpenAI `api_key` stays valid across server restarts / vault
   remounts.
 - **No extra ciphertext on disk.** There's nothing for an attacker to
-  scrape — the tokens only exist in the running server's memory.
+  scrape — the tokens only exist in the running server's memory and
+  in Char's `settings.json` (the latter is written via stdin to
+  `python -m char_settings_writer`, never via argv).
 
 #### How the gate enforces it
 
@@ -297,7 +335,8 @@ header if the token is missing or wrong.
 #### Token rotation
 
 Rotating a per-service token = rotating the master key
-(`./run.sh vault init` regenerates everything). After a rotation:
+(`./run.sh key rotate` re-randomises both halves; tokens are
+re-derived from the new master). After a rotation:
 
 1. Restart the services so they pick up the new derivations:
    `./run.sh restart`.

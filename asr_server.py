@@ -439,7 +439,8 @@ async def _lifespan(app: FastAPI):
                     "service_auth: failed to unlock master key for ASR "
                     "service: %s — set LOCAL_SCRIBE_DISABLE_AUTH=1 to "
                     "start without auth (NOT recommended), or run "
-                    "`./run.sh vault init` to create the Keychain item.",
+                    "`./run.sh key init` to generate the Option C "
+                    "split-key (Touch ID + YubiKey).",
                     exc,
                 )
                 raise

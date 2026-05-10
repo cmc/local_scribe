@@ -201,6 +201,49 @@ def _session_dir(cfg: Config, session_id: str) -> Path:
     return path
 
 
+_DELETE_CONFIRM_WORD = "DELETE"
+
+
+async def _require_typed_delete_confirm(request: Request) -> None:
+    """Enforce that a destructive ``DELETE`` request carries
+    ``{"confirm": "DELETE"}`` in its JSON body. Raises ``HTTPException
+    400`` otherwise.
+
+    This is a defence-in-depth check that complements the SPA's
+    typed-DELETE modal: a stolen inspector bearer token replayed via
+    ``curl -X DELETE /api/sessions/.../audio`` will *not* destroy data
+    because the body check fails before the unlink. See
+    ``SECURITY.md`` Defence layer 2 + ``CHAR_REVIEW.md`` § Mitigations.
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f'missing confirmation body — send '
+                f'{{"confirm": "{_DELETE_CONFIRM_WORD}"}} to confirm '
+                f'destructive deletion'
+            ),
+        )
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid JSON body: {exc}",
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("confirm") != _DELETE_CONFIRM_WORD
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f'confirmation mismatch — body must be exactly '
+                f'{{"confirm": "{_DELETE_CONFIRM_WORD}"}}'
+            ),
+        )
+
+
 _PRETTY_SPEAKER_RE = re.compile(r"^speaker_(\d+)$", re.IGNORECASE)
 
 
@@ -433,7 +476,9 @@ def create_app(cfg: Config | None = None, *,
                 logger.error(
                     "inspector auth: failed to unlock master key: %s — "
                     "set LOCAL_SCRIBE_DISABLE_AUTH=1 to start without auth "
-                    "(NOT recommended), or run `./run.sh vault init`.", exc,
+                    "(NOT recommended), or run `./run.sh key init` to "
+                    "generate the Option C split-key (Touch ID + YubiKey).",
+                    exc,
                 )
                 raise
             holder = _holder_cell["v"]
@@ -587,16 +632,27 @@ def create_app(cfg: Config | None = None, *,
         )
 
     @app.delete("/api/sessions/{session_id}/audio")
-    async def session_audio_delete(session_id: str) -> dict[str, Any]:
-        """Permanently remove a session's ``audio.mp3``. Surfaced via
-        the inspector's typed-DELETE confirmation modal (the UI never
-        calls this without the user spelling out the word DELETE in
-        the prompt), but the server still treats it as a destructive
-        operation that's gated only by the inspector's bearer-token
-        middleware -- there's no soft-delete or trash, the file goes
-        away at the filesystem layer.
+    async def session_audio_delete(
+        session_id: str, request: Request,
+    ) -> dict[str, Any]:
+        """Permanently remove a session's ``audio.mp3``.
+
+        The destructive operation is gated by *two* independent checks:
+
+        1.  The inspector's bearer-token middleware (an attacker without
+            the token gets 401 before reaching this handler).
+        2.  A typed-DELETE confirm body — the request *must* carry
+            ``{"confirm": "DELETE"}`` (JSON, case-sensitive). The
+            modal that pops in the SPA enforces typing the word on
+            the client; this server-side check makes a stolen-token
+            ``curl -X DELETE`` no longer enough on its own. Both
+            sides are needed to match the threat model in
+            SECURITY.md (Defence layer 2 + the "typed confirmation"
+            invariant in CHAR_REVIEW.md).
+
         Idempotent: 404 when the file doesn't exist so the UI can
         recover gracefully from a double-click race."""
+        await _require_typed_delete_confirm(request)
         path = _session_dir(cfg, session_id) / "audio.mp3"
         if not path.is_file():
             raise HTTPException(status_code=404, detail="audio not found")
@@ -650,10 +706,15 @@ def create_app(cfg: Config | None = None, *,
         return JSONResponse(content=json.loads(data.decode("utf-8")))
 
     @app.delete("/api/sessions/{session_id}/history/{filename}")
-    async def session_history_delete(session_id: str, filename: str) -> dict[str, Any]:
+    async def session_history_delete(
+        session_id: str, filename: str, request: Request,
+    ) -> dict[str, Any]:
         """Delete one archived transcript. Idempotent: 404 if it's
-        already gone. Loopback-only on the same trust model as the
-        rest of the inspector."""
+        already gone. Gated by the same typed-DELETE confirm body as
+        ``session_audio_delete`` -- request *must* carry
+        ``{"confirm": "DELETE"}`` (JSON), so a stolen-token
+        ``curl -X DELETE`` alone won't suffice. See SECURITY.md."""
+        await _require_typed_delete_confirm(request)
         path = _session_dir(cfg, session_id)
         if not transcript_history.is_safe_filename(filename):
             raise HTTPException(status_code=400, detail="invalid filename")
@@ -1438,7 +1499,9 @@ function wireHistoryButtons(sessionId) {
     try {
       const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId)
                               + '/history/' + encodeURIComponent(fname),
-                              {method: 'DELETE'});
+                              {method: 'DELETE',
+                               headers: {'Content-Type': 'application/json'},
+                               body: JSON.stringify({confirm: 'DELETE'})});
       if (!res.ok) throw new Error('HTTP ' + res.status);
       // Re-open the session so the badge / list refresh and any
       // pagination updates show. Simpler than surgical DOM removal.
@@ -1465,7 +1528,10 @@ async function deleteSessionAudio(sessionId, btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'deleting…'; }
   try {
     const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId)
-                            + '/audio', {method: 'DELETE'});
+                            + '/audio',
+                            {method: 'DELETE',
+                             headers: {'Content-Type': 'application/json'},
+                             body: JSON.stringify({confirm: 'DELETE'})});
     if (!res.ok && res.status !== 404) throw new Error('HTTP ' + res.status);
     // Refresh the session list (audio badge flips to "no audio") and
     // re-open the detail panel if it's currently showing this session.
