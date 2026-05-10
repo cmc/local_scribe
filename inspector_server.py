@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,28 @@ def _session_dir(cfg: Config, session_id: str) -> Path:
     if not path.is_dir():
         raise HTTPException(status_code=404, detail="session not found")
     return path
+
+
+_PRETTY_SPEAKER_RE = re.compile(r"^speaker_(\d+)$", re.IGNORECASE)
+
+
+def _pretty_speaker(label: Any) -> str:
+    """Map the backend's ``speaker_0`` / ``speaker_1`` labels to the
+    more readable ``Speaker 1`` / ``Speaker 2`` form (1-indexed). Anything
+    that doesn't match the pattern (already-renamed names, empty
+    strings, ``None``) is passed through with a sensible fallback so
+    this is safe to call from any rendering path.
+
+    Mirrors the JS ``prettySpeaker`` helper in the inspector HTML so
+    the web UI and ``transcript.txt`` download agree label-for-label.
+    """
+    if not label:
+        return "Speaker"
+    s = str(label)
+    m = _PRETTY_SPEAKER_RE.match(s)
+    if not m:
+        return s
+    return f"Speaker {int(m.group(1)) + 1}"
 
 
 def _flatten_transcript(raw: dict[str, Any]) -> dict[str, Any]:
@@ -400,17 +423,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="transcript JSON malformed")
         lines = []
         for p in payload.get("paragraphs", []):
-            sp = p.get("speaker") or "Speaker"
-            # Inline confidence next to the speaker label so this txt
-            # file matches what the inspector + Char show. Skipped when
-            # diarization didn't produce confidence values (legacy
-            # archives, ``--no-diarize`` runs).
-            conf = p.get("confidence")
-            label = (
-                f"{sp} ({round(float(conf) * 100)}%)"
-                if conf is not None else sp
+            # Pretty-print "speaker_0" -> "Speaker 1". No inline
+            # confidence here — the user explicitly wanted the
+            # transcript body to read cleanly; confidence shows up
+            # in the airtime footer below instead.
+            lines.append(
+                f"{_pretty_speaker(p.get('speaker'))}: {p.get('text', '')}"
             )
-            lines.append(f"{label}: {p.get('text', '')}")
         body = "\n\n".join(lines)
         # Trailing airtime summary so a downloaded ``.txt`` is
         # standalone — no need to open the inspector to interpret it.
@@ -427,8 +446,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 )
                 mins, rem = divmod(int(round(secs)), 60)
                 body += (
-                    f"{s.get('label', '?')}: {mins}m {rem:02d}s "
-                    f"({pct}%){mc_str}\n"
+                    f"{_pretty_speaker(s.get('label'))}: "
+                    f"{mins}m {rem:02d}s ({pct}%){mc_str}\n"
                 )
         return PlainTextResponse(body)
 
@@ -869,22 +888,11 @@ async function openSession(id) {
     if (s.transcript && s.transcript.paragraphs && s.transcript.paragraphs.length) {
       html += '<h4>Transcript</h4><div class="transcript">';
       s.transcript.paragraphs.forEach(p => {
-        // Per-paragraph mean speaker-cluster confidence in [0..1].
-        // We surface it next to the speaker name when available so
-        // the user knows which paragraphs the model is unsure about.
-        // The colour tints muted -> red below 50% so low-confidence
-        // attributions are visually obvious without needing to read
-        // every number. Above 80% gets a green tint to confirm "yep,
-        // we're confident this is speaker X".
-        let confTag = '';
-        if (p.confidence != null) {
-          const pct = Math.round(p.confidence * 100);
-          const tone = pct < 50 ? 'low' : (pct >= 80 ? 'high' : 'mid');
-          confTag = ` <span class="conf conf-${tone}" `
-                  + `title="cluster-membership confidence (silhouette-based, `
-                  + `0% = misclassified, 100% = perfectly inside its cluster)">${pct}%</span>`;
-        }
-        html += `<p><span class="speaker">${escapeHtml(p.speaker || 'Speaker')}:</span>${confTag}
+        // Pretty-print "speaker_0" -> "Speaker 1" for readability.
+        // The confidence number is intentionally NOT shown inline —
+        // it added visual noise per paragraph; the same data is
+        // surfaced once per speaker in the airtime panel below.
+        html += `<p><span class="speaker">${escapeHtml(prettySpeaker(p.speaker))}:</span>
                  ${escapeHtml(p.text)}
                  <span class="meta"> ${fmtDuration(p.start)}</span></p>`;
       });
@@ -914,6 +922,20 @@ async function openSession(id) {
   }
 }
 
+function prettySpeaker(label) {
+  // Map the backend's "speaker_0", "speaker_1" labels to the more
+  // readable "Speaker 1", "Speaker 2" form. 1-indexed because that's
+  // what a non-engineer reading the transcript expects to see.
+  //
+  // Anything that doesn't match the pattern (e.g. already-renamed
+  // "Alice", a literal "?", or an empty string) is passed through
+  // unchanged so this is safe to call on every paragraph blindly.
+  if (!label) return 'Speaker';
+  const m = String(label).match(/^speaker_(\d+)$/i);
+  if (!m) return label;
+  return 'Speaker ' + (parseInt(m[1], 10) + 1);
+}
+
 function renderSpeakerAirtime(speakers) {
   // Per-session airtime panel: one row per speaker with the talk-time
   // bar + percentage + raw seconds + mean confidence. ``speakers`` is
@@ -936,8 +958,9 @@ function renderSpeakerAirtime(speakers) {
                   + `title="mean speaker-cluster confidence across this speaker's words">`
                   + `${cp}%</span>`;
     }
+    const pretty = prettySpeaker(s.label || '?');
     h += `<div class="row-spk">
-      <div class="label" title="${escapeHtml(s.label || '?')}">${escapeHtml(s.label || '?')}</div>
+      <div class="label" title="${escapeHtml(s.label || '?')}">${escapeHtml(pretty)}</div>
       <div class="bar"><span style="width:${pct}%"></span></div>
       <div class="time">${pct}% · ${fmtDuration(s.seconds || 0)}</div>
       ${confDisplay}

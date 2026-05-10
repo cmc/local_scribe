@@ -231,7 +231,10 @@ class TranscriptConfidenceAndAirtimeTests(unittest.TestCase):
                 self.assertIsNone(p["confidence"])
             self.assertEqual(data["transcript"]["speakers"], [])
 
-    def test_transcript_txt_renders_confidence_and_airtime(self):
+    def test_transcript_txt_renders_clean_labels_plus_airtime(self):
+        # User explicitly asked for the body to be readable -- the
+        # transcript lines must NOT carry an inline (NN%) tag; the
+        # confidence number lives in the airtime block at the bottom.
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
             self._seed(data_dir, "s1",
@@ -245,14 +248,68 @@ class TranscriptConfidenceAndAirtimeTests(unittest.TestCase):
             cfg = _make_cfg(data_dir)
             client = TestClient(inspector_server.create_app(cfg))
             text = client.get("/api/sessions/s1/transcript.txt").text
-            # Speaker-prefixed lines now include "(NN%)".
-            self.assertIn("Alice (90%): hello world", text)
-            self.assertIn("Bob (40%): again", text)
-            # Trailing airtime block.
+            # Already-named speakers (Alice, Bob) pass through; backend
+            # "speaker_N" labels would be rewritten to "Speaker N+1".
+            self.assertIn("Alice: hello world", text)
+            self.assertIn("Bob: again", text)
+            # No inline percentage tag in the body.
+            self.assertNotIn("Alice (90%)", text)
+            self.assertNotIn("Bob (40%)", text)
+            # Trailing airtime block still carries the metric.
             self.assertIn("--- Speaker airtime ---", text)
             self.assertIn("Alice: 0m 01s", text)
             self.assertIn("(67%)", text)
             self.assertIn("90% mean confidence", text)
+
+    def test_pretty_speaker_relabels_backend_indices(self):
+        # speaker_0 -> "Speaker 1", speaker_1 -> "Speaker 2".
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            # Use real Char-style hints so the flatten path produces
+            # the backend label "speaker_0" etc., which the renderer
+            # rewrites for display.
+            p = data_dir / "sessions" / "s2"
+            p.mkdir(parents=True)
+            (p / "_meta.json").write_text(json.dumps({
+                "id": "s2", "title": "indexed", "created_at": "2026-05-09T00:00:00.000Z",
+            }))
+            (p / "audio.mp3").write_bytes(b"x")
+            (p / "transcript.json").write_text(json.dumps({
+                "transcripts": [{
+                    "id": "t1", "session_id": "s2",
+                    "words": [
+                        {"id": "w1", "text": "hi", "start": 0.0, "end": 0.5},
+                        {"id": "w2", "text": "yo", "start": 0.5, "end": 1.0},
+                    ],
+                    "speaker_hints": [
+                        {"id": "h1", "type": "provider_speaker_index",
+                         "value": '{"provider":"openai","channel":0,"speaker_index":0}',
+                         "word_id": "w1"},
+                        {"id": "h2", "type": "provider_speaker_index",
+                         "value": '{"provider":"openai","channel":0,"speaker_index":1}',
+                         "word_id": "w2"},
+                    ],
+                }],
+                "local_scribe": {"diarization": {
+                    "speakers": [
+                        {"label": "speaker_0", "seconds": 0.5, "percent": 0.5,
+                         "mean_confidence": 0.8},
+                        {"label": "speaker_1", "seconds": 0.5, "percent": 0.5,
+                         "mean_confidence": 0.7},
+                    ],
+                }},
+            }))
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            text = client.get("/api/sessions/s2/transcript.txt").text
+            self.assertIn("Speaker 1: hi", text)
+            self.assertIn("Speaker 2: yo", text)
+            self.assertIn("Speaker 1: 0m 00s", text)
+            self.assertIn("Speaker 2: 0m 00s", text)
+            # The raw underlying labels should never leak in the
+            # rendered output.
+            self.assertNotIn("speaker_0:", text)
+            self.assertNotIn("speaker_1:", text)
 
     def test_transcript_txt_omits_airtime_when_none(self):
         with tempfile.TemporaryDirectory() as td:
