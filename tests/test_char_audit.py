@@ -12,6 +12,27 @@ from pathlib import Path
 
 import char_audit
 import config
+import firewall
+
+
+def _firewall_all_blocked_status() -> firewall.Status:
+    """Synthetic ``firewall.Status`` representing "block list installed,
+    full coverage". Used by the clean-state tests so they don't depend on
+    the host machine's /etc/hosts."""
+    expected_total = sum(
+        1 for e in firewall.BLOCK_CATALOG
+        if e.category in firewall.DEFAULT_ENABLED_CATEGORIES
+    )
+    return firewall.Status(
+        installed=True,
+        blocked_hostnames=[e.hostname for e in firewall.BLOCK_CATALOG
+                           if e.category in firewall.DEFAULT_ENABLED_CATEGORIES],
+        coverage_by_category={
+            cat: {"blocked": expected_total, "expected": expected_total}
+            for cat in sorted(firewall.DEFAULT_ENABLED_CATEGORIES)
+        },
+        missing_by_category={},
+    )
 
 
 def _make_cfg(data_dir: Path) -> config.Config:
@@ -67,13 +88,20 @@ def _write_store(path: Path, analytics_disabled: bool, last_seen: str | None = N
 
 class CleanStateTests(unittest.TestCase):
     def test_audit_all_ok_when_settings_match_expected(self):
+        from unittest import mock
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
             cfg = _make_cfg(data_dir)
             _write_settings(data_dir / "settings.json")
             _write_store(data_dir / "store.json", analytics_disabled=True,
                          last_seen="1.0.24")
-            report = char_audit.audit(cfg)
+            # Pretend the firewall block list is fully installed -- otherwise
+            # the test's idea of "clean" depends on the host machine's
+            # /etc/hosts. The firewall-specific drift assertions live in
+            # ``FirewallIntegrationTests`` below.
+            with mock.patch.object(firewall, "status",
+                                   return_value=_firewall_all_blocked_status()):
+                report = char_audit.audit(cfg)
             statuses = {c.key: c.status for c in report.checks}
             self.assertEqual(statuses["ai.current_stt_provider"], char_audit.OK)
             self.assertEqual(statuses["ai.current_stt_model"], char_audit.OK)
@@ -82,7 +110,54 @@ class CleanStateTests(unittest.TestCase):
             self.assertEqual(statuses["store.analytics.Disabled"], char_audit.OK)
             # The updater2 entry is informational (no toggle exists)
             self.assertEqual(statuses["store.updater2.LastSeenVersion"], char_audit.INFO)
+            self.assertEqual(statuses["firewall.block_list"], char_audit.OK)
             self.assertEqual(report.summary[char_audit.WARN], 0)
+
+
+class FirewallIntegrationTests(unittest.TestCase):
+    """``audit()`` should surface firewall coverage as its own check so
+    the inspector's Char Audit tab and ``./run.sh doctor`` both report
+    drift in one place."""
+
+    def _audit_with_firewall(self, fw_status):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            cfg = _make_cfg(data_dir)
+            _write_settings(data_dir / "settings.json")
+            _write_store(data_dir / "store.json", analytics_disabled=True)
+            with mock.patch.object(firewall, "status", return_value=fw_status):
+                return char_audit.audit(cfg)
+
+    def test_warns_when_block_list_not_installed(self):
+        report = self._audit_with_firewall(firewall.Status(
+            installed=False, blocked_hostnames=[],
+            coverage_by_category={}, missing_by_category={},
+        ))
+        fw_check = next(c for c in report.checks if c.key == "firewall.block_list")
+        self.assertEqual(fw_check.status, char_audit.WARN)
+        self.assertIn("./run.sh firewall enable", fw_check.note)
+
+    def test_ok_when_block_list_fully_installed(self):
+        report = self._audit_with_firewall(_firewall_all_blocked_status())
+        fw_check = next(c for c in report.checks if c.key == "firewall.block_list")
+        self.assertEqual(fw_check.status, char_audit.OK)
+
+    def test_warns_on_drift(self):
+        """Installed but the catalog has grown since enable."""
+        # Pretend the user enabled when the catalog had 18 hosts; now
+        # there's 19, so one is missing.
+        report = self._audit_with_firewall(firewall.Status(
+            installed=True,
+            blocked_hostnames=["a.example", "b.example"],
+            coverage_by_category={
+                "telemetry": {"blocked": 2, "expected": 3},
+            },
+            missing_by_category={"telemetry": ["c.example"]},
+        ))
+        fw_check = next(c for c in report.checks if c.key == "firewall.block_list")
+        self.assertEqual(fw_check.status, char_audit.WARN)
+        self.assertIn("missing", fw_check.note.lower())
 
 
 class DirtyStateTests(unittest.TestCase):

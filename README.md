@@ -127,11 +127,11 @@ Being honest about the parts of the stack that aren't ours:
   analytics enabled by default**, plus a Tauri auto-updater that polls
   `desktop2.hyprnote.com`. `./run.sh configure-char` writes the in-app
   PostHog kill-switch (`store.json::analytics.Disabled = true`); Sentry
-  and the auto-updater have **no in-app toggle** and need to be blocked
-  at the firewall or via `/etc/hosts` overrides — see
-  [§ Mitigations](CHAR_REVIEW.md#mitigations) for the exact rule set.
-  Calendar / event sync (if you connect a calendar) does talk to your
-  calendar provider — orthogonal to recordings, but worth knowing.
+  and the auto-updater have **no in-app toggle** and are blocked at the
+  network layer by the outbound-firewall feature
+  ([§ Outbound firewall](#outbound-firewall) below). Calendar / event
+  sync (if you connect a calendar) does talk to your calendar provider —
+  orthogonal to recordings, but worth knowing.
 - **`asr_server.py` currently binds to `0.0.0.0:8000`**, not
   `127.0.0.1:8000`. macOS's firewall blocks incoming connections by
   default, but if you've allowed Python through the firewall and you're
@@ -292,7 +292,85 @@ unattended bootstrap automation.
 #### Threat-model summary
 
 The full table — assets, adversaries, capabilities — lives in
-[CHAR_REVIEW.md § Threat model](CHAR_REVIEW.md#threat-model).
+[CHAR_REVIEW.md § Threat model](CHAR_REVIEW.md#threat-model), and
+the cross-layer security posture document is
+[SECURITY.md](SECURITY.md).
+
+### Outbound firewall
+
+Loopback + bearer-token auth defends our *own* services. The
+**outbound** problem is different: Char and LM Studio also have
+their own opinions about who they should phone home to. Char in
+particular has three always-on channels with no in-app toggle — its
+Sentry DSN (panic + 100%-rate tracing), the Tauri auto-updater
+(`desktop2.hyprnote.com` proxied through Scarf), and the Sentry
+browser CDN — plus a long catalog of external STT/LLM provider plugins
+(`api.openai.com`, `api.deepgram.com`, `api.anthropic.com`, …) that
+a settings drift could silently re-enable.
+
+`local_scribe` ships an opt-in `/etc/hosts` block-list manager that
+blackholes the lot. The default catalog catches every host with no
+in-app toggle, plus every external STT/LLM provider Char ships
+plugins for. Categories:
+
+| category | default | example hosts | rationale |
+|---|---|---|---|
+| `telemetry` | **on** | `o4506190168522752.ingest.us.sentry.io`, `us.i.posthog.com`, `desktop2.hyprnote.com`, `gateway.scarf.sh` | no in-app toggle exists — block at the network layer or accept the leak |
+| `providers` | **on** | `api.openai.com`, `api.deepgram.com`, `api.anthropic.com`, `api.mistral.ai`, … | fail-safe — if a settings change ever re-points STT/LLM off-loopback, the connection fails fast instead of silently exfiltrating |
+| `char_cloud` | off | `api.char.com`, `cloudsync.sqlite.ai` | Char's hosted backend for calendar OAuth + integrations. Off by default so calendar sync keeps working; opt in with `--strict` |
+
+We deliberately use `/etc/hosts` (rather than `pf` / Little Snitch /
+LuLu) because it works with no kernel extensions, no third-party
+tools, no SIP gymnastics, and is plainly auditable with
+`cat /etc/hosts`. The block region is marker-delimited so add / remove
+is non-destructive to your existing entries; every change is backed
+up to `/etc/hosts.local_scribe.bak.<timestamp>` before being applied
+atomically via `rename(2)`. Resolution uses `0.0.0.0` (IPv4) and `::`
+(IPv6) sinks so connections fail-fast (~2 ms) rather than looping
+back to whatever's listening on `127.0.0.1`.
+
+#### Operator commands
+
+```bash
+./run.sh firewall status         # is the block installed? coverage by category?
+./run.sh firewall list           # print the full host catalog (no sudo)
+./run.sh firewall enable         # install (asks for admin password)
+./run.sh firewall enable --strict # also block api.char.com (no calendar sync)
+./run.sh firewall disable        # remove (asks for admin password)
+./run.sh firewall verify         # DNS-probe every catalog host; exit 1 if any resolves
+```
+
+`./run.sh bootstrap` (step 7/7) offers to install the block list on
+first setup. `./run.sh doctor` reports installation status + per-
+category coverage and flags drift if a `local_scribe` upgrade has
+added new hosts the current install doesn't cover (re-run
+`./run.sh firewall enable` to refresh). `./run.sh firewall enable` is
+idempotent — re-applying on an already-correct file is a zero-diff
+write.
+
+#### Removal
+
+Either `./run.sh firewall disable` (clean, asks for admin password)
+or `sudo $EDITOR /etc/hosts` (delete the lines between the
+`>>> local_scribe firewall` and `<<< local_scribe firewall` markers).
+Either way the backup at `/etc/hosts.local_scribe.bak.<latest>` is
+the pre-change reference for diffs.
+
+#### What it does **not** do
+
+- Block IP literals — `/etc/hosts` only catches name resolution.
+  An app that hard-codes an IP bypasses it. Char's plugins all use
+  hostnames (verified by `strings`-sweep against the signed
+  binary).
+- Block DNS-over-HTTPS clients with their own resolver. Char doesn't
+  ship one (verified); if a future version did, we'd add the DoH
+  endpoint hostname to the catalog.
+- Restrict loopback traffic. Char ↔ `127.0.0.1:8000` (our ASR shim)
+  and our own services ↔ each other stay unaffected.
+
+Catalog source of truth: [`firewall.py`](firewall.py) →
+`BLOCK_CATALOG`. Full rationale + per-host reasons in
+[SECURITY.md § Defence layer 1](SECURITY.md#defence-layer-1--network-egress-firewall).
 
 ### Air-gap mode
 
@@ -301,11 +379,20 @@ green, you can disable Wi-Fi + Bluetooth and the pipeline keeps working
 indefinitely: live recording, batch Generate, summaries, all of it.
 Bootstrap downloads are the only network dependency.
 
+### Full security policy
+
+The cross-layer threat model — what we're defending, against whom,
+which module enforces what, and how to verify it all on your own
+machine — lives in [SECURITY.md](SECURITY.md). Read that for the
+single document covering the firewall, per-service auth, at-rest
+vault, YubiKey escrow, Char-settings enforcement, the third-party
+audit methodology, and the continuous-audit checklist.
+
 ### Future privacy work
 
-See [TODO.md](TODO.md) for planned hardening — encrypting audio +
-transcripts at rest with a Keychain-backed key, age-based auto-purge,
-a `./run.sh wipe` command, and tightening loopback-only binding.
+See [TODO.md](TODO.md) for planned hardening — wiring `vault.py` +
+`yubikey_backup.py` into `bootstrap`, an age-based auto-purge, a
+`./run.sh wipe` command, and tightening the loopback bind default.
 
 ## What's in here
 
@@ -317,7 +404,10 @@ a `./run.sh wipe` command, and tightening loopback-only binding.
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
 | `redo_session.py` | Re-runs ASR + diarization on an existing Char session and overwrites its `transcript.json` via `char_persist.py`. Used when the original Generate produced the wrong number of speakers (1:1 came back as one blob, or a long meeting over-clustered). Match by full UUID, UUID prefix, or session-title substring. Invoked via `./run.sh redo-session …`. | Per-session re-do |
 | `transcript_history.py` | Auto-archives `transcript.json` before each overwrite into `<session>/.local_scribe_history/<timestamp>_<sha7>.json`. Each archive is the previous file verbatim plus a `local_scribe` metadata block (ASR model, diarization algorithm, K, audio sha256, timestamps). The inspector exposes list/view/download/delete per archive. | Re-transcription history |
-| `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, and produce health reports. | Operator tool |
+| `firewall.py` | `/etc/hosts` block-list manager. Marker-delimited region, `0.0.0.0`/`::` sinks, idempotent installer, DNS probe. Catches Char's Sentry / PostHog / auto-updater + every external STT/LLM provider. Driven by `./run.sh firewall …`. Full rationale in [SECURITY.md](SECURITY.md). | Outbound egress control |
+| `service_auth.py` | HKDF-SHA256 per-service bearer tokens derived from a Keychain master key (Touch ID gated). Enforced by every gated FastAPI route. | Inter-service authentication |
+| `char_audit.py` | Reads Char's `settings.json` + `store.json` and asserts the four-key contract + firewall coverage. Surfaces drift in `./run.sh doctor` and the inspector's Char Audit tab. | Char-settings enforcement |
+| `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, manage the firewall, and produce health reports. | Operator tool |
 
 ## How the integration works (a.k.a. "the hack")
 

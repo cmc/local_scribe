@@ -640,46 +640,72 @@ events sent. (If your install predates this script change, run
 
 ### What you should also block at the network layer
 
-Sentry and the auto-updater have **no in-app toggle**. Block them at
-your firewall — most macOS users have one of:
+Sentry and the auto-updater have **no in-app toggle**. As of v0.6 this
+repo ships an `/etc/hosts` block-list manager that catches both, plus
+every external STT/LLM provider Char ships plugins for. **Use that
+unless you specifically need per-process control.**
 
-- **[Little Snitch](https://www.obdev.at/products/littlesnitch/index.html)**: add deny rules for these hosts:
-  ```
-  o4506190168522752.ingest.us.sentry.io
-  *.ingest.us.sentry.io
-  *.ingest.de.sentry.io
-  browser.sentry-cdn.com
-  desktop2.hyprnote.com
-  gateway.scarf.sh
-  ```
-- **[LuLu](https://objective-see.org/products/lulu.html)** (free): same hostnames; LuLu blocks at the process layer so block all of these for `char` and `char-cli`.
-- **[Stock pf firewall](https://www.openbsd.org/faq/pf/)** in `/etc/pf.conf`: a process-level deny isn't natively supported, so use the `/etc/hosts` trick instead.
+```bash
+./run.sh firewall status          # is it installed?
+./run.sh firewall list            # see the exact host catalog
+./run.sh firewall enable          # install (asks for admin password)
+./run.sh firewall enable --strict # also block api.char.com (no calendars)
+./run.sh firewall disable         # remove (asks for admin password)
+./run.sh firewall verify          # DNS-probe; fail if anything resolves
+```
 
-### Hosts-file shortcut (no firewall app needed)
+The catalog source of truth is [`firewall.py`](firewall.py) →
+`BLOCK_CATALOG`. The list is marker-delimited (`>>> local_scribe
+firewall` / `<<< local_scribe firewall`) inside `/etc/hosts` so add /
+remove doesn't disturb your existing entries; every change is backed
+up to `/etc/hosts.local_scribe.bak.<timestamp>` before being applied
+atomically via `rename(2)`. Resolution uses `0.0.0.0` (IPv4) and `::`
+(IPv6) sinks so connections fail-fast (~2 ms) rather than looping
+back to whatever's listening on `127.0.0.1`.
+
+The full rationale + per-host catalog + design trade-offs are in
+[SECURITY.md § Defence layer 1](SECURITY.md#defence-layer-1--network-egress-firewall).
+
+#### Per-process granularity, if you need it
+
+The `/etc/hosts` approach is **system-wide**: if some other tool you
+trust does use Sentry / PostHog, those will also be blocked. If you
+need per-process control instead:
+
+- **[Little Snitch](https://www.obdev.at/products/littlesnitch/index.html)**:
+  add deny rules for `char` + `char-cli` matching the hostnames in
+  `firewall.BLOCK_CATALOG` (paste `./run.sh firewall list` output into
+  the rule editor).
+- **[LuLu](https://objective-see.org/products/lulu.html)** (free):
+  same idea — block all default-catalog hostnames for `char` and
+  `char-cli` only.
+- **[Stock pf firewall](https://www.openbsd.org/faq/pf/)** in
+  `/etc/pf.conf`: process-level deny isn't natively supported, so
+  fall back to the `./run.sh firewall enable` path.
+
+#### Manual hosts-file fallback
+
+If you prefer to apply the rules by hand (without `./run.sh firewall`,
+e.g. on a machine where you've cloned a frozen branch):
 
 ```bash
 sudo tee -a /etc/hosts > /dev/null <<'EOF'
-# local_scribe: block Char's telemetry / auto-update endpoints
+# >>> local_scribe firewall (managed manually) >>>
 0.0.0.0 desktop2.hyprnote.com
 0.0.0.0 gateway.scarf.sh
 0.0.0.0 o4506190168522752.ingest.us.sentry.io
 0.0.0.0 us.i.posthog.com
 0.0.0.0 eu.i.posthog.com
 0.0.0.0 browser.sentry-cdn.com
+# <<< local_scribe firewall <<<
 EOF
 sudo dscacheutil -flushcache
 sudo killall -HUP mDNSResponder
 ```
 
-After this, `dig us.i.posthog.com` should return `0.0.0.0` and Char's
-telemetry attempts will fail-fast at TCP connect with no traffic
-leaving the machine. Sentry/PostHog client libraries are designed to
-fail silently in this case (they retry briefly then drop the queue).
-
-The downside of `0.0.0.0` redirection is per-app granularity is lost —
-if some other tool you trust *does* use Sentry / PostHog, those will
-also be blocked. Use Little Snitch / LuLu if you need per-process
-control.
+This is the minimum subset. The full default catalog is bigger
+(includes the external STT/LLM providers); see `./run.sh firewall
+list` or [`firewall.py`](firewall.py) for the canonical version.
 
 ### Verifying the block works
 
@@ -820,16 +846,30 @@ fingerprint for an unexpected prompt".
   to consume CPU / fill the cache directory. We log + rate-limit at
   the OS level only.
 
+### What landed since the initial threat model
+
+- ✅ **Per-service bearer tokens** (Keychain + Touch ID). Closes
+  tier #4 (shell-as-user). See [`service_auth.py`](service_auth.py) +
+  [SECURITY.md § Defence layer 2](SECURITY.md#defence-layer-2--inter-service-authentication).
+- ✅ **`/etc/hosts` block-list manager** for Char's Sentry / PostHog
+  / auto-updater + every external STT/LLM provider. Closes the
+  "no in-app toggle" gap. See [`firewall.py`](firewall.py) +
+  [SECURITY.md § Defence layer 1](SECURITY.md#defence-layer-1--network-egress-firewall).
+- ✅ **Char-settings drift detection** via `char_audit.py` (run by
+  `./run.sh doctor` and the inspector's Char Audit tab). Flags any
+  saved `api_key` that's not the current ASR token, any non-loopback
+  `base_url`, any non-disabled PostHog toggle, and any missing
+  firewall coverage.
+
 ### Open mitigations (tracked in [TODO.md](TODO.md))
 
 - Wire `vault.py` + `yubikey_backup.py` into `./run.sh bootstrap` and
   the lifespan startup so on-disk encryption is enabled by default.
 - Bind ASR to `127.0.0.1` by default with a `BIND_ALL=1` opt-in.
-- Block Char's auto-update endpoint at the firewall and provide a
-  runtime kill-switch for the Sentry DSN.
 - Per-session delete + audit log inside the inspector so a user can
   review what an attacker could have seen if any of the above
   defences ever fail.
+- LM Studio analytics auto-disable at bootstrap.
 
 ---
 

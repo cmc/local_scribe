@@ -59,21 +59,23 @@ sweep whenever `CHAR_KNOWN_GOOD_VERSION` is bumped.
       short-circuits `tauri_plugin_analytics::is_disabled()` before any
       event hits `us.i.posthog.com`. `doctor` now reports the toggle
       state. See [CHAR_REVIEW.md § PostHog deep dive](CHAR_REVIEW.md#posthog-deep-dive).
-- [ ] **Block / spoof Char's auto-update endpoint.** No in-app toggle
-      exists for `desktop2.hyprnote.com` (proxied through `gateway.scarf.sh`).
-      Options: (a) write a `/etc/hosts` patcher behind a `--block-updates`
-      flag in `configure-char`; (b) ship a Little Snitch ruleset; (c) wrap
-      Char in a launcher that sets `tauri-plugin-updater` env vars to point
-      to a no-op endpoint. (a) is most user-friendly; (c) is least invasive.
-      See [CHAR_REVIEW.md § Auto-update channel](CHAR_REVIEW.md#auto-update-channel).
-- [ ] **Add a runtime kill-switch for Char's Sentry DSN.** Currently
-      compile-time baked via `option_env!("SENTRY_DSN")`. Two paths: (a)
-      maintain a fork of `fastrepl/anarlog` with the DSN pull replaced by
-      a `settings.json`-aware branch and bundle the rebuilt DMG via
-      `./run.sh install-char`; (b) keep upstream and rely on firewall
-      rules — document the exact `pf` / Little Snitch entries in
-      [CHAR_REVIEW.md § Mitigations](CHAR_REVIEW.md#mitigations) and have
-      `./run.sh configure-char` offer to write them. (b) ships first.
+- [x] **Block Char's auto-update endpoint.** ✅ Landed:
+      `./run.sh firewall enable` blackholes `desktop2.hyprnote.com` +
+      `gateway.scarf.sh` (and the Sentry DSN, PostHog ingest, plus
+      every external STT/LLM provider Char ships plugins for) in
+      `/etc/hosts`. Marker-delimited region, atomic rename, idempotent
+      re-apply, timestamped backups, `./run.sh firewall verify` DNS
+      probe. Bootstrap step (7/7) offers to install on first run; doctor
+      reports coverage + drift. Catalog source: [`firewall.py`](firewall.py)
+      `BLOCK_CATALOG`. Full rationale in [SECURITY.md](SECURITY.md). See
+      [CHAR_REVIEW.md § Mitigations](CHAR_REVIEW.md#mitigations).
+- [x] **Add a runtime kill-switch for Char's Sentry DSN.** ✅ Landed
+      via the same `/etc/hosts` block-list manager: the Sentry DSN host
+      (`o4506190168522752.ingest.us.sentry.io`) + the browser CDN
+      (`browser.sentry-cdn.com`) are in the default telemetry category.
+      Sentry SDK silently drops the queue on connect-refused, so the
+      desktop binary keeps running normally — no need to fork
+      `fastrepl/anarlog`. See [CHAR_REVIEW.md § Sentry deep dive](CHAR_REVIEW.md#sentry-deep-dive).
 - [ ] **Spotlight exclusion.** `bootstrap` could optionally run
       `mdutil -i off ~/Library/Application\ Support/hyprnote/` so
       Spotlight doesn't index recordings into a separately-readable

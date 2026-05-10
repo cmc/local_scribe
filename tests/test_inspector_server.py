@@ -529,10 +529,27 @@ class CharAuditEndpointTests(unittest.TestCase):
             tmp_cfg.write_text(json.dumps(raw, indent=2))
             real = config.DEFAULT_CONFIG_PATH
             config.DEFAULT_CONFIG_PATH = tmp_cfg
+            # audit() now also reports firewall coverage; stub it out
+            # so this test doesn't depend on the host's /etc/hosts.
+            # The firewall integration itself is exercised by
+            # ``tests/test_char_audit.py::FirewallIntegrationTests``.
+            from unittest import mock
+            import firewall
+            fake_fw = firewall.Status(
+                installed=True,
+                blocked_hostnames=[e.hostname for e in firewall.BLOCK_CATALOG
+                                   if e.category in firewall.DEFAULT_ENABLED_CATEGORIES],
+                coverage_by_category={
+                    cat: {"blocked": 1, "expected": 1}
+                    for cat in firewall.DEFAULT_ENABLED_CATEGORIES
+                },
+                missing_by_category={},
+            )
             try:
-                cfg = _make_cfg(data_dir)
-                client = TestClient(inspector_server.create_app(cfg))
-                r = client.get("/api/char/audit")
+                with mock.patch.object(firewall, "status", return_value=fake_fw):
+                    cfg = _make_cfg(data_dir)
+                    client = TestClient(inspector_server.create_app(cfg))
+                    r = client.get("/api/char/audit")
                 self.assertEqual(r.status_code, 200)
                 d = r.json()
                 self.assertTrue(d["settings_present"])

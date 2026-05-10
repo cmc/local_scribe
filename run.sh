@@ -57,6 +57,13 @@
 #                            Use when the original Generate produced a
 #                            single-speaker blob (1:1 call) or over-clustered
 #                            (long meeting -> 30+ phantom speakers).
+#   ./run.sh firewall {status|enable|disable|list|verify} [--strict]
+#                            manage the /etc/hosts block list that severs
+#                            Char's link to Sentry / PostHog / its
+#                            auto-updater + every external STT/LLM provider.
+#                            `enable` and `disable` require sudo (we prompt
+#                            via the macOS admin dialog). See SECURITY.md
+#                            for the full host catalog and threat model.
 #
 # Env overrides (prefer ~/.config/local_scribe/config.json for these):
 #   ASR_BACKEND       default parakeet  (parakeet | whisper)
@@ -548,6 +555,34 @@ PY
                             "$c_bold" "$c_reset" "$c_bold" "$c_reset"
   fi
 
+  printf "\n%soutbound firewall:%s\n" "$c_bold" "$c_reset"
+  if [[ -x "$VENV_PY" ]]; then
+    "$VENV_PY" - <<'PY'
+import sys
+import firewall
+G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
+try:
+    s = firewall.status()
+except Exception as exc:  # noqa: BLE001
+    print(f"  {R}\u25cb{Z} firewall status check failed: {exc}")
+    sys.exit(0)
+if not s.installed:
+    print(f"  {Y}\u25cb{Z} block list NOT installed")
+    print(f"      Char can still reach Sentry / PostHog / its auto-updater +")
+    print(f"      api.openai.com etc. Run `./run.sh firewall enable` to block.")
+    print(f"      Full host catalog: `./run.sh firewall list`. Details in SECURITY.md.")
+    sys.exit(0)
+print(f"  {G}\u25cf{Z} block list installed ({len(s.blocked_hostnames)} hostnames blackholed in /etc/hosts)")
+for cat, c in s.coverage_by_category.items():
+    if c["blocked"] == c["expected"]:
+        print(f"  {G}\u25cf{Z} {cat:11s} {c['blocked']}/{c['expected']}  (full coverage)")
+    else:
+        print(f"  {Y}\u25cb{Z} {cat:11s} {c['blocked']}/{c['expected']}  (drift; re-run `./run.sh firewall enable`)")
+        for h in s.missing_by_category.get(cat, []):
+            print(f"      missing: {h}")
+PY
+  fi
+
   printf "\n%sauthentication:%s\n" "$c_bold" "$c_reset"
   if [[ -x "$VENV_PY" ]]; then
     "$VENV_PY" - <<'PY'
@@ -614,25 +649,25 @@ cmd_setup() {
 cmd_bootstrap() {
   printf "%sbootstrap%s — first-time setup for a fresh clone\n\n" "$c_bold" "$c_reset"
 
-  printf "%s(1/6) python venv + pip deps%s\n" "$c_bold" "$c_reset"
+  printf "%s(1/7) python venv + pip deps%s\n" "$c_bold" "$c_reset"
   ensure_pip_deps             || return 1
 
-  printf "\n%s(2/6) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(2/7) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
   ensure_parakeet_model       || return 1
 
-  printf "\n%s(3/6) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(3/7) sherpa-onnx diarization models%s\n" "$c_bold" "$c_reset"
   ensure_diarization_models   || true   # best-effort
 
-  printf "\n%s(4/6) ~/.config/local_scribe/config.json%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(4/7) ~/.config/local_scribe/config.json%s\n" "$c_bold" "$c_reset"
   ensure_config_json          || true   # best-effort
 
-  printf "\n%s(5/6) LM Studio.app + Qwen LLM%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(5/7) LM Studio.app + Qwen LLM%s\n" "$c_bold" "$c_reset"
   if ! lmstudio_full_bootstrap; then
     say "${c_yellow}LM Studio bootstrap incomplete — Char's summary step will fail${c_reset}"
     say "  fix the issues above (or load the model from LM Studio.app), then re-run"
   fi
 
-  printf "\n%s(6/6) Char.app — install + auto-config%s\n" "$c_bold" "$c_reset"
+  printf "\n%s(6/7) Char.app — install + auto-config%s\n" "$c_bold" "$c_reset"
   if ! char_installed; then
     printf "  Char.app not installed at /Applications/Char.app.\n"
     printf "  We can fetch the pinned version (%s) from GitHub Releases:\n" "$CHAR_KNOWN_GOOD_VERSION"
@@ -671,6 +706,35 @@ cmd_bootstrap() {
     else
       printf "  skipped — run %s./run.sh configure-char%s any time\n" "$c_bold" "$c_reset"
     fi
+  fi
+
+  printf "\n%s(7/7) outbound firewall — block Char's Sentry / PostHog / auto-updater%s\n" \
+         "$c_bold" "$c_reset"
+  # The firewall block is the only bootstrap step that needs sudo, so
+  # we ask explicitly instead of running it implicitly. Status check
+  # is read-only so we can show the user where they stand before they
+  # decide.
+  local fw_status
+  fw_status="$("$VENV_PY" -m firewall status 2>&1 | head -1 || true)"
+  printf "  current state: %s\n" "${fw_status:-unknown}"
+  printf "  We can rewrite /etc/hosts to blackhole the hostnames Char reaches\n"
+  printf "  with no in-app toggle (Sentry, PostHog, the Tauri auto-updater)\n"
+  printf "  plus every external STT/LLM provider Char ships plugins for\n"
+  printf "  (OpenAI, Deepgram, Anthropic, ...). Block list catalog:\n"
+  printf "  %s./run.sh firewall list%s   removal: %s./run.sh firewall disable%s\n" \
+         "$c_bold" "$c_reset" "$c_bold" "$c_reset"
+  printf "  Full rationale + threat model: %sSECURITY.md%s\n" "$c_bold" "$c_reset"
+  printf "\n"
+  if ask_yn "  Install the block list now? (asks for your admin password)" y; then
+    printf "\n"
+    if "$VENV_PY" -m firewall enable; then
+      say "${c_green}firewall block list installed${c_reset}"
+    else
+      say "${c_yellow}firewall install failed/skipped; you can re-run \`./run.sh firewall enable\` later${c_reset}"
+    fi
+  else
+    printf "  skipped — run %s./run.sh firewall enable%s any time (recommended for privacy)\n" \
+           "$c_bold" "$c_reset"
   fi
 
   printf "\n%s════════ bootstrap complete ════════%s\n\n" "$c_green" "$c_reset"
@@ -1720,6 +1784,62 @@ cmd_transcribe() {
   exec "$VENV_PY" -u "$REPO/transcribe_file.py" "$@"
 }
 
+cmd_firewall() {
+  shift  # drop "firewall"
+  local sub="${1:-status}"
+  shift || true
+
+  if [[ ! -x "$VENV_PY" ]]; then
+    say "${c_red}venv python missing — run \`./run.sh bootstrap\` first${c_reset}"
+    return 1
+  fi
+
+  case "$sub" in
+    status|list|verify)
+      # Read-only paths -- no sudo needed.
+      exec "$VENV_PY" -m firewall "$sub" "$@"
+      ;;
+    enable|disable)
+      # Write paths require root. Tell the user up-front rather than
+      # silently triggering an osascript prompt. We default to the
+      # GUI flow if STDIN isn't a TTY (e.g. when bootstrap drives this
+      # non-interactively), otherwise fall through to sudo.
+      printf "%s/etc/hosts requires admin privileges to edit.%s\n" "$c_bold" "$c_reset"
+      printf "  We'll either prompt for your sudo password (if you ran this in a\n"
+      printf "  terminal) or pop the macOS admin dialog (if not). The diff is\n"
+      printf "  preserved verbatim in /etc/hosts.local_scribe.bak.* so you can\n"
+      printf "  always inspect or roll back what we changed.\n"
+      printf "\n"
+      exec "$VENV_PY" -m firewall "$sub" "$@"
+      ;;
+    -h|--help|help|"")
+      cat <<EOF
+usage: ./run.sh firewall {status|enable|disable|list|verify} [--strict]
+
+Subcommands:
+  status         show current /etc/hosts coverage (no sudo)
+  list           print the would-be-blocked host catalog (no sudo)
+  enable         install the block list (asks for sudo / admin password)
+                 [--strict] also block api.char.com (breaks calendar sync)
+                 [--gui]    force the AppleScript admin dialog
+                 [--no-backup] skip the /etc/hosts.local_scribe.bak.* file
+  disable        remove the block list (asks for sudo / admin password)
+  verify         DNS-probe the catalog and report what's actually blocked
+
+The block list catches Char's Sentry, PostHog, and auto-updater traffic
+(no in-app toggles available) plus every external STT / LLM / TTS
+provider Char ships plugins for. See SECURITY.md for the full host
+catalog, rationale, and audit / removal procedure.
+EOF
+      ;;
+    *)
+      say "unknown firewall subcommand: $sub"
+      say "  run \`./run.sh firewall help\` for usage"
+      return 1
+      ;;
+  esac
+}
+
 cmd_redo_session() {
   shift  # drop "redo-session"
   if [[ $# -eq 0 ]]; then
@@ -1770,6 +1890,7 @@ case "${1:-}" in
               shift; cmd_inspector "$@" ;;
   transcribe) cmd_transcribe "$@" ;;
   redo-session|redo_session|redo) cmd_redo_session "$@" ;;
+  firewall|fw) cmd_firewall "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
          /^#/{sub(/^# ?/,""); print; next}

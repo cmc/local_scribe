@@ -404,9 +404,60 @@ def audit(cfg: Config) -> AuditReport:
                 status=INFO,
                 current=updater.get("LastSeenVersion"),
                 note=("Char's auto-updater polls desktop2.hyprnote.com on a "
-                      "timer -- block it at the firewall if you don't want "
-                      "those checks. CHAR_REVIEW.md §Mitigations has the rules."),
+                      "timer. Block it with `./run.sh firewall enable` "
+                      "(the desktop2.hyprnote.com + gateway.scarf.sh hosts "
+                      "are in the default telemetry category)."),
             ))
+
+    # ---- /etc/hosts firewall coverage ----------------------------------
+    #
+    # Surfaces the state of the outbound block list -- this is the
+    # backstop for everything Char does that has no in-app toggle
+    # (Sentry DSN, Tauri auto-updater) and the fail-safe against an
+    # accidental settings change that re-points STT at api.openai.com.
+    # See firewall.py + SECURITY.md.
+    try:
+        import firewall  # noqa: PLC0415 -- intentionally lazy
+        fw = firewall.status()
+        if not fw.installed:
+            checks.append(Check(
+                key="firewall.block_list",
+                status=WARN,
+                current="not installed",
+                expected="installed",
+                note=("Char can still reach Sentry, PostHog, its auto-updater, "
+                      "and external STT/LLM provider APIs. Run "
+                      "`./run.sh firewall enable` to install the default "
+                      "block list (rationale + host catalog in SECURITY.md)."),
+            ))
+        else:
+            drift = sum(len(v) for v in fw.missing_by_category.values())
+            if drift == 0:
+                checks.append(Check(
+                    key="firewall.block_list",
+                    status=OK,
+                    current=f"{len(fw.blocked_hostnames)} hostnames",
+                    note=("Outbound telemetry + external-provider hostnames "
+                          "blackholed in /etc/hosts. Audit the exact list "
+                          "with `./run.sh firewall list`."),
+                ))
+            else:
+                checks.append(Check(
+                    key="firewall.block_list",
+                    status=WARN,
+                    current=f"{len(fw.blocked_hostnames)} of "
+                            f"{len(fw.blocked_hostnames) + drift} hostnames",
+                    note=(f"Catalog has grown since last enable -- {drift} "
+                          "expected host(s) missing. Re-run "
+                          "`./run.sh firewall enable` to refresh."),
+                ))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(Check(
+            key="firewall.block_list",
+            status=INFO,
+            current=f"check failed: {type(exc).__name__}",
+            note="firewall.py couldn't be imported; this audit field is informational only.",
+        ))
 
     summary: dict[str, int] = {OK: 0, WARN: 0, INFO: 0, MISS: 0}
     for c in checks:
