@@ -175,6 +175,7 @@ a `./run.sh wipe` command, and tightening loopback-only binding.
 | `parakeet_backend.py` | parakeet-mlx wrapper. Merges sub-word BPE tokens into clean words, shapes output to Deepgram's word/timing schema. | Default ASR engine |
 | `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) + an LLM pass to map `SPEAKER_00/01/...` to real names. | Speaker labeling |
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
+| `redo_session.py` | Re-runs ASR + diarization on an existing Char session and overwrites its `transcript.json` via `char_persist.py`. Used when the original Generate produced the wrong number of speakers (1:1 came back as one blob, or a long meeting over-clustered). Match by full UUID, UUID prefix, or session-title substring. Invoked via `./run.sh redo-session …`. | Per-session re-do |
 | `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, and produce health reports. | Operator tool |
 
 ## How the integration works (a.k.a. "the hack")
@@ -416,12 +417,15 @@ directly) or the SHA256 didn't match — both expected, both no-op.
 Compared to actually hitting `api.openai.com/v1/audio/transcriptions`,
 the shim:
 
-- Inlines `Speaker N: …` prefixes into the streamed text on short
-  files where diarization fires. The progressive shape Char accepts
-  here can't carry the structured `segments[*].speaker` array (Char's
-  parser doesn't have a segment arm — see § the streaming-batch
-  persistence bug). Long files auto-skip diarization
-  (`MAX_DIARIZE_SECONDS=1800` by default).
+- Inlines `Speaker N: …` prefixes into the streamed text. The
+  progressive shape Char accepts here can't carry the structured
+  `segments[*].speaker` array (Char's parser doesn't have a segment
+  arm — see § the streaming-batch persistence bug), but the sidecar
+  (`char_persist.py`) writes the full word-level + speaker hint data
+  to `transcript.json` so Char's UI colours speakers correctly on
+  session reload. `MAX_DIARIZE_SECONDS=14400` (4 h) by default —
+  set `0` to disable the cap, see § Diarization tuning for the
+  per-session redo command.
 - Ignores the OpenAI multipart fields `prompt`, `temperature`,
   `timestamp_granularities`, and `language`. Parakeet doesn't take
   sampling-temperature hints or per-token granularity, and language
@@ -709,15 +713,37 @@ non-streaming path.
 
 **Diarization tuning** — sherpa-onnx with the default `CLUSTER_THRESHOLD=0.5`
 tends to over-shard on short conversational audio (you may see 6-10 speakers
-where there were really 2-3). Either:
+where there were really 2-3) and under-cluster on long recordings (a 2-hour
+1:1 may collapse to a single blob). The streaming flow Char uses defaults
+to `CLUSTER_THRESHOLD=0.7` for audio ≥ 10 minutes, but you can override:
 
-  * If you know the speaker count, set `NUM_SPEAKERS=2` (or 3, etc.) before
-    `./run.sh start` — gives clean, exact labels.
-  * Or set `OPENAI_BATCH_DIARIZE=0` to skip diarization entirely (single
-    `speaker_0` placeholder, ~1s instead of ~4s).
-  * Or run `./run.sh transcribe FILE` for richer output: same diarization
-    plus an LLM pass that maps `speaker_0/1/...` to the actual people's
-    names by reading conversational cues.
+  * **One-off, no restart:** redo the session with the speaker count you
+    know to be true:
+    ```bash
+    ./run.sh redo-session "Maus Meeting" --speakers 2
+    ./run.sh redo-session 77f87727 --speakers 3 --cluster-threshold 0.85
+    ```
+    `redo-session` re-runs ASR + diarization on the session's existing
+    `audio.mp3` and overwrites its `transcript.json` in-place. Switch
+    sessions in Char (or relaunch it) to reload. Match by full UUID,
+    UUID prefix, or session-title substring.
+  * **Server-wide:** set `NUM_SPEAKERS=2` (or 3, etc.) before
+    `./run.sh start` — every Generate forces that many speakers.
+    Set `CLUSTER_THRESHOLD=0.85` to favour fewer, larger clusters across
+    the board.
+  * **Disable entirely:** set `OPENAI_BATCH_DIARIZE=0` or
+    `asr.diarization.enabled=false` in `~/.config/local_scribe/config.json`.
+    Single `speaker_0` placeholder, ~1s instead of ~5+ min on long audio.
+  * **Per-request opt-out:** append `?diarize=0` to the OpenAI POST URL
+    (used by `./run.sh redo-session --no-diarize`).
+  * **Richest output:** `./run.sh transcribe FILE` runs the same
+    diarization plus an LLM pass that maps `speaker_0/1/...` to the
+    actual people's names by reading conversational cues.
+
+The diarization auto-skip cap is `MAX_DIARIZE_SECONDS=14400` (4 hours)
+by default — generous enough for any plausible single-meeting recording
+while still bounding a runaway run on a 10-hour podcast. Set to `0` in
+`config.json` (or env) to remove the cap entirely.
 
 #### 3. Summary / Intelligence (LM Studio)
 
@@ -980,7 +1006,7 @@ All knobs are also env vars; defaults are sensible.
 | `OPENAI_BATCH_DIARIZE` | `1` | set `0` to skip diarization in `POST /v1/audio/transcriptions` (Char's Generate flow) |
 | `NUM_SPEAKERS` | unset (auto) | hint sherpa-onnx with the exact speaker count if known |
 | `CLUSTER_THRESHOLD` | `0.5` short / `0.7` long | sherpa-onnx fast-clustering threshold. Auto-bumps to `0.7` for audio ≥ 10 min (long meetings have few speakers; tighter thresholds over-shard). Set this env var to lock a value. |
-| `MAX_DIARIZE_SECONDS` | `1800` | audio longer than this auto-skips diarization on `POST /v1/audio/transcriptions` (returns ASR transcript with single `speaker_0` placeholder). Sherpa-onnx clustering is O(N²) and Char's UI doesn't tolerate multi-minute Generate latencies. Set `0` to disable the cap. |
+| `MAX_DIARIZE_SECONDS` | `14400` | audio longer than this (4 h default) auto-skips diarization on `POST /v1/audio/transcriptions` (returns ASR transcript with single `speaker_0` placeholder). Sherpa-onnx clustering is O(N²); the cap exists so an accidentally-long file can't lock up the server. Set `0` to disable the cap. |
 | `MAX_SPEAKERS` | `12` | if sherpa-onnx returns more than this many distinct speakers, treat it as a clustering blow-up and collapse to single-speaker output rather than emit JSON Char can't render. Set `0` to disable the guard. |
 | `STREAM_HEARTBEAT_SECONDS` | `20` | heartbeat interval (in seconds) for the SSE streaming branch of `POST /v1/audio/transcriptions`. Each heartbeat resets Char's hardcoded 60-second `BATCH_IDLE_TIMEOUT`; lower it on slower machines, raise it for less wire chatter. Must stay strictly less than 60. |
 | `INSPECTOR_BIND` | `127.0.0.1` | bind address for the Inspector web UI; loopback by default. Refuse to start non-loopback unless `inspector.auth_token` is also set in `config.json`. |
@@ -1070,6 +1096,8 @@ refuse the latter without the former.
 local_scribe/
 ├── asr_server.py            # FastAPI server (Deepgram-compatible)
 ├── transcribe_file.py       # CLI for manual files
+├── redo_session.py          # ./run.sh redo-session: re-run ASR + diarization
+│                            #   on an existing Char session, overwrite transcript.json
 ├── parakeet_backend.py      # parakeet-mlx wrapper, BPE -> Deepgram words
 ├── diarization_backend.py   # sherpa-onnx + LLM speaker naming
 ├── inspector_server.py      # FastAPI web UI + sessions/config/char-audit API
@@ -1079,7 +1107,7 @@ local_scribe/
 ├── config.py                # config loader (defaults <- file <- env)
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 206 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 215 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -1176,7 +1204,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 206 tests, ~0.5s, no model loads
+venv/bin/python -m unittest discover -s tests   # 215 tests, ~0.5s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run

@@ -54,7 +54,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "stream_heartbeat_seconds": 20.0,
         "diarization": {
             "enabled": True,
-            "max_seconds": 1800,
+            # 4 hours. Long enough for any plausible single-meeting
+            # recording; short enough that a runaway diarization run on
+            # an accidentally-long file (~10h podcast etc.) still gets
+            # bounded. Set to 0 to remove the cap entirely.
+            "max_seconds": 14400,
             "max_speakers": 12,
             "num_speakers": None,
             "cluster_threshold": None,

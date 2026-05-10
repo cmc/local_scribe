@@ -497,9 +497,10 @@ _NUM_SPEAKERS = _CFG.num_speakers
 _CLUSTER_THRESHOLD_OVERRIDE: float | None = _CFG.cluster_threshold
 _CLUSTER_THRESHOLD_DEFAULT = 0.5
 # Audio longer than this auto-skips diarization entirely (returns a single
-# `speaker_0` placeholder), because: (a) sherpa-onnx clustering is O(N^2) and
-# blows up past ~30 min, and (b) the resulting wall time would exceed Char's
-# UI patience. Set asr.diarization.max_seconds=0 to disable the auto-skip.
+# `speaker_0` placeholder). sherpa-onnx clustering is O(N^2) and the wall
+# time on multi-hour audio gets long, but real meetings do run long, so
+# the default is a generous 4 hours. Set asr.diarization.max_seconds=0
+# to remove the cap entirely.
 _MAX_DIARIZE_SECONDS = _CFG.max_diarize_seconds
 # When sherpa-onnx returns more than this many distinct speakers we treat it
 # as a clustering blow-up (long mono recordings often produce 100+ phantom
@@ -528,6 +529,9 @@ def _attach_speakers_to_words(
     words: list[dict[str, Any]],
     duration: float | None = None,
     request_id: str | None = None,
+    *,
+    num_speakers_override: int | None = None,
+    cluster_threshold_override: float | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Run sherpa-onnx diarization on `audio_path` and attach a speaker
     label to each word. Returns (words_with_speaker, num_speakers).
@@ -539,6 +543,16 @@ def _attach_speakers_to_words(
     Also enforces the duration cap (`MAX_DIARIZE_SECONDS`) and speaker-count
     cap (`MAX_SPEAKERS`) -- both fall back to single-speaker output rather
     than emit a response Char's UI can't render.
+
+    Per-request overrides (passed in from the openai endpoint's query
+    string by ``redo-session`` / power users) take precedence over the
+    server-wide config knobs:
+
+      * ``num_speakers_override`` -> forces sherpa-onnx to that exact
+        cluster count, side-stepping the over-clustering we see on
+        long mono recordings.
+      * ``cluster_threshold_override`` -> raw threshold (0..1) shipped
+        straight into sherpa-onnx; bypasses the long-audio auto-bump.
     """
     log_id = f"[openai {request_id}] " if request_id else ""
 
@@ -562,18 +576,36 @@ def _attach_speakers_to_words(
     try:
         import diarization_backend as dz
 
-        threshold = _pick_cluster_threshold(duration)
-        if threshold != _CLUSTER_THRESHOLD_DEFAULT and _CLUSTER_THRESHOLD_OVERRIDE is None:
+        if cluster_threshold_override is not None:
+            threshold = cluster_threshold_override
+        else:
+            threshold = _pick_cluster_threshold(duration)
+            if (
+                threshold != _CLUSTER_THRESHOLD_DEFAULT
+                and _CLUSTER_THRESHOLD_OVERRIDE is None
+            ):
+                logger.info(
+                    "%susing CLUSTER_THRESHOLD=%.2f (auto-bumped from %.2f "
+                    "for audio >= %ds; pass ?cluster_threshold=N or set "
+                    "CLUSTER_THRESHOLD env to override)",
+                    log_id, threshold, _CLUSTER_THRESHOLD_DEFAULT,
+                    _LONG_AUDIO_BUMP_AFTER_SECONDS,
+                )
+
+        num_clusters = (
+            num_speakers_override
+            if num_speakers_override is not None
+            else _NUM_SPEAKERS
+        )
+        if num_speakers_override is not None:
             logger.info(
-                "%susing CLUSTER_THRESHOLD=%.2f (auto-bumped from %.2f for "
-                "audio >= %ds; set CLUSTER_THRESHOLD env var to override)",
-                log_id, threshold, _CLUSTER_THRESHOLD_DEFAULT,
-                _LONG_AUDIO_BUMP_AFTER_SECONDS,
+                "%sforcing num_speakers=%d (per-request override)",
+                log_id, num_speakers_override,
             )
 
         turns = dz.diarize(
             Path(audio_path),
-            num_clusters=_NUM_SPEAKERS,
+            num_clusters=num_clusters,
             cluster_threshold=threshold,
         )
         if not turns:
@@ -888,6 +920,62 @@ def _openai_transcription_response(
 _OPENAI_STREAM_HEARTBEAT_SECONDS = _CFG.stream_heartbeat_seconds
 
 
+def _parse_diarize_overrides(
+    query_params, request_id: str,
+) -> tuple[int | None, float | None]:
+    """Extract per-request diarization overrides from the query string.
+
+    Recognised keys (loose typing; bad values are logged + ignored
+    rather than 400ed, so a user typo can't kill an in-flight Generate):
+
+      * ``num_speakers=N``   -> force exactly N clusters
+      * ``cluster_threshold=F`` -> raw 0..1 distance threshold
+
+    Returns ``(num_speakers, cluster_threshold)`` with either set to
+    ``None`` when absent / invalid. ``redo-session`` is the primary
+    consumer; humans can also pass them via curl when comparing
+    different parameterisations on the same audio.
+    """
+    num_speakers: int | None = None
+    threshold: float | None = None
+
+    raw_num = query_params.get("num_speakers")
+    if raw_num is not None and raw_num != "":
+        try:
+            n = int(raw_num)
+            if 1 <= n <= 50:
+                num_speakers = n
+            else:
+                logger.warning(
+                    "[openai %s] ignoring num_speakers=%s (out of range 1..50)",
+                    request_id, raw_num,
+                )
+        except (TypeError, ValueError):
+            logger.warning(
+                "[openai %s] ignoring num_speakers=%r (not an int)",
+                request_id, raw_num,
+            )
+
+    raw_thr = query_params.get("cluster_threshold")
+    if raw_thr is not None and raw_thr != "":
+        try:
+            f = float(raw_thr)
+            if 0.0 < f < 1.0:
+                threshold = f
+            else:
+                logger.warning(
+                    "[openai %s] ignoring cluster_threshold=%s (must be in (0, 1))",
+                    request_id, raw_thr,
+                )
+        except (TypeError, ValueError):
+            logger.warning(
+                "[openai %s] ignoring cluster_threshold=%r (not a float)",
+                request_id, raw_thr,
+            )
+
+    return num_speakers, threshold
+
+
 def _sse(event: dict[str, Any]) -> str:
     return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
 
@@ -941,6 +1029,9 @@ async def _stream_openai_transcription(
     audio_path: str,
     started: float,
     do_diarize: bool,
+    *,
+    num_speakers_override: int | None = None,
+    cluster_threshold_override: float | None = None,
 ):
     """SSE generator for Char's progressive (gpt-4o-transcribe) batch path.
 
@@ -980,6 +1071,8 @@ async def _stream_openai_transcription(
             )
             words, num_speakers = await asyncio.to_thread(
                 _attach_speakers_to_words, audio_path, words, duration, request_id,
+                num_speakers_override=num_speakers_override,
+                cluster_threshold_override=cluster_threshold_override,
             )
             if num_speakers > 1:
                 transcript = _compose_speaker_prefixed_text(words, transcript)
@@ -1120,14 +1213,28 @@ async def openai_audio_transcriptions(request: Request):
             os.write(fd, audio_bytes)
         finally:
             os.close(fd)
-        do_diarize = (
-            _OPENAI_BATCH_DIARIZE
-            and (response_format == "diarized_json"
-                 or requested_model.endswith("-diarize"))
+        # Streaming-path diarization gate: the original gate required
+        # response_format=diarized_json or model=*-diarize, which made
+        # sense back when Char used `gpt-4o-transcribe-diarize` for the
+        # non-streaming batch flow. After we moved Char to the
+        # progressive (SSE) path to bypass BATCH_IDLE_TIMEOUT, Char
+        # sends `model=gpt-4o-transcribe` + `response_format=json` and
+        # those gates collapsed -- diarization silently no-op'd, every
+        # streamed transcript came back with a single speaker_0.
+        # Now: diarize whenever the user has it enabled in config.
+        # `?diarize=0` query string is honoured for one-off opt-out.
+        do_diarize = _OPENAI_BATCH_DIARIZE and (
+            request.query_params.get("diarize", "1").lower()
+            not in ("0", "false", "no", "off")
+        )
+        num_speakers_override, cluster_threshold_override = _parse_diarize_overrides(
+            request.query_params, request_id,
         )
         return StreamingResponse(
             _stream_openai_transcription(
                 request_id, tmp_path, started, do_diarize,
+                num_speakers_override=num_speakers_override,
+                cluster_threshold_override=cluster_threshold_override,
             ),
             media_type="text/event-stream",
             headers={
@@ -1158,8 +1265,13 @@ async def openai_audio_transcriptions(request: Request):
             logger.info(
                 "[openai %s] running diarization (sherpa-onnx) ...", request_id,
             )
+            num_speakers_override, cluster_threshold_override = (
+                _parse_diarize_overrides(request.query_params, request_id)
+            )
             words, num_speakers = await asyncio.to_thread(
                 _attach_speakers_to_words, tmp.name, words, duration, request_id,
+                num_speakers_override=num_speakers_override,
+                cluster_threshold_override=cluster_threshold_override,
             )
 
         # Mirror the streaming path's sidecar write: ensures the

@@ -51,6 +51,12 @@
 #                            only by default.
 #   ./run.sh transcribe FILE [args...]
 #                            run transcribe_file.py FILE with the venv python
+#   ./run.sh redo-session SESSION [--speakers N] [--cluster-threshold F]
+#                            re-run ASR + diarization on an existing Char
+#                            session and overwrite its transcript.json.
+#                            Use when the original Generate produced a
+#                            single-speaker blob (1:1 call) or over-clustered
+#                            (long meeting -> 30+ phantom speakers).
 #
 # Env overrides (prefer ~/.config/local_scribe/config.json for these):
 #   ASR_BACKEND       default parakeet  (parakeet | whisper)
@@ -1560,6 +1566,36 @@ cmd_transcribe() {
   exec "$VENV_PY" -u "$REPO/transcribe_file.py" "$@"
 }
 
+cmd_redo_session() {
+  shift  # drop "redo-session"
+  if [[ $# -eq 0 ]]; then
+    cat <<EOF
+usage: ./run.sh redo-session SESSION [--speakers N] [--cluster-threshold F]
+                                     [--no-diarize] [--asr-url URL]
+
+Re-run ASR + diarization on an existing Char session and overwrite its
+transcript.json. Useful when the original "Generate" produced the wrong
+number of speakers (e.g. a 1:1 call that came back as one big blob, or
+a long meeting that over-clustered into 30+ phantom speakers).
+
+Examples:
+
+  ./run.sh redo-session 77f87727-c9b8-4bac-bbfa-26934c8b4ba7 --speakers 2
+  ./run.sh redo-session "Maus Meeting" --speakers 2 --cluster-threshold 0.85
+  ./run.sh redo-session test --no-diarize     # rewrite as single speaker
+
+The ASR server must be running (./run.sh start). The session is matched
+by full UUID, UUID prefix, or session-title substring.
+EOF
+    return 1
+  fi
+  if ! curl -fsS "http://127.0.0.1:${ASR_PORT}/health" >/dev/null 2>&1; then
+    say "ASR server is not running. Start it with: ./run.sh start"
+    return 1
+  fi
+  exec "$VENV_PY" -u "$REPO/redo_session.py" "$@"
+}
+
 case "${1:-}" in
   start)      cmd_start ;;
   stop)       cmd_stop ;;
@@ -1579,6 +1615,7 @@ case "${1:-}" in
   inspector|web|ui)
               shift; cmd_inspector "$@" ;;
   transcribe) cmd_transcribe "$@" ;;
+  redo-session|redo_session|redo) cmd_redo_session "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
          /^#/{sub(/^# ?/,""); print; next}

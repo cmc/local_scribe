@@ -262,6 +262,74 @@ class WriteTranscriptTests(_Tmp):
         self.assertEqual(d["transcripts"][0]["words"][0]["text"], " hi")
 
 
+class SpeakerCoercionTests(unittest.TestCase):
+    """Regression tests for the Aug-2026 incident where redo-session on
+    a long meeting crashed in char_persist with
+    ``ValueError: invalid literal for int() with base 10: 'speaker_0'``.
+
+    asr_server returns ``speaker="speaker_0"`` (string label) when the
+    auto-skip path fires, but emits an integer index when real
+    diarization runs. The sidecar writer must handle both shapes.
+    """
+
+    def test_int_passthrough(self) -> None:
+        self.assertEqual(char_persist._coerce_speaker_index(0), 0)
+        self.assertEqual(char_persist._coerce_speaker_index(3), 3)
+
+    def test_none_returns_fallback(self) -> None:
+        self.assertEqual(
+            char_persist._coerce_speaker_index(None, fallback=7), 7,
+        )
+
+    def test_lowercase_speaker_underscore_label(self) -> None:
+        self.assertEqual(char_persist._coerce_speaker_index("speaker_0"), 0)
+        self.assertEqual(char_persist._coerce_speaker_index("speaker_1"), 1)
+        self.assertEqual(char_persist._coerce_speaker_index("speaker_42"), 42)
+
+    def test_uppercase_pyannote_label(self) -> None:
+        self.assertEqual(char_persist._coerce_speaker_index("SPEAKER_00"), 0)
+        self.assertEqual(char_persist._coerce_speaker_index("SPEAKER_15"), 15)
+
+    def test_numeric_string(self) -> None:
+        self.assertEqual(char_persist._coerce_speaker_index("3"), 3)
+
+    def test_unknown_string_returns_fallback(self) -> None:
+        # Forward-compat: a sherpa upgrade renames labels -> we'd
+        # rather ship a one-speaker transcript than crash.
+        self.assertEqual(
+            char_persist._coerce_speaker_index("Alice", fallback=0), 0,
+        )
+
+    def test_string_label_round_trip_in_writer(self) -> None:
+        # End-to-end: the same crash that broke redo-session must
+        # not reappear. We pass words shaped exactly like asr_server's
+        # auto-skip path emits them.
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        data_dir = Path(td.name) / "hyprnote"
+        sd = data_dir / "sessions" / "ses1"
+        sd.mkdir(parents=True)
+        (sd / "audio.mp3").write_bytes(b"a")
+        (sd / "_meta.json").write_text("{}")
+        upload = Path(td.name) / "u.mp3"
+        upload.write_bytes(b"a")
+
+        char_persist.write_transcript_for_audio(
+            upload, data_dir,
+            words=[
+                {"word": "hi", "start": 0.0, "end": 0.1, "speaker": "speaker_0"},
+                {"word": "yo", "start": 0.1, "end": 0.2, "speaker": "speaker_0"},
+            ],
+        )
+
+        d = json.loads((sd / "transcript.json").read_text())
+        hints = d["transcripts"][0]["speaker_hints"]
+        idx0 = json.loads(hints[0]["value"])["speaker_index"]
+        idx1 = json.loads(hints[1]["value"])["speaker_index"]
+        self.assertEqual(idx0, 0)
+        self.assertEqual(idx1, 0)
+
+
 class TraversalDefenseTests(_Tmp):
     def test_refuses_to_write_outside_char_data_dir(self) -> None:
         # Build an alternate dir we'd never want to write to and a

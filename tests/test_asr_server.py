@@ -609,7 +609,8 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
     def _post(self, *, response_format: str | None = None,
               filename: str = "audio.m4a",
               model: str | None = "gpt-4o-transcribe-diarize",
-              extra_form: dict | None = None):
+              extra_form: dict | None = None,
+              query_params: dict | None = None):
         files = {"file": (filename, io.BytesIO(b"FAKE_AUDIO" * 100), "audio/m4a")}
         data: dict = {}
         if model is not None:
@@ -623,6 +624,7 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
             files=files,
             data=data,
             headers={"Authorization": "Bearer test-key"},
+            params=query_params,
         )
 
     def test_default_format_is_json_with_text_only(self):
@@ -888,6 +890,72 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         # The second speaker's lines must come AFTER the first speaker's
         # lines, not interleaved.
         self.assertLess(text.index("Speaker 0:"), text.index("Speaker 1:"))
+
+    def test_stream_diarizes_by_default_for_plain_gpt4o_transcribe(self):
+        # Regression: Char's progressive flow sends `model=gpt-4o-transcribe`
+        # + `response_format=json` (never `-diarize` / `diarized_json`).
+        # The original gate required one of those, so diarization silently
+        # no-op'd on every Generate -> single-speaker transcripts.
+        # The fix: diarize whenever `_OPENAI_BATCH_DIARIZE` is on,
+        # regardless of model name / response_format.
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.10},
+            {"speaker": "SPEAKER_01", "start": 1.20, "end": 2.30},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(CANNED_WORDS[0], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[1], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[2], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[3], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[4], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[5], speaker="SPEAKER_01"),
+        ]
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
+             mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", True):
+            resp = self._post(
+                model="gpt-4o-transcribe",       # NOT -diarize
+                response_format=None,            # i.e. defaulted to "json"
+                extra_form={"stream": "true"},
+            )
+        self.assertEqual(resp.status_code, 200)
+        events = self._parse_sse_events(resp.text)
+        done = next(e for e in events if isinstance(e, dict)
+                    and e.get("type") == "transcript.text.done")
+        # Speaker prefixes prove diarization actually fired for this
+        # bare gpt-4o-transcribe + json combination.
+        self.assertIn("Speaker 0:", done["text"])
+        self.assertIn("Speaker 1:", done["text"])
+
+    def test_stream_diarize_query_param_zero_opts_out(self):
+        # Operator escape hatch: `?diarize=0` skips diarization even when
+        # the server-wide flag is on, so power users can compare with
+        # and without speakers without restarting the server.
+        # If diarization had run we'd see Speaker prefixes in the text
+        # (per the test above); their absence confirms the opt-out.
+        fake_dz = mock.MagicMock()
+        # Make diarize.return_value distinctive so a regression that
+        # accidentally still calls diarization will fail this assertion.
+        fake_dz.diarize.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.10},
+            {"speaker": "SPEAKER_01", "start": 1.20, "end": 2.30},
+        ]
+        with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
+             mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", True):
+            resp = self._post(
+                model="gpt-4o-transcribe",
+                response_format=None,
+                extra_form={"stream": "true"},
+                # `?diarize=0` is the documented opt-out.
+                query_params={"diarize": "0"},
+            )
+        self.assertEqual(resp.status_code, 200)
+        fake_dz.diarize.assert_not_called()
+        events = self._parse_sse_events(resp.text)
+        done = next(e for e in events if isinstance(e, dict)
+                    and e.get("type") == "transcript.text.done")
+        # Plain transcript, no speaker prefixes inlined.
+        self.assertNotIn("Speaker 0:", done["text"])
 
     def test_stream_handles_asr_failure_with_synthetic_done(self):
         # If ASR explodes mid-stream we still must emit a `done` event so

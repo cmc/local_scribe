@@ -183,6 +183,47 @@ def _normalise_word_text(text: str) -> str:
     return " " + text
 
 
+def _coerce_speaker_index(value: Any, *, fallback: int = 0) -> int:
+    """Map sherpa-onnx / asr_server speaker labels into the integer
+    ``speaker_index`` Char's persister UI expects.
+
+    Accepts:
+
+      * ``None`` -> ``fallback`` (no diarization info on this word)
+      * ``int`` (0, 1, 2, ...) -> returned as-is
+      * ``"speaker_0"``, ``"speaker_1"``, ... -> trailing integer parsed
+        (asr_server's auto-skip / single-speaker fallback writes this)
+      * ``"SPEAKER_00"``, ``"SPEAKER_01"``, ... -> trailing integer
+        parsed (raw sherpa-onnx output before remapping)
+      * any other string -> ``fallback`` (don't crash on unexpected
+        labels; better to ship a transcript with one speaker than no
+        transcript at all)
+
+    Splitting this out as a typed helper because we hit the bug
+    repeatedly: the ASR layer mixes string labels and ints depending on
+    which branch it took (auto-skip vs real diarization), so the
+    sidecar writer has to be defensive.
+    """
+    if value is None:
+        return int(fallback)
+    if isinstance(value, bool):
+        return int(fallback)
+    if isinstance(value, int):
+        return value
+    s = str(value)
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    if "_" in s:
+        tail = s.rsplit("_", 1)[1]
+        try:
+            return int(tail)
+        except ValueError:
+            pass
+    return int(fallback)
+
+
 def _build_words_and_hints(
     words: Iterable[dict[str, Any]],
     *,
@@ -215,9 +256,13 @@ def _build_words_and_hints(
             "end_ms": _ms(w.get("end") if w.get("end") is not None else w.get("end_ms")),
             "channel": int(w.get("channel", channel)),
         })
-        speaker_index = (
-            int(w["speaker"]) if w.get("speaker") is not None
-            else (speaker_for_index[i] if speaker_for_index and i < len(speaker_for_index) else 0)
+        speaker_index = _coerce_speaker_index(
+            w.get("speaker"),
+            fallback=(
+                speaker_for_index[i]
+                if speaker_for_index and i < len(speaker_for_index)
+                else 0
+            ),
         )
         out_hints.append({
             "id": str(uuid.uuid4()),
