@@ -153,14 +153,43 @@ def diarize(
     Pass `num_clusters` if you know the speaker count exactly. Otherwise
     `cluster_threshold` (0.5 default) controls sensitivity - smaller →
     more speakers, larger → fewer speakers."""
+    samples, sr = _load_wav_16k_mono(audio_path)
+    return _diarize_samples(
+        samples, sr,
+        num_clusters=num_clusters,
+        cluster_threshold=cluster_threshold,
+        num_threads=num_threads,
+        on_progress=on_progress,
+        cache_dir=cache_dir,
+    )
+
+
+def _diarize_samples(
+    samples,
+    sr: int,
+    *,
+    num_clusters: int | None = None,
+    cluster_threshold: float = 0.5,
+    num_threads: int = 4,
+    on_progress: Optional[Callable[[float], None]] = None,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+) -> list[dict]:
+    """Run sherpa-onnx speaker diarization on already-loaded samples.
+
+    Splitting the on-samples step out of ``diarize()`` lets the auto-K
+    pipeline (``diarize_auto``) load the audio exactly once and then
+    pass the same array into both sherpa's diarization AND the
+    standalone embedding extractor. Loading twice is dangerous — on
+    long-running diarization jobs the upstream FastAPI handler may
+    have already cleaned up the tempfile by the time the second load
+    fires, and we lose the entire transcription.
+    """
     diarizer = load_diarizer(
         num_clusters=num_clusters,
         cluster_threshold=cluster_threshold,
         num_threads=num_threads,
         cache_dir=cache_dir,
     )
-
-    samples, sr = _load_wav_16k_mono(audio_path)
     if sr != diarizer.sample_rate:
         raise RuntimeError(
             f"Audio sample rate {sr} doesn't match diarizer's "
@@ -435,6 +464,161 @@ def _pick_k_eigengap(
     return k_chosen, eigvals.tolist()
 
 
+def _silhouette_score(
+    affinity: "np.ndarray", labels: "np.ndarray",
+) -> float:
+    """Canonical silhouette score on a cosine-similarity affinity
+    matrix. Converts to distance internally so the formula matches
+    the standard sklearn / Rousseeuw 1987 definition.
+
+    For each point i, compute:
+      a_i = mean distance to other points in its own cluster
+      b_i = min mean distance to any other cluster
+      s_i = (b_i − a_i) / max(a_i, b_i)
+
+    Return the mean s_i across points. Range is [−1, 1]:
+      * +1  ⇒ point sits well inside its cluster
+      *  0  ⇒ point is on the boundary
+      * −1  ⇒ point is misclassified
+
+    Why distance, not similarity: cosine sim can dip slightly
+    negative for near-orthogonal embeddings, which makes the
+    similarity-based formulation produce scores outside [−1, 1]. The
+    distance form (``1 − sim``, clipped at 0) is always
+    non-negative and matches every reference implementation.
+    """
+    import numpy as np
+    n = affinity.shape[0]
+    unique = np.unique(labels)
+    if len(unique) < 2 or n < 2:
+        return 0.0
+
+    # Distance = 1 − sim, clipped to [0, 2]. Self-distance of 0 is
+    # never used because we exclude i from its own-cluster mean.
+    distance = 1.0 - np.clip(affinity, -1.0, 1.0)
+
+    s_vals: list[float] = []
+    for i in range(n):
+        own = labels[i]
+        own_mask = labels == own
+        if own_mask.sum() <= 1:
+            # Singleton cluster — silhouette undefined; skip rather
+            # than poison the mean with nan.
+            continue
+        own_mask = own_mask.copy()
+        own_mask[i] = False
+        a_i = float(np.mean(distance[i, own_mask]))
+
+        b_i = np.inf
+        for u in unique:
+            if u == own:
+                continue
+            other_mask = labels == u
+            if other_mask.any():
+                b_i = min(b_i, float(np.mean(distance[i, other_mask])))
+        if not np.isfinite(b_i):
+            continue
+
+        m = max(a_i, b_i)
+        if m == 0:
+            s_vals.append(0.0)
+        else:
+            s_vals.append((b_i - a_i) / m)
+    return float(np.mean(s_vals)) if s_vals else 0.0
+
+
+def _pick_k_silhouette(
+    affinity: "np.ndarray",
+    *,
+    k_min: int = _AUTO_K_DEFAULT_K_MIN,
+    k_max: int = _AUTO_K_DEFAULT_K_MAX,
+    prefer_higher_within: float = 0.02,
+    monologue_affinity: float = _AUTO_K_MONOLOGUE_AFFINITY,
+) -> tuple[int, list[tuple[int, float]]]:
+    """Pick K by sweeping spectral clustering across ``[k_min, k_max]``
+    and choosing the K that maximizes the silhouette score.
+
+    Returns ``(k_chosen, [(k, silhouette), ...])``.
+
+    Tiebreak: when multiple K have silhouette within
+    ``prefer_higher_within`` of the maximum (default 0.02), prefer the
+    LARGER K. This biases toward more speakers when the data is
+    ambiguous, which is the right error mode for diarization:
+    under-splitting loses information, over-splitting just shows
+    extra labels the user can ignore.
+
+    Replaces the eigengap heuristic for the default path because
+    eigengap-argmax has a well-known failure mode where the trivial
+    λ_0 → λ_1 gap (or the K=1 → K=2 gap) dominates and the algorithm
+    misses the secondary maximum at the real K. We hit this in
+    production on a 4-speaker legal call where eigengap picked K=2
+    despite silhouette peaking at K=3 / K=4. The eigengap path is
+    still available via ``_pick_k_eigengap`` for callers that need
+    deterministic O(n²) selection on tiny inputs; the silhouette path
+    is O(K · n²) but that's still sub-second at n=500.
+    """
+    import numpy as np
+    n = affinity.shape[0]
+    if n <= 1:
+        return 1, []
+    if n == 2:
+        sim = float(affinity[0, 1])
+        return (1 if sim > monologue_affinity else 2), [(2, 0.0)]
+
+    iu = np.triu_indices(n, k=1)
+    mean_sim = float(np.mean(affinity[iu])) if iu[0].size else 0.0
+    if mean_sim >= monologue_affinity:
+        return 1, []
+
+    k_search = min(k_max, n - 1)
+    if k_min > k_search:
+        return k_search, []
+
+    scores: list[tuple[int, float]] = []
+    for k in range(k_min, k_search + 1):
+        labels = _spectral_cluster(affinity, k)
+        scores.append((k, _silhouette_score(affinity, labels)))
+
+    if not scores:
+        return min(k_min, n - 1), []
+
+    best = max(s for _, s in scores)
+    # Prefer larger K when within ε of best (over-split bias).
+    candidates = [k for k, s in scores if s >= best - prefer_higher_within]
+    return max(candidates), scores
+
+
+def _validate_cluster_airtime(
+    raw_segments: list[dict],
+    centroid_to_label: dict[str, int],
+    *,
+    min_fraction: float = 0.03,
+    min_seconds: float = 30.0,
+) -> bool:
+    """Reject a candidate clustering if any final cluster has less
+    than ``max(min_seconds, min_fraction × total_airtime)`` of speech.
+
+    The silhouette picker already filters most over-clustering
+    failures, but it can't catch the case where spectral clustering
+    splits one acoustically-stable speaker into two thin clusters
+    that both score reasonably. Requiring every final speaker to hold
+    at least 3% of the conversation (and at least 30 s of speech)
+    catches those.
+    """
+    import collections
+    by_label: dict[int, float] = collections.defaultdict(float)
+    for seg in raw_segments:
+        lbl = centroid_to_label.get(seg["speaker"])
+        if lbl is None:
+            continue
+        by_label[lbl] += seg["end"] - seg["start"]
+    if not by_label:
+        return True
+    total = sum(by_label.values())
+    smallest = min(by_label.values())
+    return smallest >= max(min_seconds, total * min_fraction)
+
+
 def _spectral_cluster(
     affinity: "np.ndarray", k: int, *, seed: int = 42,
 ) -> "np.ndarray":
@@ -551,11 +735,21 @@ def diarize_auto(
 
     seg_path, emb_path = ensure_models(cache_dir)
 
+    # 0) Load the audio EXACTLY ONCE. We pass the same samples array
+    #    into both sherpa's diarization step and the standalone
+    #    embedding extractor below. Loading twice is dangerous — on
+    #    long-running diarization jobs the upstream tempfile may have
+    #    been cleaned up by the time the second load fires, and we
+    #    lose the entire transcription. (This bit us on a 71-min
+    #    legal call where Char or macOS unlinked the tempfile during
+    #    the 5-minute sherpa pass; we now keep the bytes in memory.)
+    samples, sr = _load_wav_16k_mono(audio_path)
+
     # 1) Tight-threshold sherpa pass (segmentation + over-clustering).
     #    The over-clustering is the point: we WANT each chunk to land
     #    in its own micro-cluster so we can re-cluster cleanly below.
-    raw_segments = diarize(
-        audio_path,
+    raw_segments = _diarize_samples(
+        samples, sr,
         num_clusters=None,
         cluster_threshold=tight_threshold,
         num_threads=num_threads,
@@ -583,8 +777,8 @@ def diarize_auto(
 
     # 2) Centroid embedding per micro-cluster (with the noise filter
     #    that drops sub-3s phantoms — the single biggest quality win
-    #    for eigengap on long recordings).
-    samples, sr = _load_wav_16k_mono(audio_path)
+    #    for eigengap on long recordings). Re-uses the samples loaded
+    #    in step 0.
     centroids = _extract_centroid_embeddings(
         samples, sr, raw_segments,
         embedding_path=emb_path, num_threads=num_threads,
@@ -604,30 +798,53 @@ def diarize_auto(
             for s in sorted(raw_segments, key=lambda s: s["start"])
         ]
 
-    # 3) Build affinity matrix on centroids and pick K via eigengap.
+    # 3) Build affinity matrix on centroids and pick K via silhouette.
     speaker_keys = list(centroids.keys())
     emb_matrix = np.stack([centroids[k] for k in speaker_keys])
     affinity = emb_matrix @ emb_matrix.T  # cosine sim (already unit-normed)
 
-    k_final, eigvals = _pick_k_eigengap(
+    k_final, scores = _pick_k_silhouette(
         affinity, k_max=k_max, k_min=k_min,
         monologue_affinity=monologue_affinity,
     )
     log.info(
-        "%seigengap chose K=%d (filtered_centroids=%d, eigvals[:%d]=%s)",
+        "%ssilhouette chose K=%d (filtered_centroids=%d, "
+        "silhouette_by_k=%s)",
         log_id, k_final, len(speaker_keys),
-        min(k_max + 1, len(eigvals)),
-        [f"{v:.3f}" for v in eigvals[: min(k_max + 1, len(eigvals))]],
+        [f"K={k}:{s:+.3f}" for k, s in scores],
     )
 
-    # 4) Spectral cluster the centroids to K.
-    centroid_labels = _spectral_cluster(affinity, k_final)
+    # 4) Spectral cluster the centroids to K, with an airtime
+    #    validation fallback: if the chosen K produced a sliver
+    #    cluster (< 3% of total speech AND < 30 s), step down to
+    #    K−1, K−2, ... until either the clustering is valid or we
+    #    hit K=1. Catches the case where spectral clustering splits
+    #    a single acoustically-stable speaker.
+    k_attempted = k_final
+    while k_attempted >= 1:
+        if k_attempted == 1:
+            # All segments collapse to one speaker.
+            return [
+                {"speaker": "SPEAKER_00",
+                 "start": float(s["start"]), "end": float(s["end"])}
+                for s in sorted(raw_segments, key=lambda s: s["start"])
+            ]
+        centroid_labels = _spectral_cluster(affinity, k_attempted)
+        centroid_to_label = {
+            speaker_keys[i]: int(centroid_labels[i])
+            for i in range(len(speaker_keys))
+        }
+        if _validate_cluster_airtime(raw_segments, centroid_to_label):
+            if k_attempted != k_final:
+                log.info(
+                    "%sstepped K=%d → K=%d (smaller cluster failed "
+                    "airtime check at the higher K)",
+                    log_id, k_final, k_attempted,
+                )
+            break
+        k_attempted -= 1
 
-    # 5) Build {raw_speaker → final_label} and remap.
-    centroid_to_label: dict[str, int] = {
-        speaker_keys[i]: int(centroid_labels[i])
-        for i in range(len(speaker_keys))
-    }
+    # 5) Apply the {raw_speaker → final_label} mapping to segments.
     return _remap_segments(raw_segments, centroid_to_label)
 
 
