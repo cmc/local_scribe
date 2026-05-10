@@ -30,16 +30,22 @@ from pathlib import Path
 
 import secret_store
 from secret_store import (
+    ACCOUNT_KC_HALF_V2,
+    ACCOUNT_LEGACY_V1,
     HelperMissingError,
     KEY_BYTES,
     MasterKey,
     SecretStoreError,
     UserCancelledError,
+    delete_kc_half,
     delete_master_key,
     generate_master_key,
+    has_kc_half,
     has_master_key,
     helper_path,
+    load_kc_half,
     load_master_key,
+    store_kc_half,
     store_master_key,
 )
 
@@ -64,9 +70,23 @@ def _write_fake_helper(tmp: Path, *, behavior: str = "happy") -> Path:
     # Bash's `read` returns 1 on EOF-without-newline, which under `set -e`
     # kills the script before we get a chance to validate. Using a plain
     # `read || true` reproduces Swift's tolerance.
+    #
+    # The fake helper supports the same ``[--account NAME] <cmd>``
+    # surface as the real Swift binary: when ``--account NAME`` is
+    # present we map to a per-account state file
+    # (``stored.<NAME>.hex``); otherwise we fall back to a default
+    # ``stored.hex`` for backward-compatibility with pre-Option-C tests.
     bodies = {
         "happy": f"""
-            STATE_FILE={state}
+            DEFAULT_STATE={state}
+            STATE_DIR=$(dirname "$DEFAULT_STATE")
+            ACCOUNT=master_key
+            if [ "$1" = "--account" ]; then
+              ACCOUNT="$2"; shift 2
+              STATE_FILE="$STATE_DIR/stored.$ACCOUNT.hex"
+            else
+              STATE_FILE="$DEFAULT_STATE"
+            fi
             case "$1" in
               exists)
                 if [ -f "$STATE_FILE" ]; then exit 0; else exit 2; fi
@@ -100,6 +120,7 @@ def _write_fake_helper(tmp: Path, *, behavior: str = "happy") -> Path:
             esac
         """,
         "missing_item": """
+            if [ "$1" = "--account" ]; then shift 2; fi
             case "$1" in
               exists) exit 2;;
               load) echo "error: key not stored" >&2; exit 2;;
@@ -108,6 +129,7 @@ def _write_fake_helper(tmp: Path, *, behavior: str = "happy") -> Path:
             esac
         """,
         "cancelled": """
+            if [ "$1" = "--account" ]; then shift 2; fi
             case "$1" in
               exists) exit 0;;
               load)   echo "error: Touch ID cancelled" >&2; exit 3;;
@@ -120,6 +142,7 @@ def _write_fake_helper(tmp: Path, *, behavior: str = "happy") -> Path:
             exit 4
         """,
         "broken_output": """
+            if [ "$1" = "--account" ]; then shift 2; fi
             case "$1" in
               load) echo "NOT-HEX-DATA"; exit 0;;
               exists) exit 0;;
@@ -127,6 +150,7 @@ def _write_fake_helper(tmp: Path, *, behavior: str = "happy") -> Path:
             esac
         """,
         "short_output": """
+            if [ "$1" = "--account" ]; then shift 2; fi
             case "$1" in
               load) printf "deadbeef\\n"; exit 0;;
               exists) exit 0;;
@@ -319,6 +343,63 @@ class HelperMissingTests(unittest.TestCase):
                     os.environ.pop(secret_store.HELPER_ENV, None)
                 else:
                     os.environ[secret_store.HELPER_ENV] = old
+
+
+# ---------- split-key (Option C) Keychain API ------------------------
+
+
+class KcHalfRoundTripTests(_HelperEnvMixin, unittest.TestCase):
+    """The Option C split-key API stores ``kc_half`` under a separate
+    Keychain account (``master_key_kc_half_v2``). These tests exercise
+    the same round-trip as the legacy API but on the new account, and
+    additionally verify the two namespaces don't bleed into each other
+    when both are populated at once.
+    """
+    BEHAVIOR = "happy"
+
+    def test_account_constants_distinct(self):
+        self.assertEqual(ACCOUNT_LEGACY_V1, "master_key")
+        self.assertEqual(ACCOUNT_KC_HALF_V2, "master_key_kc_half_v2")
+        self.assertNotEqual(ACCOUNT_LEGACY_V1, ACCOUNT_KC_HALF_V2)
+
+    def test_has_kc_half_false_when_unset(self):
+        self.assertFalse(has_kc_half())
+
+    def test_kc_half_round_trip(self):
+        half = generate_master_key()  # OS-CSPRNG 32 bytes — fine for kc_half
+        store_kc_half(half)
+        self.assertTrue(has_kc_half())
+        self.assertEqual(load_kc_half(prompt="Test kc_half"), half)
+
+    def test_kc_half_rejects_wrong_length(self):
+        with self.assertRaises(ValueError):
+            store_kc_half(b"\x00" * 16)
+        with self.assertRaises(ValueError):
+            store_kc_half(b"")
+
+    def test_kc_half_delete_removes(self):
+        store_kc_half(generate_master_key())
+        self.assertTrue(has_kc_half())
+        delete_kc_half()
+        self.assertFalse(has_kc_half())
+
+    def test_legacy_and_kc_half_are_isolated(self):
+        legacy = b"\xaa" * KEY_BYTES
+        kc = b"\xbb" * KEY_BYTES
+        store_master_key(legacy)
+        store_kc_half(kc)
+        self.assertTrue(has_master_key())
+        self.assertTrue(has_kc_half())
+        self.assertEqual(load_master_key(prompt="leg"), legacy)
+        self.assertEqual(load_kc_half(prompt="kch"), kc)
+        delete_master_key()
+        self.assertFalse(has_master_key())
+        # Deleting one must leave the other intact — this is the
+        # property the split-key flow depends on (migration deletes
+        # the legacy item *after* writing kc_half).
+        self.assertTrue(has_kc_half())
+        delete_kc_half()
+        self.assertFalse(has_kc_half())
 
 
 if __name__ == "__main__":

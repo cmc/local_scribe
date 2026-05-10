@@ -5,25 +5,38 @@
 // stack stays pure-Python (no PyObjC dependency, ~0 install size beyond what
 // Xcode CLT already provides).
 //
-// Commands (one positional arg, all data on stdin/stdout, never argv):
+// Usage:
 //
-//   touchid-keychain store
+//   touchid-keychain [--account NAME] <store|load|exists|delete> [prompt]
+//
+// The optional ``--account NAME`` flag (which MUST precede the subcommand)
+// selects which Keychain item to operate on. We use multiple accounts under
+// the same ``service=local_scribe`` namespace for the split-key Option C
+// architecture: ``master_key`` is the legacy whole-key item (kept for
+// backward compatibility / migration), and ``master_key_kc_half_v2`` holds
+// one half of an XOR-split key; the other half lives in a YubiKey-encrypted
+// age file on disk. Defaults to ``master_key`` when --account is omitted
+// for backward compatibility with the pre-Option-C wire format.
+//
+// Commands (all data on stdin/stdout, never argv):
+//
+//   touchid-keychain [--account NAME] store
 //       Reads a hex-encoded key from stdin, writes it to the Keychain item
-//       (service=local_scribe, account=master_key) with an access control
+//       (service=local_scribe, account=<NAME>) with an access control
 //       requiring user presence (Touch ID + passcode fallback). Replaces any
 //       existing item.
 //
-//   touchid-keychain load [prompt]
+//   touchid-keychain [--account NAME] load [prompt]
 //       Reads the item from the Keychain. macOS shows the Touch ID prompt
 //       with ``prompt`` as the explanation text ("Unlock local_scribe
 //       vault" by default). Prints the hex-encoded key on stdout.
 //
-//   touchid-keychain exists
+//   touchid-keychain [--account NAME] exists
 //       Exits 0 if the item exists (without prompting), 2 if not. Uses
 //       ``kSecUseAuthenticationUISkip`` so a missing biometric session
 //       won't pop UI.
 //
-//   touchid-keychain delete
+//   touchid-keychain [--account NAME] delete
 //       Removes the item if present. Always exits 0.
 //
 // Error exits (so callers can branch):
@@ -42,7 +55,7 @@ import Security
 import LocalAuthentication
 
 let SERVICE = "local_scribe"
-let ACCOUNT = "master_key"
+let DEFAULT_ACCOUNT = "master_key"
 
 // errSecUserCanceled is defined as -128 in macOS SDKs; pull from the
 // Security framework so we don't hardcode an integer.
@@ -80,17 +93,17 @@ extension Data {
 
 // MARK: - Keychain ops
 
-func deleteItem() {
+func deleteItem(account: String) {
     // Pure delete; ignore "not found".
     let q: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: SERVICE,
-        kSecAttrAccount as String: ACCOUNT,
+        kSecAttrAccount as String: account,
     ]
     _ = SecItemDelete(q as CFDictionary)
 }
 
-func storeKey(_ key: Data) {
+func storeKey(_ key: Data, account: String) {
     var err: Unmanaged<CFError>?
     // .userPresence = Touch ID *or* device passcode. We deliberately accept
     // the passcode fallback so users without enrolled fingerprints (or with
@@ -106,12 +119,12 @@ func storeKey(_ key: Data) {
     }
 
     // Replace-on-add: simplest correct semantics for "store the latest key".
-    deleteItem()
+    deleteItem(account: account)
 
     let attrs: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: SERVICE,
-        kSecAttrAccount as String: ACCOUNT,
+        kSecAttrAccount as String: account,
         kSecValueData as String: key,
         kSecAttrAccessControl as String: access,
         // We *want* the auth UI on read (later); the add itself happens
@@ -125,7 +138,7 @@ func storeKey(_ key: Data) {
     }
 }
 
-func loadKey(prompt: String) -> Data {
+func loadKey(account: String, prompt: String) -> Data {
     // Modern replacement for the deprecated kSecUseOperationPrompt: build
     // an LAContext with our user-facing reason string and pass it via
     // kSecUseAuthenticationContext. The result is identical (Touch ID
@@ -136,7 +149,7 @@ func loadKey(prompt: String) -> Data {
     let q: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: SERVICE,
-        kSecAttrAccount as String: ACCOUNT,
+        kSecAttrAccount as String: account,
         kSecReturnData as String: true,
         kSecMatchLimit as String: kSecMatchLimitOne,
         kSecUseAuthenticationContext as String: ctx,
@@ -144,7 +157,7 @@ func loadKey(prompt: String) -> Data {
     var item: CFTypeRef?
     let status = SecItemCopyMatching(q as CFDictionary, &item)
     if status == errSecItemNotFound {
-        die("key not stored (run \"./run.sh vault init\")", code: 2)
+        die("key not stored (run \"./run.sh key init\")", code: 2)
     }
     if kCanceledStatuses.contains(status) {
         die("Touch ID cancelled / auth failed", code: 3)
@@ -158,7 +171,7 @@ func loadKey(prompt: String) -> Data {
     return data
 }
 
-func itemExists() -> Bool {
+func itemExists(account: String) -> Bool {
     // kSecUseAuthenticationUISkip => return errSecInteractionNotAllowed
     // ( -25308 ) when the item exists but reading it would require user
     // interaction. That's exactly the "yes, it's there, but I'm not going
@@ -166,7 +179,7 @@ func itemExists() -> Bool {
     let q: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: SERVICE,
-        kSecAttrAccount as String: ACCOUNT,
+        kSecAttrAccount as String: account,
         kSecReturnData as String: false,
         kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
     ]
@@ -176,9 +189,32 @@ func itemExists() -> Bool {
 
 // MARK: - dispatch
 
-let args = Array(CommandLine.arguments.dropFirst())
-guard let cmd = args.first else {
-    die("usage: touchid-keychain <store|load|exists|delete> [prompt]")
+// Parse a leading ``--account NAME`` flag, then the subcommand. We keep the
+// CLI surface tiny and positional after the optional flag so the Swift code
+// stays auditable; ``secret_store.py`` is the only intended caller.
+var rest = Array(CommandLine.arguments.dropFirst())
+var account = DEFAULT_ACCOUNT
+if rest.count >= 2, rest[0] == "--account" {
+    let candidate = rest[1]
+    // Defensive whitelist: account names must look like identifiers so we
+    // don't accidentally accept attacker-controlled metadata if someone
+    // wires ``--account`` to user input. ``master_key`` and
+    // ``master_key_kc_half_v2`` (the only callers in tree) pass; arbitrary
+    // strings with spaces / shell metacharacters don't.
+    let allowed: CharacterSet = {
+        var s = CharacterSet.alphanumerics
+        s.insert(charactersIn: "_-")
+        return s
+    }()
+    if candidate.isEmpty || candidate.rangeOfCharacter(from: allowed.inverted) != nil {
+        die("invalid --account value")
+    }
+    account = candidate
+    rest = Array(rest.dropFirst(2))
+}
+
+guard let cmd = rest.first else {
+    die("usage: touchid-keychain [--account NAME] <store|load|exists|delete> [prompt]")
 }
 
 switch cmd {
@@ -190,23 +226,23 @@ case "store":
     guard let bytes = Data.fromHex(line), !bytes.isEmpty else {
         die("invalid hex on stdin", code: 5)
     }
-    storeKey(bytes)
+    storeKey(bytes, account: account)
     exit(0)
 
 case "load":
-    let prompt = args.count >= 2
-        ? args[1...].joined(separator: " ")
+    let prompt = rest.count >= 2
+        ? rest[1...].joined(separator: " ")
         : "Unlock local_scribe vault"
-    let data = loadKey(prompt: prompt)
+    let data = loadKey(account: account, prompt: prompt)
     // stdout — append a newline so shell wrappers can `$(...)` cleanly.
     print(data.hexString)
     exit(0)
 
 case "exists":
-    exit(itemExists() ? 0 : 2)
+    exit(itemExists(account: account) ? 0 : 2)
 
 case "delete":
-    deleteItem()
+    deleteItem(account: account)
     exit(0)
 
 default:

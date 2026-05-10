@@ -228,7 +228,15 @@ class ServiceToken:
             prompt = (
                 f"Unlock local_scribe to start the {service} server"
             )
-        mk = MasterKey.unlock(prompt=prompt)
+        # Route through key_lifecycle so we get the split-key (Option C)
+        # flow on v2 installs and an implicit migration on v1 installs.
+        # The legacy ``MasterKey.unlock`` direct path is kept around for
+        # secret_store unit tests but is no longer used by production
+        # code paths.
+        import key_lifecycle  # local import: keep service_auth importable
+                              # without key_lifecycle's dependencies
+                              # (yubikey_backup) on bare-metal CI.
+        mk = key_lifecycle.unlock_master_key(prompt=prompt)
         try:
             token = derive_service_token(mk.as_bytes(), service)
         finally:
@@ -455,9 +463,11 @@ def client_token_for(service: str, *,
                 f"LOCAL_SCRIBE_MASTER_KEY_HEX not valid hex: {exc}"
             ) from exc
         return derive_service_token(mk, service)
-    # Default: prompt Touch ID and derive.
-    mk = MasterKey.unlock(prompt=prompt or
-                          f"Authenticate local_scribe to call the {service} server")
+    # Default: split-key unlock (Touch ID + YubiKey tap).
+    import key_lifecycle
+    mk = key_lifecycle.unlock_master_key(
+        prompt=prompt or f"Authenticate local_scribe to call the {service} server"
+    )
     try:
         return derive_service_token(mk.as_bytes(), service)
     finally:

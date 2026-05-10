@@ -64,6 +64,15 @@
 #                            `enable` and `disable` require sudo (we prompt
 #                            via the macOS admin dialog). See SECURITY.md
 #                            for the full host catalog and threat model.
+#   ./run.sh key {status|init|unlock|rotate|add-yubikey|dr-restore|migrate|destroy}
+#                            manage the split-key (Option C) master key:
+#                            Keychain (Touch ID) AND YubiKey (tap) both
+#                            required to unlock. ``init`` walks first-time
+#                            enrollment and optional passphrase-encrypted
+#                            disaster-recovery backup. All key material
+#                            flows over stdin / Keychain ACL; never argv,
+#                            never env, never logs. See ARCHITECTURE.md
+#                            §4 + SECURITY.md for the threat model.
 #
 # Env overrides (prefer ~/.config/local_scribe/config.json for these):
 #   ASR_BACKEND       default parakeet  (parakeet | whisper)
@@ -219,6 +228,37 @@ ensure_pip_deps() {
   fi
   touch "$DEPS_STAMP"
   say "${c_green}python deps ready${c_reset}"
+}
+
+# Compile the Touch ID / Keychain bridge if it's missing or older than
+# the .swift source. The compiled binary lives at bin/touchid-keychain
+# and is gitignored; we recompile on every source change so updates to
+# the Swift CLI (e.g. the --account flag for the Option C split-key
+# storage) take effect without a manual swiftc step. swiftc ships with
+# Xcode CLT; if it's not on PATH we leave a clear "install xcode-select"
+# hint -- this whole stack assumes Xcode CLT for compiled native helpers.
+ensure_touchid_helper() {
+  local src="$REPO/bin/touchid_keychain.swift"
+  local out="$REPO/bin/touchid-keychain"
+  if [[ ! -f "$src" ]]; then
+    say "${c_yellow}Touch ID helper source missing at $src${c_reset}"
+    return 0  # not fatal; the rest of the pipeline runs without it
+  fi
+  if [[ -x "$out" && "$out" -nt "$src" ]]; then
+    return 0  # up-to-date
+  fi
+  if ! command -v swiftc >/dev/null 2>&1; then
+    say "${c_yellow}swiftc not found — install Xcode Command Line Tools:${c_reset}"
+    say "  xcode-select --install"
+    return 1
+  fi
+  say "compiling Touch ID helper (bin/touchid-keychain) ..."
+  if ! swiftc -O -o "$out" "$src" 2>&1; then
+    say "${c_red}swiftc failed; the Keychain-backed master key won't work${c_reset}"
+    return 1
+  fi
+  chmod 755 "$out"
+  say "${c_green}Touch ID helper compiled${c_reset}"
 }
 
 # Pre-fetch the parakeet-mlx weights into the HuggingFace cache. parakeet-mlx
@@ -649,8 +689,9 @@ cmd_setup() {
 cmd_bootstrap() {
   printf "%sbootstrap%s — first-time setup for a fresh clone\n\n" "$c_bold" "$c_reset"
 
-  printf "%s(1/7) python venv + pip deps%s\n" "$c_bold" "$c_reset"
+  printf "%s(1/7) python venv + pip deps + Touch ID helper%s\n" "$c_bold" "$c_reset"
   ensure_pip_deps             || return 1
+  ensure_touchid_helper       || true   # best-effort; doctor will flag
 
   printf "\n%s(2/7) parakeet ASR weights%s\n" "$c_bold" "$c_reset"
   ensure_parakeet_model       || return 1
@@ -1056,36 +1097,24 @@ PY
     say "${c_yellow}auth bypass enabled — Char's api_key set to a placeholder${c_reset}"
   fi
 
-  # Patch the four keys we care about. Everything else (LLM, templates,
-  # general.*, calendars, etc.) is left untouched.
-  if ! "$VENV_PY" - "$CHAR_SETTINGS" "$ASR_PORT" "$asr_token" <<'PY'
-import json, sys, pathlib
-p = pathlib.Path(sys.argv[1]); port = sys.argv[2]; tok = sys.argv[3]
-d = json.loads(p.read_text())
-ai  = d.setdefault("ai", {})
-stt = ai.setdefault("stt", {})
-oai = stt.setdefault("openai", {})
-ai["current_stt_provider"] = "openai"
-# `gpt-4o-transcribe` triggers Char's progressive (SSE-streamed) batch path.
-# Char's tauri-plugin-transcription/listener2/ext.rs hardcodes a 60-second
-# BATCH_IDLE_TIMEOUT for the non-streaming `gpt-4o-transcribe-diarize` path,
-# which silently aborts the spawned future on any audio whose ASR takes
-# longer than 60s -- our local Parakeet pass is ~80x realtime so that's any
-# meeting longer than ~80 minutes. The progressive path resets the timer on
-# every SSE delta, and our /v1/audio/transcriptions endpoint emits heartbeat
-# deltas every STREAM_HEARTBEAT_SECONDS to keep it alive on long files.
-ai["current_stt_model"]    = "gpt-4o-transcribe"
-oai["base_url"]            = f"http://127.0.0.1:{port}/v1"
-# api_key is the per-service ASR bearer token (HKDF-derived from the
-# Keychain master key -- see service_auth.py). Anything else here, and
-# the ASR server returns 401.
-oai["api_key"]             = tok
-p.write_text(json.dumps(d, indent=2) + "\n")
-PY
-  then
+  # Patch the four keys we care about. Everything else (LLM,
+  # templates, general.*, calendars, etc.) is left untouched.
+  #
+  # The ASR token is sent on stdin (as three newline-separated values:
+  # settings_path, port, token) to ``python -m char_settings_writer``
+  # so it never appears in argv / a ``ps`` listing. ``printf`` is a
+  # bash builtin -- it doesn't fork, so even ``$asr_token`` as its
+  # argument lives only in this shell's memory.
+  if ! printf '%s\n%s\n%s\n' "$CHAR_SETTINGS" "$ASR_PORT" "$asr_token" \
+       | "$VENV_PY" -m char_settings_writer; then
     say "${c_red}failed to write settings.json — your backup is at $settings_backup${c_reset}"
     return 1
   fi
+  # Scrub the local token variable so a downstream `set` / `env` /
+  # accidental subprocess inherit doesn't see it. Best-effort: the
+  # ASR token is short-lived; the user can revoke it any time by
+  # rotating the master key (`./run.sh key rotate`).
+  unset asr_token
 
   # Disable PostHog analytics in Char's tauri-plugin-store2 scoped store. This
   # is the ONLY in-app telemetry kill-switch -- Sentry's DSN is compile-time
@@ -1840,6 +1869,180 @@ EOF
   esac
 }
 
+cmd_key() {
+  shift  # drop "key"
+  local sub="${1:-status}"
+  shift || true
+
+  if [[ ! -x "$VENV_PY" ]]; then
+    say "${c_red}venv python missing — run \`./run.sh bootstrap\` first${c_reset}"
+    return 1
+  fi
+
+  # All key-lifecycle CLI lives in ``python -m key_lifecycle <cmd>``
+  # so secrets (passphrase, master key) flow over stdin / Keychain
+  # ACL only -- never argv, never env. The shell handles UX (TTY
+  # prompts, colour, confirmation) and forwards bytes via pipes.
+
+  case "$sub" in
+    status)
+      exec "$VENV_PY" -m key_lifecycle status
+      ;;
+    init)
+      # First-time setup. Walks the user through:
+      #   1. YubiKey enrollment (if not already enrolled)
+      #   2. Master-key generation + split
+      #   3. kc_half → Keychain (Touch ID ACL attached)
+      #   4. yk_half → age file encrypted to the YubiKey
+      #   5. Optional: passphrase-encrypted disaster-recovery backup
+      local want_dr="yes"
+      local cli_args=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --no-dr) want_dr="no"; cli_args+=("--no-dr"); shift ;;
+          --force) cli_args+=("--force"); shift ;;
+          *) say "unknown key init flag: $1"; return 1 ;;
+        esac
+      done
+
+      printf "%sInitialising local_scribe master key%s\n" "$c_bold" "$c_reset"
+      printf "  This will generate a 256-bit master key, split it via XOR into\n"
+      printf "  two halves, and persist:\n"
+      printf "    1. kc_half  → macOS Keychain (Touch ID-gated)\n"
+      printf "    2. yk_half  → age-encrypted file on disk (YubiKey-decryptable)\n"
+      if [[ "$want_dr" == "yes" ]]; then
+        printf "    3. master   → passphrase-encrypted age file (disaster recovery)\n"
+      fi
+      printf "\n  Insert your YubiKey before continuing.\n\n"
+
+      local dr_pass=""
+      if [[ "$want_dr" == "yes" ]]; then
+        printf "  Disaster-recovery passphrase (won't echo; press Enter to skip): "
+        IFS= read -rs dr_pass </dev/tty
+        printf "\n"
+        if [[ -n "$dr_pass" ]]; then
+          printf "  Re-enter to confirm: "
+          local dr_pass2=""
+          IFS= read -rs dr_pass2 </dev/tty
+          printf "\n"
+          if [[ "$dr_pass" != "$dr_pass2" ]]; then
+            say "${c_red}passphrases do not match; aborting${c_reset}"
+            unset dr_pass dr_pass2
+            return 1
+          fi
+          unset dr_pass2
+        fi
+      fi
+
+      # Pipe the passphrase (possibly empty) to the CLI on stdin; the
+      # CLI treats empty stdin as "no DR backup". The passphrase
+      # never appears in argv or the environment.
+      if ! printf '%s' "$dr_pass" | "$VENV_PY" -m key_lifecycle init "${cli_args[@]}"; then
+        unset dr_pass
+        say "${c_red}key init failed${c_reset}"
+        return 1
+      fi
+      unset dr_pass
+      if [[ "$want_dr" == "yes" ]]; then
+        printf "\n  %s● master key initialised%s (with disaster-recovery backup)\n" "$c_green" "$c_reset"
+      else
+        printf "\n  %s● master key initialised%s (no DR backup -- consider re-running with --dr later)\n" "$c_green" "$c_reset"
+      fi
+      ;;
+    unlock)
+      exec "$VENV_PY" -m key_lifecycle unlock
+      ;;
+    rotate)
+      printf "%sRotating master key%s\n" "$c_bold" "$c_reset"
+      printf "  This unlocks the current key (Touch ID + YubiKey tap), draws a\n"
+      printf "  fresh master, re-splits, and replaces both halves.\n\n"
+      printf "  NOTE: any vault/keybag encrypted under the OLD master key must\n"
+      printf "  be re-encrypted before the old key is forgotten. The vault\n"
+      printf "  re-key step is not yet wired; for now rotation is a developer\n"
+      printf "  smoke test of the split-key plumbing.\n\n"
+      exec "$VENV_PY" -m key_lifecycle rotate
+      ;;
+    add-yubikey|add_yubikey)
+      # Enroll a second YubiKey so either YubiKey can decrypt yk_half.
+      if [[ $# -lt 1 ]]; then
+        say "usage: ./run.sh key add-yubikey age1yubikey1..."
+        say "  obtain the recipient via:"
+        say "    age-plugin-yubikey --generate --slot 1 --name local_scribe_backup"
+        return 1
+      fi
+      exec "$VENV_PY" -m key_lifecycle add-yubikey "$1"
+      ;;
+    dr-restore|dr_restore)
+      printf "%sDisaster-recovery restore%s\n" "$c_bold" "$c_reset"
+      printf "  Reads the passphrase-encrypted master key on disk and (by\n"
+      printf "  default) re-initialises the split-key flow with a fresh\n"
+      printf "  kc_half + yk_half so routine unlock works again.\n\n"
+      printf "  Passphrase (won't echo): "
+      local dr_pass=""
+      IFS= read -rs dr_pass </dev/tty
+      printf "\n"
+      if [[ -z "$dr_pass" ]]; then
+        say "${c_red}empty passphrase; aborting${c_reset}"
+        return 1
+      fi
+      if ! printf '%s' "$dr_pass" | "$VENV_PY" -m key_lifecycle dr-restore; then
+        unset dr_pass
+        say "${c_red}dr-restore failed (wrong passphrase? missing DR file?)${c_reset}"
+        return 1
+      fi
+      unset dr_pass
+      printf "\n  %s● master key recovered%s\n" "$c_green" "$c_reset"
+      ;;
+    migrate)
+      exec "$VENV_PY" -m key_lifecycle migrate
+      ;;
+    destroy)
+      printf "%sThis will destroy every master-key artefact.%s\n" "$c_red" "$c_reset"
+      printf "  All encrypted transcripts / audio will become permanently\n"
+      printf "  unreadable unless you have a YubiKey-decryptable backup OR\n"
+      printf "  remember your disaster-recovery passphrase.\n\n"
+      printf "  Type 'DESTROY' to confirm: "
+      local confirm=""
+      IFS= read -r confirm </dev/tty
+      if [[ "$confirm" != "DESTROY" ]]; then
+        say "aborted (you must type DESTROY exactly)"
+        return 1
+      fi
+      exec "$VENV_PY" -m key_lifecycle destroy
+      ;;
+    -h|--help|help|"")
+      cat <<EOF
+usage: ./run.sh key {status|init|unlock|rotate|add-yubikey|dr-restore|migrate|destroy}
+
+Subcommands:
+  status         JSON snapshot of the key lifecycle (no Touch ID / no YubiKey)
+  init           first-time setup: enroll YubiKey, split key, persist halves
+                   --no-dr     skip the passphrase-encrypted DR backup
+                   --force     replace an existing v2 install (DANGEROUS)
+  unlock         smoke-test the unlock path; prints service-token fingerprints
+  rotate         generate a fresh master key + rewrite both halves
+  add-yubikey R  enroll a second YubiKey (R is its age recipient); re-wraps
+                 yk_half so either YubiKey can decrypt it
+  dr-restore     recover the master key from the on-disk DR file via passphrase
+  migrate        walk a legacy v1 (whole-key Keychain) install over to v2
+  destroy        delete every key artefact (irreversible)
+
+All passphrases are read from /dev/tty (no echo, never on argv). All
+master-key bytes are passed via stdin / Keychain ACL — they never
+appear in process listings, environment variables, or logs.
+
+See SECURITY.md and ARCHITECTURE.md §4 for the full threat model.
+EOF
+      ;;
+    *)
+      say "unknown key subcommand: $sub"
+      say "  run \`./run.sh key help\` for usage"
+      return 1
+      ;;
+  esac
+}
+
+
 cmd_redo_session() {
   shift  # drop "redo-session"
   if [[ $# -eq 0 ]]; then
@@ -1891,6 +2094,7 @@ case "${1:-}" in
   transcribe) cmd_transcribe "$@" ;;
   redo-session|redo_session|redo) cmd_redo_session "$@" ;;
   firewall|fw) cmd_firewall "$@" ;;
+  key|keys)   cmd_key "$@" ;;
   ""|-h|--help|help)
     awk 'NR==1{next}
          /^#/{sub(/^# ?/,""); print; next}

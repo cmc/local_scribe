@@ -58,6 +58,13 @@ DEFAULT_HELPER_PATH = Path(__file__).resolve().parent / "bin" / "touchid-keychai
 # helper that returns canned hex without involving the real Keychain.
 HELPER_ENV = "LOCAL_SCRIBE_TOUCHID_HELPER"
 
+# Keychain account names. ``ACCOUNT_LEGACY_V1`` is the pre-split-key
+# whole-key item; the migration path reads from it and then writes
+# ``ACCOUNT_KC_HALF_V2`` before deleting the v1 item. New installs
+# only ever see the v2 account.
+ACCOUNT_LEGACY_V1 = "master_key"
+ACCOUNT_KC_HALF_V2 = "master_key_kc_half_v2"
+
 
 class SecretStoreError(Exception):
     """Raised when the underlying Keychain helper fails for any reason
@@ -87,20 +94,30 @@ def helper_path() -> Path:
 
 
 def _run_helper(args: list[str], *, stdin: Optional[str] = None,
-                allow_exits: tuple[int, ...] = (0,)
+                allow_exits: tuple[int, ...] = (0,),
+                account: Optional[str] = None,
                 ) -> subprocess.CompletedProcess:
     """Execute the helper, returning a CompletedProcess. Translates exit
     codes documented by the Swift CLI into the corresponding Python
-    exceptions for ergonomic call sites."""
+    exceptions for ergonomic call sites.
+
+    When ``account`` is given the helper is invoked with
+    ``--account NAME`` *before* the subcommand so the same binary can
+    manage multiple keychain items (currently the legacy whole-key item
+    and the split-key ``kc_half``). The Swift CLI documents the flag
+    and falls back to ``master_key`` when absent for backward
+    compatibility with the pre-Option-C wire format.
+    """
     binpath = helper_path()
     if not binpath.is_file() or not os.access(binpath, os.X_OK):
         raise HelperMissingError(
             f"Touch ID helper not found / not executable: {binpath}. "
             f"Run `./run.sh bootstrap` to compile it."
         )
+    prefix = ["--account", account] if account else []
     try:
         proc = subprocess.run(
-            [str(binpath), *args],
+            [str(binpath), *prefix, *args],
             input=stdin,
             text=True,
             capture_output=True,
@@ -126,12 +143,49 @@ def _run_helper(args: list[str], *, stdin: Optional[str] = None,
     raise SecretStoreError(msg)
 
 
-def has_master_key() -> bool:
-    """True if the master key is present in the Keychain. Does *not*
-    trigger a Touch ID prompt (uses kSecUseAuthenticationUISkip
-    internally) so it's safe to call from status-check code paths."""
-    proc = _run_helper(["exists"], allow_exits=(0, 2))
+def _has_item(*, account: Optional[str] = None) -> bool:
+    proc = _run_helper(["exists"], allow_exits=(0, 2), account=account)
     return proc.returncode == 0
+
+
+def _store_item(data: bytes, *, account: Optional[str] = None) -> None:
+    if not isinstance(data, (bytes, bytearray)) or len(data) != KEY_BYTES:
+        raise ValueError(f"data must be {KEY_BYTES} bytes, got {len(data)}")
+    _run_helper(["store"], stdin=bytes(data).hex(), account=account)
+
+
+def _load_item(*, prompt: str, account: Optional[str] = None) -> bytes:
+    proc = _run_helper(["load", prompt], account=account)
+    hex_data = (proc.stdout or "").strip()
+    try:
+        data = bytes.fromhex(hex_data)
+    except ValueError as exc:
+        raise SecretStoreError(f"helper returned non-hex data: {exc}") from exc
+    if len(data) != KEY_BYTES:
+        raise SecretStoreError(
+            f"helper returned {len(data)} bytes, expected {KEY_BYTES}"
+        )
+    return data
+
+
+def _delete_item(*, account: Optional[str] = None) -> None:
+    _run_helper(["delete"], account=account)
+
+
+# ---- legacy whole-key API (v1) — kept for migration + tests ---------
+
+
+def has_master_key() -> bool:
+    """True if the legacy v1 *whole-key* item is present in the
+    Keychain. Used only by the migration path
+    (``key_lifecycle.migrate_v1_to_v2``); new code should prefer
+    :func:`has_kc_half`.
+
+    Does *not* trigger a Touch ID prompt (uses
+    ``kSecUseAuthenticationUISkip`` internally) so it's safe to call
+    from status-check code paths.
+    """
+    return _has_item(account=ACCOUNT_LEGACY_V1)
 
 
 def generate_master_key() -> bytes:
@@ -140,47 +194,71 @@ def generate_master_key() -> bytes:
 
 
 def store_master_key(key: bytes) -> None:
-    """Persist ``key`` into the Keychain, replacing any existing item.
+    """Persist a legacy v1 whole-key item. Used by migration tests and
+    the v1 backward-compat path. New installs use the split-key flow
+    in :mod:`key_lifecycle` and never call this.
 
     This call does *not* prompt for Touch ID -- the access-control
-    metadata is attached and only triggers on subsequent loads. This
-    matters for bootstrap UX: the user gets exactly one Touch ID prompt
-    (when the vault is first mounted), not two (store + mount).
+    metadata is attached and only triggers on subsequent loads.
     """
-    if not isinstance(key, (bytes, bytearray)) or len(key) != KEY_BYTES:
-        raise ValueError(f"key must be {KEY_BYTES} bytes, got {len(key)}")
-    _run_helper(["store"], stdin=bytes(key).hex())
+    _store_item(key, account=ACCOUNT_LEGACY_V1)
     logger.info("stored master key in Keychain (service=local_scribe / "
-                "account=master_key)")
+                "account=%s)", ACCOUNT_LEGACY_V1)
 
 
 def load_master_key(*, prompt: str = "Unlock local_scribe vault") -> bytes:
-    """Fetch the master key, prompting Touch ID. ``prompt`` is the text
-    shown in the LocalAuthentication sheet -- callers should phrase it
-    in user-visible terms ("Unlock vault to start ASR server", etc.).
+    """Fetch the legacy v1 whole-key item, prompting Touch ID. Used
+    only by the migration path. New code calls :func:`load_kc_half`
+    and reconstitutes the master key via ``key_split.combine_halves``.
 
     Raises:
-        SecretStoreError: key not stored (call ``store_master_key`` first).
+        SecretStoreError: key not stored.
         UserCancelledError: user dismissed the sheet or failed biometrics.
     """
-    proc = _run_helper(["load", prompt])
-    hex_data = (proc.stdout or "").strip()
-    try:
-        key = bytes.fromhex(hex_data)
-    except ValueError as exc:
-        raise SecretStoreError(f"helper returned non-hex data: {exc}") from exc
-    if len(key) != KEY_BYTES:
-        raise SecretStoreError(
-            f"helper returned {len(key)} bytes, expected {KEY_BYTES}"
-        )
-    return key
+    return _load_item(prompt=prompt, account=ACCOUNT_LEGACY_V1)
 
 
 def delete_master_key() -> None:
-    """Remove the Keychain item entirely. Used by uninstall + tests."""
-    _run_helper(["delete"])
+    """Remove the legacy v1 Keychain item entirely. Used by uninstall +
+    tests + the second step of the migration path."""
+    _delete_item(account=ACCOUNT_LEGACY_V1)
     logger.info("deleted Keychain item (service=local_scribe / "
-                "account=master_key)")
+                "account=%s)", ACCOUNT_LEGACY_V1)
+
+
+# ---- split-key kc_half API (v2) — primary path on new installs ------
+
+
+def has_kc_half() -> bool:
+    """True if the split-key ``kc_half`` item is present in the
+    Keychain (no Touch ID prompt). This is the canonical
+    "is local_scribe set up?" check on a v2 install."""
+    return _has_item(account=ACCOUNT_KC_HALF_V2)
+
+
+def store_kc_half(half: bytes) -> None:
+    """Persist the 32-byte ``kc_half`` to the Keychain (no Touch ID
+    prompt; the ACL only triggers on read). The half is one of two
+    XOR factors required to reconstitute the master key — see
+    :mod:`key_split`."""
+    _store_item(half, account=ACCOUNT_KC_HALF_V2)
+    logger.info("stored kc_half in Keychain (service=local_scribe / "
+                "account=%s)", ACCOUNT_KC_HALF_V2)
+
+
+def load_kc_half(*, prompt: str = "Unlock local_scribe vault") -> bytes:
+    """Fetch the 32-byte ``kc_half`` from the Keychain, prompting
+    Touch ID. The caller XORs this with ``yk_half`` (decrypted via
+    YubiKey) to obtain the master key."""
+    return _load_item(prompt=prompt, account=ACCOUNT_KC_HALF_V2)
+
+
+def delete_kc_half() -> None:
+    """Remove the kc_half item. Used by ``./run.sh key destroy`` and
+    rotation tests."""
+    _delete_item(account=ACCOUNT_KC_HALF_V2)
+    logger.info("deleted Keychain item (service=local_scribe / "
+                "account=%s)", ACCOUNT_KC_HALF_V2)
 
 
 # ----------------------------------------------------------------------
@@ -207,14 +285,28 @@ class MasterKey:
 
     @classmethod
     def unlock(cls, *, prompt: str = "Unlock local_scribe vault") -> "MasterKey":
-        """Read the key from the Keychain (prompts Touch ID)."""
+        """Read the *legacy v1 whole-key* item from the Keychain (prompts
+        Touch ID).
+
+        New code should prefer :func:`key_lifecycle.unlock_master_key`,
+        which implements the split-key Option C flow (Touch ID + YubiKey
+        tap). This method is retained for the migration path and for
+        tests that drive only the Keychain layer; calling it on a v2
+        install raises ``SecretStoreError("key not stored")``.
+        """
         b = load_master_key(prompt=prompt)
         return cls(_buf=bytearray(b))
 
     @classmethod
     def generate_and_store(cls) -> "MasterKey":
-        """Generate + persist a fresh key. Returns the in-memory handle
-        so the immediate caller (bootstrap) can keep using it."""
+        """Generate + persist a fresh *legacy v1 whole-key* item.
+        Returns the in-memory handle so the immediate caller (tests,
+        migration) can keep using it.
+
+        New installs go through ``key_lifecycle.init_master_key``,
+        which splits the key into ``kc_half`` (Keychain) +
+        ``yk_half`` (YubiKey-wrapped) and never stores the whole key.
+        """
         key = generate_master_key()
         store_master_key(key)
         return cls(_buf=bytearray(key))
