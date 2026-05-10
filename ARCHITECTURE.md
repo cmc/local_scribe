@@ -18,6 +18,8 @@ displays each diagram inline. Companion to:
 
 ## Contents
 
+### Part I — top-level flows
+
 1. [System overview](#1-system-overview)
 2. [Component dependencies](#2-component-dependencies)
 3. [Bootstrap flow](#3-bootstrap-flow)
@@ -33,6 +35,24 @@ displays each diagram inline. Companion to:
 13. [Destructive-action confirmation (typed-DELETE)](#13-destructive-action-confirmation-typed-delete)
 14. [Threat model × defence layers](#14-threat-model--defence-layers)
 15. [Vault & key lifecycle](#15-vault--key-lifecycle)
+
+### Part II — deep dives (CLIs, APIs, internals, data shapes)
+
+16. [`./run.sh` subcommand map](#16-runsh-subcommand-map)
+17. [`./run.sh start` orchestration](#17-runsh-start-orchestration)
+18. [`./run.sh stop` orchestration](#18-runsh-stop-orchestration)
+19. [`transcribe_file.py` flow](#19-transcribe_filepy-flow)
+20. [`redo_session.py` flow](#20-redo_sessionpy-flow)
+21. [ASR HTTP API surface](#21-asr-http-api-surface)
+22. [Inspector HTTP API surface](#22-inspector-http-api-surface)
+23. [Touch ID Swift helper subcommands](#23-touch-id-swift-helper-subcommands)
+24. [HKDF-SHA256 derivation visual](#24-hkdf-sha256-derivation-visual)
+25. [age + YubiKey PIV decryption chain](#25-age--yubikey-piv-decryption-chain)
+26. [Char data directory layout](#26-char-data-directory-layout)
+27. [Transcript JSON data model](#27-transcript-json-data-model)
+28. [LM Studio summary flow](#28-lm-studio-summary-flow)
+29. [Char telemetry channels (3 separate concerns)](#29-char-telemetry-channels-3-separate-concerns)
+30. [Key rotation flow](#30-key-rotation-flow)
 
 ### Legend
 
@@ -611,6 +631,527 @@ stateDiagram-v2
     Restored --> Stored
 
     Lost --> [*] : no YubiKey backup →<br/>data unrecoverable
+```
+
+---
+
+---
+
+# Part II — deep dives
+
+These are reference / internals diagrams: where the top-level Part I
+flows compress an entire user-facing path into one picture, Part II
+zooms in on a single CLI, API surface, crypto primitive, or data
+shape. Skip ahead to the one you want.
+
+---
+
+## 16. `./run.sh` subcommand map
+
+Which subcommand maps to which handler. Tells you where to look in
+`run.sh` for a given behaviour, and which Python module it delegates
+to.
+
+```mermaid
+flowchart LR
+    User(("./run.sh CMD"))
+
+    subgraph lifecycle["lifecycle"]
+      start["start"]
+      stop["stop"]
+      restart["restart"]
+      status["status"]
+      health["health"]
+      doctor["doctor"]
+      logs["logs"]
+    end
+    subgraph setup["setup"]
+      bootstrap["bootstrap"]
+      setupcmd["setup"]
+      configure_char["configure-char"]
+      install_char["install-char"]
+      install_llm["install-llm"]
+    end
+    subgraph runtime["runtime ops"]
+      inspector["inspector start|stop|restart"]
+      transcribe["transcribe FILE"]
+      redo["redo-session SESSION"]
+      firewall["firewall enable|disable|status|list|verify"]
+    end
+
+    User --> lifecycle
+    User --> setup
+    User --> runtime
+
+    start --> asr_start["asr_start (uvicorn asr_server:app :8000)"]
+    start --> inspector_start["inspector_start (uvicorn inspector_server:app :8001)"]
+    stop  --> asr_stop["asr_stop"]
+    stop  --> inspector_stop["inspector_stop"]
+    transcribe --> tf["python transcribe_file.py …"]
+    redo  --> rs["python redo_session.py …"]
+    firewall --> fwpy["python -m firewall …"]
+    doctor --> probes[(ASR / firewall / config /<br/>auth / yubikey probes)]
+    bootstrap --> seven[7 numbered steps<br/>see § 3]
+```
+
+---
+
+## 17. `./run.sh start` orchestration
+
+What `./run.sh start` actually does, in order. Useful when something
+goes wrong: each box is a check that can fail independently and the
+script bails with a labelled error if it does.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant Rs as run.sh
+    participant LMS as lms (CLI)
+    participant ASR as asr_server :8000
+    participant INS as inspector_server :8001
+    participant SA as service_auth
+
+    U->>Rs: ./run.sh start
+    Rs->>Rs: probe Parakeet weights<br/>(bail if missing)
+    Rs->>LMS: lms server status
+    LMS-->>Rs: running / off / no-model
+    alt lms not running
+        Rs->>LMS: lms server start
+    end
+    Rs->>ASR: nohup uvicorn asr_server:app<br/>--host 0.0.0.0 --port 8000
+    loop until /health 200 (≤30 s)
+        Rs->>ASR: GET /health
+    end
+    Rs->>INS: nohup uvicorn inspector_server:app<br/>--host 127.0.0.1 --port 8001
+    loop until /api/health 200 (≤15 s)
+        Rs->>INS: GET /api/health
+    end
+    Rs->>SA: python -m service_auth url inspector
+    SA-->>Rs: http://127.0.0.1:8001/auth?token=…
+    Rs-->>U: pipeline-ready summary +<br/>clickable inspector auth URL
+    Rs->>Rs: exec tail -F asr.log
+```
+
+---
+
+## 18. `./run.sh stop` orchestration
+
+The shutdown side. Each server gets a polite `TERM`, a 7.5 s grace
+window, then a forceful `KILL -9` if it's still alive. LM Studio is
+**not** stopped — that's deliberate, so its model stays warm in GPU
+memory for the next start.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant Rs as run.sh
+    participant ASR as asr_server (pid)
+    participant INS as inspector_server (pid)
+
+    U->>Rs: ./run.sh stop
+    Rs->>ASR: kill TERM
+    loop wait 7.5 s
+        Rs->>ASR: kill -0 (alive?)
+    end
+    alt still alive
+        Rs->>ASR: kill -9
+    end
+    Rs->>INS: kill TERM
+    loop wait 7.5 s
+        Rs->>INS: kill -0 (alive?)
+    end
+    alt still alive
+        Rs->>INS: kill -9
+    end
+    Rs->>Rs: rm pid files
+    Note right of Rs: LM Studio left running on purpose<br/>(preserves model in GPU memory)
+    Rs-->>U: stopped
+```
+
+---
+
+## 19. `transcribe_file.py` flow
+
+The manual one-shot CLI for files Char didn't pick up automatically.
+Caches by audio SHA-256 (so LLM iteration is fast), runs the full
+ASR + diarization + LLM-summary stack, and lets you steer output to
+stdout, a markdown file, or the clipboard.
+
+```mermaid
+flowchart TD
+    Start(["./run.sh transcribe AUDIO"]) --> Cache{transcript cached?<br/>~/.cache/local_scribe/<br/>transcripts/&lt;sha&gt;.json}
+    Cache -->|hit| LoadCache["load cached transcript"]
+    Cache -->|miss| Auth["client_auth_header_for(asr, token)<br/>(Touch ID via service_auth)"]
+    Auth --> Post["POST /v1/audio/transcriptions<br/>Authorization: Token <token>"]
+    Post --> SSE["consume SSE deltas<br/>(progress printed to stderr)"]
+    SSE --> Done["receive event=done"]
+    Done --> SaveCache["write cache entry"]
+    SaveCache --> LLM
+    LoadCache --> LLM["stream summary from LM Studio<br/>(POST /v1/chat/completions, stream=true)"]
+    LLM --> Format["render markdown:<br/>TL;DR · Participants · Key points ·<br/>Decisions · Open Q · Risks ·<br/>Next steps · Notable quotes"]
+    Format --> Output{output target?}
+    Output -->|--out PATH| WriteFile["write markdown to file"]
+    Output -->|--clipboard| Pbcopy["pbcopy to system clipboard"]
+    Output -->|default| Stdout["print to stdout"]
+```
+
+---
+
+## 20. `redo_session.py` flow
+
+Re-runs ASR + diarization on an existing Char session and overwrites
+its `transcript.json` in place. The previous transcript is **always**
+archived to `.local_scribe_history/` first — see § 11.
+
+```mermaid
+flowchart TD
+    Start(["./run.sh redo-session SESSION"]) --> Match["match SESSION by:<br/>full UUID / UUID prefix /<br/>title substring"]
+    Match --> Found{exactly one match?}
+    Found -->|"no"| Err["error: ambiguous / missing"]
+    Found -->|"yes"| Archive["transcript_history.archive_current()<br/>(rename → .local_scribe_history/<br/>YYYYMMDDTHHMMSSZ_&lt;sha7&gt;.json)"]
+    Archive --> Auth["service_auth.client_auth_header_for(<br/>  asr, style=bearer)"]
+    Auth --> Post["POST /v1/audio/transcriptions<br/>multipart audio + Authorization: Bearer …"]
+    Post --> Wait["consume SSE until done"]
+    Wait --> Persist["char_persist.write_transcript()<br/>(overwrite session/transcript.json)"]
+    Persist --> Done["print: archived → … , new transcript written"]
+```
+
+---
+
+## 21. ASR HTTP API surface
+
+Every route the ASR server exposes, the contract each one
+implements, and which response shape it emits. The auth column tells
+you which gating dependency runs on entry.
+
+```mermaid
+flowchart LR
+    subgraph Public["public (no auth)"]
+      Hp["GET /health<br/>→ {asr_backend, model, ready}"]
+    end
+    subgraph Gated["bearer-token gated"]
+      A1["POST /v1/audio/transcriptions<br/>multipart audio<br/>(OpenAI Whisper shape)"]
+      A2["POST /v1/listen<br/>multipart audio<br/>(Deepgram batch shape)"]
+      A3["WS /v1/listen/stream<br/>binary PCM/Opus frames<br/>(Deepgram streaming shape)"]
+    end
+
+    A1 --> R1["SSE event=heartbeat (5 s)<br/>SSE event=delta (rolling text)<br/>SSE event=done<br/>(transcripts[] + local_scribe.diarization)"]
+    A2 --> R2["single Deepgram JSON<br/>(results.channels[0].alternatives[0])"]
+    A3 --> R3["per-chunk JSON deltas →<br/>final close-frame JSON<br/>(speaker_<n>: tags)"]
+
+    classDef pub fill:#efe,stroke:#393
+    classDef gated fill:#fee,stroke:#c33
+    class Hp pub
+    class A1,A2,A3 gated
+```
+
+---
+
+## 22. Inspector HTTP API surface
+
+Same idea, inspector side. The cookie set by `/auth?token=…`
+satisfies the gate for every `/api/…` route subsequently.
+
+```mermaid
+flowchart LR
+    subgraph Public["public"]
+      H["GET /api/health"]
+      Au["GET /auth?token=…<br/>(sets HttpOnly cookie, 302 → /)"]
+      Idx["GET /<br/>(HTML SPA)"]
+    end
+    subgraph Gated["cookie / bearer gated"]
+      S1["GET /api/sessions<br/>→ list, with history_count"]
+      S2["GET /api/sessions/{id}<br/>→ meta + flattened transcript"]
+      S3["GET /api/sessions/{id}/audio<br/>→ audio.mp3 stream"]
+      Sx["DELETE /api/sessions/{id}/audio<br/>→ {deleted, bytes_removed}"]
+      ST["GET /api/sessions/{id}/transcript.txt<br/>(Content-Disposition attachment)"]
+      H1["GET /api/sessions/{id}/history<br/>→ archive list with metadata"]
+      H2["GET /api/sessions/{id}/history/{f}<br/>→ raw archive JSON"]
+      H3["GET /api/sessions/{id}/history/{f}/transcript.txt<br/>(Content-Disposition attachment)"]
+      Hx["DELETE /api/sessions/{id}/history/{f}"]
+      C1["GET /api/config"]
+      C2["PUT /api/config<br/>(validates + auto-backup)"]
+      CA["GET /api/char/audit"]
+    end
+
+    classDef pub fill:#efe,stroke:#393
+    classDef gated fill:#fee,stroke:#c33
+    class H,Au,Idx pub
+    class S1,S2,S3,Sx,ST,H1,H2,H3,Hx,C1,C2,CA gated
+```
+
+---
+
+## 23. Touch ID Swift helper subcommands
+
+Internals of `bin/touchid-keychain` — the four CLI subcommands and
+the stdin/stdout contract each one uses. The key bytes flow only via
+stdin (for `store`) and stdout (for `load`). They are **never** on
+argv, which is the whole point of having a Swift wrapper instead of
+shelling out to `security`.
+
+```mermaid
+flowchart LR
+    Stdin[("stdin")]
+    Stdout[("stdout")]
+    Bin["bin/touchid-keychain &lt;subcommand&gt;"]
+
+    Stdin --> Bin
+    Bin --> Op{subcommand?}
+    Op -->|exists| Exists["SecItemCopyMatching<br/>kSecUseAuthenticationUISkip<br/>(no Touch ID prompt)"]
+    Op -->|store|  Store["read 64-hex from stdin<br/>SecItemAdd(<br/>  SecAccessControl=userPresence,<br/>  Accessible=WhenUnlockedThisDeviceOnly)"]
+    Op -->|load|   Load["LAContext.localizedReason set<br/>SecItemCopyMatching<br/>(Touch ID prompt fires)"]
+    Op -->|delete| Del["SecItemDelete<br/>(no Touch ID prompt)"]
+    Exists --> Rc1["exit 0 (present) /<br/>exit 2 (not found)"]
+    Store  --> Rc2["exit 0 (stored) /<br/>exit 2 (key not stored on miss-followup)"]
+    Load   --> Rc3
+    Rc3["exit 0 + 64-hex to stdout (ok) /<br/>exit 3 (Touch ID cancelled)"] --> Stdout
+    Del    --> Rc4["exit 0 / exit 2 (already gone)"]
+```
+
+---
+
+## 24. HKDF-SHA256 derivation visual
+
+`service_auth.derive_service_token` step by step. RFC 5869 extract +
+expand, with `salt` versioned by `DERIVATION_VERSION` so we can bump
+the construction later without recovering tokens from
+already-rotated installations.
+
+```mermaid
+flowchart LR
+    MK["master_key<br/>(32 bytes, from Keychain)"]
+    Salt["salt =<br/>b'local_scribe.service_auth.v1'"]
+    InfoA["info = b'service:asr'"]
+    InfoI["info = b'service:inspector'"]
+
+    MK --> Extract
+    Salt --> Extract
+    Extract["RFC 5869 §2.2 extract:<br/>PRK = HMAC-SHA256(salt, IKM=master_key)"]
+    Extract --> PRK["PRK (32 bytes)"]
+
+    PRK --> ExpA
+    InfoA --> ExpA
+    PRK --> ExpI
+    InfoI --> ExpI
+
+    ExpA["RFC 5869 §2.3 expand:<br/>T(1) = HMAC-SHA256(PRK, info || 0x01)"]
+    ExpI["RFC 5869 §2.3 expand:<br/>T(1) = HMAC-SHA256(PRK, info || 0x01)"]
+    ExpA --> Trim1["first TOKEN_BYTES (16) bytes"]
+    ExpI --> Trim2["first TOKEN_BYTES (16) bytes"]
+    Trim1 --> Tok1["ls_asr_&lt;32 hex&gt;"]
+    Trim2 --> Tok2["ls_inspector_&lt;32 hex&gt;"]
+```
+
+---
+
+## 25. age + YubiKey PIV decryption chain
+
+What actually happens during `age -d -i identity backup.age` —
+useful when something fails ("no YubiKey" / "wrong slot" / "touch
+timeout") and you need to know which layer surfaced the error.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI as age -d -i identity backup.age
+    participant Plugin as age-plugin-yubikey
+    participant SC as scdaemon / libpcsc
+    participant YK as YubiKey PIV slot 9a
+
+    CLI->>Plugin: hand off identity stub<br/>(age plugin protocol)
+    Plugin->>SC: open PIV session
+    SC->>YK: SELECT AID + serial check
+    Plugin->>Plugin: parse age ciphertext header,<br/>extract ephemeral pubkey
+    Plugin->>YK: GENERAL AUTHENTICATE<br/>(ECDH with PIV slot 9a private key)
+    YK-->>Plugin: REQUIRES TOUCH<br/>(touch-policy=always)
+    Plugin-->>CLI: stderr: "please touch your YubiKey"
+    Note over YK: user taps the metal contact
+    YK-->>Plugin: shared secret bytes
+    Plugin->>Plugin: HKDF(shared_secret) → file key
+    Plugin-->>CLI: file key
+    CLI->>CLI: ChaCha20-Poly1305 body decrypt
+    CLI-->>+stdout: 32-byte plaintext master key
+```
+
+---
+
+## 26. Char data directory layout
+
+Filesystem tree of Char's data dir as it lives on disk today
+(plaintext). Once vault wiring lands, the same tree lives **inside
+the mounted sparse bundle** and the canonical path is a symlink to
+it — readers up the stack are unchanged.
+
+```mermaid
+flowchart TD
+    Root["~/Library/Application Support/<br/>hyprnote/"]
+    Root --> Settings["settings.json<br/>(stt provider / api_key / base_url<br/>+ .bak.&lt;ts&gt; on each rewrite)"]
+    Root --> Store["store.json<br/>(analytics.Disabled · tauri-plugin-store2)"]
+    Root --> DB["app.db<br/>(SQLite session catalog)"]
+    Root --> Sessions["sessions/"]
+    Sessions --> S1["<uuid>/"]
+    S1 --> Sa["audio.mp3"]
+    S1 --> St["transcript.json<br/>(current)"]
+    S1 --> Sn["<TemplateName>.md<br/>(LLM-generated note)"]
+    S1 --> Sm["_meta.json<br/>(title, created_at, …)"]
+    S1 --> SH[".local_scribe_history/"]
+    SH --> Sh1["20260510T120000Z_&lt;sha7&gt;.json"]
+    SH --> Sh2["20260510T140000Z_&lt;sha7&gt;.json"]
+    SH --> Sh3["20260510T180000Z_&lt;sha7&gt;.json"]
+```
+
+---
+
+## 27. Transcript JSON data model
+
+The shape Char's `transcript.json` actually carries on disk. Char
+itself only writes `transcripts[]`; we attach `local_scribe.…` on
+top with our diarization output + provenance metadata.
+`_flatten_transcript` in the inspector consumes both halves.
+
+```mermaid
+classDiagram
+    class TranscriptJson {
+        +transcripts: Transcript[]
+        +local_scribe: LocalScribeMeta
+    }
+    class Transcript {
+        +id: str
+        +session_id: str
+        +words: Word[]
+        +speaker_hints: SpeakerHint[]
+    }
+    class Word {
+        +id: str
+        +text: str
+        +start: float
+        +end: float
+    }
+    class SpeakerHint {
+        +id: str
+        +type: name_or_provider_speaker_index
+        +value: str
+        +word_id: str_or_str_list
+    }
+    class LocalScribeMeta {
+        +asr_model: str
+        +audio_sha256: str
+        +transcribed_at: ISO8601
+        +diarization: DiarizationMeta
+    }
+    class DiarizationMeta {
+        +algorithm: auto_silhouette
+        +num_speakers: int
+        +speakers: SpeakerAirtime[]
+        +word_confidences: float[]
+    }
+    class SpeakerAirtime {
+        +label: str
+        +seconds: float
+        +percent: float
+        +mean_confidence: float
+    }
+    TranscriptJson "1" --o "many" Transcript
+    TranscriptJson "1" --o "1" LocalScribeMeta
+    Transcript "1" --o "many" Word
+    Transcript "1" --o "many" SpeakerHint
+    LocalScribeMeta "1" --o "1" DiarizationMeta
+    DiarizationMeta "1" --o "many" SpeakerAirtime
+```
+
+---
+
+## 28. LM Studio summary flow
+
+How a finished transcript becomes a structured markdown summary.
+We use the OpenAI-compatible `/v1/chat/completions` endpoint LM
+Studio exposes; both Char's note generator and our standalone
+`transcribe_file.py` go through this same path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as transcribe_file.py / Char
+    participant LMS as LM Studio :1234
+    participant Qwen as Qwen3-30B (MLX)
+
+    Caller->>LMS: POST /v1/chat/completions<br/>{model: qwen3-30b, stream: true,<br/>messages: [system prompt, user (transcript)]}
+    LMS->>Qwen: ensure loaded (lms load if not)
+    LMS->>Qwen: run inference
+    loop streaming tokens
+        Qwen-->>LMS: token
+        LMS-->>Caller: data: {choices:[{delta:{content:…}}]}
+    end
+    LMS-->>Caller: data: [DONE]
+    Caller->>Caller: render markdown sections:<br/>TL;DR · Context & Purpose · Discussion ·<br/>Decisions · Open Questions · Risks ·<br/>Next steps · Notable quotes
+```
+
+---
+
+## 29. Char telemetry channels (3 separate concerns)
+
+Char's three always-on outbound channels are handled by **three
+independent controls**. Sentry and the auto-updater have no in-app
+toggle so the firewall is the only line of defence; PostHog is also
+short-circuited in-app via `store.json::analytics.Disabled=true`.
+
+```mermaid
+flowchart LR
+    subgraph CharBin["Char binary"]
+      Sentry["sentry-sdk init<br/>(DSN compile-time baked)"]
+      PostHog["analytics dispatcher<br/>(reads store.json::analytics.Disabled)"]
+      Updater["tauri-updater<br/>(updater.active=true in tauri.conf.stable.json)"]
+    end
+    subgraph Mitigations["our mitigations"]
+      F["firewall.py blackhole<br/>(category=telemetry)"]
+      S["configure-char rewrites store.json<br/>analytics.Disabled = true"]
+    end
+
+    Sentry --> SH["o4506…sentry.io"] --> F --> R1[(connection refused)]
+    PostHog --> Check{Disabled=true?}
+    Check -->|"yes (we set it)"| Short[("short-circuit before fetch")]
+    Check -.->|"no"| PH["us.i.posthog.com"] --> F --> R2[(connection refused — belt+suspenders)]
+    Updater --> UH["desktop2.hyprnote.com"] --> F --> R3[(connection refused)]
+    S --> Check
+```
+
+---
+
+## 30. Key rotation flow
+
+`./run.sh vault rotate` (forward-looking — see TODO.md): when a
+Touch ID phish is suspected or a token leak has been observed,
+rotating the master key invalidates every derived bearer token in
+one shot. The sparse-bundle keybag is re-encrypted (O(few KB), not
+O(disk)); Char is reconfigured and the services restarted.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant Rs as run.sh
+    participant SS as secret_store
+    participant SA as service_auth
+    participant V as vault.py
+    participant Char as Char.app
+
+    U->>Rs: ./run.sh vault rotate
+    Rs->>SS: load_master_key() (Touch ID)
+    SS-->>Rs: old_key
+    Rs->>SS: generate_master_key()
+    SS-->>Rs: new_key
+    Rs->>V: rotate_password(old_key, new_key)
+    V->>V: hdiutil chpass -stdinpass -newstdinpass<br/>(stdin payload: old\nnew\nnew\n)
+    V-->>Rs: ok
+    Rs->>SS: store_master_key(new_key)
+    Rs->>SA: derive new asr / inspector tokens<br/>(HKDF on new_key)
+    SA-->>Rs: new tokens
+    Rs->>Char: configure-char (rewrite settings.json<br/>with new api_key)
+    Rs->>Rs: restart ASR + inspector
+    Rs-->>U: rotated; old tokens invalid;<br/>YubiKey backup also re-encrypted
 ```
 
 ---

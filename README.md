@@ -44,9 +44,12 @@ once the models are downloaded.
 ## Architecture diagrams
 
 Every major flow in this codebase has a Mermaid diagram in
-[`ARCHITECTURE.md`](ARCHITECTURE.md). GitHub renders them inline, so
-the file is a clickable map of the system. Jump straight to the one
-you want:
+[`ARCHITECTURE.md`](ARCHITECTURE.md). **30 diagrams** total, split
+into top-level flows (Part I) and reference / internals (Part II).
+GitHub renders them inline, so the file is a clickable map of the
+system.
+
+**Part I — top-level flows**
 
 | # | diagram | when you want it |
 |---|---|---|
@@ -65,6 +68,26 @@ you want:
 | 13 | [Destructive-action confirmation](ARCHITECTURE.md#13-destructive-action-confirmation-typed-delete) | the typed-DELETE modal shared by audio + history delete |
 | 14 | [Threat model × defence layers](ARCHITECTURE.md#14-threat-model--defence-layers) | which adversary tier is mitigated by which control |
 | 15 | [Vault & key lifecycle](ARCHITECTURE.md#15-vault--key-lifecycle) | full state machine for the master key (generate → rotate → backup → restore → lose) |
+
+**Part II — deep dives (CLIs, APIs, internals, data shapes)**
+
+| # | diagram | when you want it |
+|---|---|---|
+| 16 | [`./run.sh` subcommand map](ARCHITECTURE.md#16-runsh-subcommand-map) | which subcommand maps to which handler / Python module |
+| 17 | [`./run.sh start` orchestration](ARCHITECTURE.md#17-runsh-start-orchestration) | full start sequence with timeouts and bail points |
+| 18 | [`./run.sh stop` orchestration](ARCHITECTURE.md#18-runsh-stop-orchestration) | shutdown sequence (and why LM Studio is intentionally left alive) |
+| 19 | [`transcribe_file.py` flow](ARCHITECTURE.md#19-transcribe_filepy-flow) | the manual one-shot CLI: cache → ASR → LLM → markdown |
+| 20 | [`redo_session.py` flow](ARCHITECTURE.md#20-redo_sessionpy-flow) | re-running ASR + diarization on an existing Char session |
+| 21 | [ASR HTTP API surface](ARCHITECTURE.md#21-asr-http-api-surface) | every route, its contract, its response shape |
+| 22 | [Inspector HTTP API surface](ARCHITECTURE.md#22-inspector-http-api-surface) | same for the inspector |
+| 23 | [Touch ID Swift helper subcommands](ARCHITECTURE.md#23-touch-id-swift-helper-subcommands) | `bin/touchid-keychain`'s 4 subcommands and stdin/stdout contracts |
+| 24 | [HKDF-SHA256 derivation visual](ARCHITECTURE.md#24-hkdf-sha256-derivation-visual) | master key → salt + info → bearer token, step by step |
+| 25 | [age + YubiKey PIV decryption chain](ARCHITECTURE.md#25-age--yubikey-piv-decryption-chain) | what happens inside `age -d -i identity backup.age` |
+| 26 | [Char data directory layout](ARCHITECTURE.md#26-char-data-directory-layout) | filesystem tree of `~/Library/Application Support/hyprnote/` |
+| 27 | [Transcript JSON data model](ARCHITECTURE.md#27-transcript-json-data-model) | the shape `transcript.json` carries on disk |
+| 28 | [LM Studio summary flow](ARCHITECTURE.md#28-lm-studio-summary-flow) | finished transcript → Qwen → structured markdown sections |
+| 29 | [Char telemetry channels (3)](ARCHITECTURE.md#29-char-telemetry-channels-3-separate-concerns) | Sentry / PostHog / auto-updater and which control catches each |
+| 30 | [Key rotation flow](ARCHITECTURE.md#30-key-rotation-flow) | `./run.sh vault rotate` — invalidate every derived token in one shot |
 
 ## Privacy and data locality
 
