@@ -1124,6 +1124,150 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         self.assertEqual(events[-1], "[DONE]")
 
 
+# ---------------------------------------------------------------------------
+# Auth integration: exercises the real bearer-token check end-to-end.
+#
+# The rest of the e2e suite runs with LOCAL_SCRIBE_DISABLE_AUTH=1 so the
+# bypass branch is taken and the tests can ignore the new auth layer.
+# This class explicitly turns the bypass *off* and stands up the app
+# inside a TestClient context manager so the FastAPI lifespan runs and
+# populates ``asr_server._asr_token`` from the test master-key env var.
+# ---------------------------------------------------------------------------
+
+class AsrServerAuthIntegrationTests(unittest.TestCase):
+    """End-to-end verification that gated endpoints really do 401 on
+    missing/wrong tokens and pass with the right one, exercising the
+    same code path Char hits in production."""
+
+    TEST_MK_HEX = "ab" * 32
+
+    @classmethod
+    def setUpClass(cls):
+        import service_auth as sa
+        cls._old_bypass = os.environ.pop(sa.BYPASS_ENV, None)
+        cls._old_test_mk = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
+        os.environ["LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"] = cls.TEST_MK_HEX
+        # Precompute what the server's derived token will be so we can
+        # match it in headers.
+        cls.expected_token = sa.derive_service_token(
+            bytes.fromhex(cls.TEST_MK_HEX), "asr",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        import service_auth as sa
+        if cls._old_bypass is not None:
+            os.environ[sa.BYPASS_ENV] = cls._old_bypass
+        if cls._old_test_mk is None:
+            os.environ.pop("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX", None)
+        else:
+            os.environ["LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"] = cls._old_test_mk
+
+    def setUp(self):
+        # ``with TestClient(...) as client`` enters the lifespan, which
+        # is where ``_asr_token`` is populated. Without the context
+        # manager, lifespan runs lazily and we can't guarantee state.
+        self._cm = TestClient(asr_server.app)
+        self.client = self._cm.__enter__()
+        self.addCleanup(lambda: self._cm.__exit__(None, None, None))
+        self._patcher = mock.patch.object(
+            asr_server, "_run_asr_async", side_effect=_fake_run_asr_async,
+        )
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    def _audio_files(self):
+        return {"file": ("a.m4a", io.BytesIO(b"FAKE" * 100), "audio/m4a")}
+
+    # ---- /health stays open --------------------------------------
+
+    def test_health_endpoint_remains_unauthenticated(self):
+        """/health is the liveness probe — gating it would break
+        ``./run.sh status`` and any future monitoring."""
+        r = self.client.get("/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ok"])
+
+    # ---- /v1/audio/transcriptions (OpenAI batch, Char's path) ----
+
+    def test_openai_endpoint_401_without_auth_header(self):
+        r = self.client.post(
+            "/v1/audio/transcriptions",
+            files=self._audio_files(),
+            data={"model": "gpt-4o-transcribe-diarize"},
+        )
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("WWW-Authenticate", r.headers)
+        body = r.json()
+        self.assertEqual(body["detail"]["error"]["type"], "auth")
+        self.assertEqual(body["detail"]["error"]["service"], "asr")
+
+    def test_openai_endpoint_401_with_wrong_token(self):
+        r = self.client.post(
+            "/v1/audio/transcriptions",
+            files=self._audio_files(),
+            data={"model": "gpt-4o-transcribe-diarize"},
+            headers={"Authorization": "Bearer ls_asr_wrong"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_openai_endpoint_200_with_correct_bearer(self):
+        r = self.client.post(
+            "/v1/audio/transcriptions",
+            files=self._audio_files(),
+            data={"model": "gpt-4o-transcribe-diarize"},
+            headers={"Authorization": f"Bearer {self.expected_token}"},
+        )
+        self.assertEqual(r.status_code, 200, msg=f"body={r.text[:300]}")
+
+    def test_openai_endpoint_accepts_x_api_key_header(self):
+        r = self.client.post(
+            "/v1/audio/transcriptions",
+            files=self._audio_files(),
+            data={"model": "gpt-4o-transcribe-diarize"},
+            headers={"X-API-Key": self.expected_token},
+        )
+        self.assertEqual(r.status_code, 200)
+
+    # ---- /v1/listen (Deepgram batch, Char's live path) -----------
+
+    def test_listen_endpoint_401_without_auth(self):
+        r = self.client.post("/v1/listen", content=b"raw audio bytes")
+        self.assertEqual(r.status_code, 401)
+
+    def test_listen_endpoint_accepts_token_scheme(self):
+        # Deepgram clients use ``Authorization: Token <key>``.
+        r = self.client.post(
+            "/v1/listen",
+            content=b"raw audio bytes" * 100,
+            headers={
+                "Authorization": f"Token {self.expected_token}",
+                "Content-Type": "audio/wav",
+            },
+        )
+        # Either 200 or 400 (bad WAV) is fine -- we only care that the
+        # request got *past* the 401 gate and reached the handler body.
+        self.assertNotEqual(r.status_code, 401)
+
+    # ---- /v1/listen/stream ---------------------------------------
+
+    def test_listen_stream_endpoint_gated(self):
+        r = self.client.post(
+            "/v1/listen/stream", content=b"raw audio bytes",
+        )
+        self.assertEqual(r.status_code, 401)
+
+    # ---- Token derivation ----------------------------------------
+
+    def test_lifespan_derived_token_matches_expected(self):
+        # Lifespan should have populated _asr_token; verify it's the
+        # exact token we'd derive from our test master key.
+        holder = asr_server._asr_token
+        self.assertIsNotNone(holder)
+        self.assertEqual(holder.service, "asr")
+        self.assertEqual(holder.token, self.expected_token)
+
+
 class ComposeSpeakerPrefixedTextTests(unittest.TestCase):
     def test_groups_by_speaker_turn_with_blank_lines(self):
         words = [

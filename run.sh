@@ -450,7 +450,9 @@ PY
     fi
     if [[ -f "$CHAR_SETTINGS" ]]; then
       "$VENV_PY" - "$CHAR_SETTINGS" "$ASR_PORT" <<'PY'
-import json, sys, pathlib
+import json, os, sys, pathlib
+import service_auth
+
 expected_port = sys.argv[2]
 G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
 d = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -459,9 +461,50 @@ oai = ((ai.get("stt") or {}).get("openai")) or {}
 prov  = ai.get("current_stt_provider", "")
 model = ai.get("current_stt_model", "")
 url   = oai.get("base_url", "")
+api_key = oai.get("api_key", "")
 expected_url = f"http://127.0.0.1:{expected_port}/v1"
+
+# Auth drift: Char's stored api_key has to match the current ASR
+# token (HKDF-derived from the Keychain master key) or every Generate
+# click returns 401. Compute the expected token *without* prompting
+# Touch ID -- we use the test-env shortcut if it's set, or skip the
+# auth check entirely if neither side is available.
+expected_token = None
+if not service_auth.is_bypass_enabled():
+    mk_hex = (os.environ.get("LOCAL_SCRIBE_MASTER_KEY_HEX")
+              or os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"))
+    if mk_hex:
+        try:
+            expected_token = service_auth.derive_service_token(
+                bytes.fromhex(mk_hex.strip()), "asr",
+            )
+        except Exception:  # noqa: BLE001
+            expected_token = None
+    # We DON'T fetch the token via Touch ID here -- doctor is a
+    # non-interactive check. If neither env var is set we just skip
+    # the api_key drift assertion and tell the user to compare
+    # fingerprints via `./run.sh status`.
+
 if prov == "openai" and model == "gpt-4o-transcribe" and url == expected_url:
     print(f"  {G}\u25cf{Z} Char transcriber configured for this server")
+    if expected_token is not None:
+        if api_key == expected_token:
+            print(f"  {G}\u25cf{Z} Char api_key matches current ASR token "
+                  f"(fp={service_auth.token_fingerprint(expected_token)})")
+        else:
+            print(f"  {Y}\u25cb{Z} Char api_key DRIFT -- saved key doesn't match "
+                  f"the current ASR token (fp={service_auth.token_fingerprint(expected_token)})")
+            print(f"      run `./run.sh configure-char` to rewrite Char's settings.json")
+    elif api_key and not service_auth.is_bypass_enabled():
+        # Best-effort sanity check: at least the api_key should LOOK
+        # like one of our tokens (ls_asr_<hex>) rather than a real
+        # OpenAI key. A real OpenAI key here is a privacy red flag.
+        if not api_key.startswith("ls_asr_") and api_key != "local-auth-bypassed":
+            print(f"  {Y}\u25cb{Z} Char api_key is set but doesn't look like our "
+                  f"derived token (got {api_key[:8]!r}...) -- did configure-char run?")
+        else:
+            print(f"  {G}\u25cf{Z} Char api_key has the right shape "
+                  f"(verify via `./run.sh status` fingerprint)")
 else:
     print(f"  {Y}\u25cb{Z} Char transcriber NOT pointed here -- run `./run.sh configure-char`")
     print(f"      provider : {prov!r:<25s} (want 'openai')")
@@ -505,10 +548,55 @@ PY
                             "$c_bold" "$c_reset" "$c_bold" "$c_reset"
   fi
 
+  printf "\n%sauthentication:%s\n" "$c_bold" "$c_reset"
+  if [[ -x "$VENV_PY" ]]; then
+    "$VENV_PY" - <<'PY'
+import json, sys
+import service_auth
+G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
+
+if service_auth.is_bypass_enabled():
+    print(f"  {Y}\u25cb{Z} AUTH BYPASS ENABLED via LOCAL_SCRIBE_DISABLE_AUTH=1")
+    print(f"      every /api/* and /v1/* endpoint is OPEN -- unset for production")
+    sys.exit(0)
+
+try:
+    from secret_store import has_master_key, helper_path
+except Exception as exc:  # noqa: BLE001
+    print(f"  {R}\u25cb{Z} secret_store unimportable: {exc}")
+    sys.exit(0)
+
+hp = helper_path()
+if not hp.is_file():
+    print(f"  {R}\u25cb{Z} Touch ID helper missing at {hp}")
+    print(f"      run `./run.sh bootstrap` to compile bin/touchid_keychain.swift")
+    sys.exit(0)
+print(f"  {G}\u25cf{Z} Touch ID helper present ({hp})")
+
+try:
+    present = has_master_key()
+except Exception as exc:  # noqa: BLE001
+    print(f"  {R}\u25cb{Z} cannot probe Keychain item: {exc}")
+    sys.exit(0)
+
+if not present:
+    print(f"  {Y}\u25cb{Z} No master key in Keychain yet")
+    print(f"      run `./run.sh vault init` to generate one")
+    sys.exit(0)
+
+print(f"  {G}\u25cf{Z} master key present in Keychain (service=local_scribe / account=master_key)")
+print(f"      tokens are HKDF-derived per service; see `./run.sh status` for fingerprints")
+print(f"      and the inspector auth URL.")
+PY
+  fi
+
   printf "\n%schar config hints (manual fallback):%s\n" "$c_bold" "$c_reset"
+  printf "  %sprefer:%s %s./run.sh configure-char%s   (sets the right api key automatically)\n" \
+         "$c_dim" "$c_reset" "$c_bold" "$c_reset"
   printf "  Live recording  : Custom provider, Base URL http://127.0.0.1:%s\n" "$ASR_PORT"
   printf "  Generate (file) : OpenAI provider, Model gpt-4o-transcribe, Base URL http://127.0.0.1:%s/v1\n" "$ASR_PORT"
-  printf "  api key (both)  : any non-empty string (auth is ignored locally)\n"
+  printf "  api key (both)  : the per-service ASR token (run \`./run.sh status\` to see the\n"
+  printf "                    fingerprint; configure-char writes it for you)\n"
   printf "  intelligence    : LM Studio @ http://127.0.0.1:%s   model=%s\n" "$LMSTUDIO_PORT" "$LLM_MODEL"
   printf "\n"
 }
@@ -883,11 +971,32 @@ PY
   cp "$CHAR_SETTINGS" "$settings_backup"
   printf "  settings.json backup : %s\n" "$settings_backup"
 
+  # Fetch the current ASR token from the Keychain (prompts Touch ID
+  # the FIRST time we read it this shell session; cached by the kernel
+  # for subsequent reads). This is the bearer token every request to
+  # the ASR server must carry.
+  #
+  # If the Keychain item doesn't exist yet, we surface a clear hint
+  # and bail -- the user needs to run `./run.sh vault init` first.
+  printf "  Fetching ASR bearer token from Keychain (Touch ID prompt may appear) ...\n"
+  local asr_token
+  if ! asr_token="$("$VENV_PY" -m service_auth token asr 2>&1)"; then
+    say "${c_red}failed to derive ASR token: $asr_token${c_reset}"
+    say "  run \`./run.sh vault init\` to create the Keychain master key first"
+    return 1
+  fi
+  if [[ -z "$asr_token" ]]; then
+    # Bypass mode -> use a placeholder value so Char's input field
+    # isn't empty (some Char versions refuse to save an empty key).
+    asr_token="local-auth-bypassed"
+    say "${c_yellow}auth bypass enabled — Char's api_key set to a placeholder${c_reset}"
+  fi
+
   # Patch the four keys we care about. Everything else (LLM, templates,
   # general.*, calendars, etc.) is left untouched.
-  if ! "$VENV_PY" - "$CHAR_SETTINGS" "$ASR_PORT" <<'PY'
+  if ! "$VENV_PY" - "$CHAR_SETTINGS" "$ASR_PORT" "$asr_token" <<'PY'
 import json, sys, pathlib
-p = pathlib.Path(sys.argv[1]); port = sys.argv[2]
+p = pathlib.Path(sys.argv[1]); port = sys.argv[2]; tok = sys.argv[3]
 d = json.loads(p.read_text())
 ai  = d.setdefault("ai", {})
 stt = ai.setdefault("stt", {})
@@ -903,7 +1012,10 @@ ai["current_stt_provider"] = "openai"
 # deltas every STREAM_HEARTBEAT_SECONDS to keep it alive on long files.
 ai["current_stt_model"]    = "gpt-4o-transcribe"
 oai["base_url"]            = f"http://127.0.0.1:{port}/v1"
-oai["api_key"]             = "local"
+# api_key is the per-service ASR bearer token (HKDF-derived from the
+# Keychain master key -- see service_auth.py). Anything else here, and
+# the ASR server returns 401.
+oai["api_key"]             = tok
 p.write_text(json.dumps(d, indent=2) + "\n")
 PY
   then
@@ -954,11 +1066,17 @@ PY
     fi
   fi
 
+  # Compute the token fingerprint (first 6 hex chars after the prefix)
+  # for a safe-to-log identifier the user can match against
+  # `./run.sh status`.
+  local asr_fp
+  asr_fp="$("$VENV_PY" -m service_auth fingerprint asr 2>/dev/null || true)"
   printf "\n  %s● char configured%s\n" "$c_green" "$c_reset"
   printf "    current_stt_provider : openai\n"
   printf "    current_stt_model    : gpt-4o-transcribe           (progressive/SSE -- no 60s client-side timeout)\n"
   printf "    stt.openai.base_url  : http://127.0.0.1:%s/v1\n" "$ASR_PORT"
-  printf "    stt.openai.api_key   : local\n"
+  printf "    stt.openai.api_key   : ls_asr_%s…  (Keychain-derived; fingerprint=%s)\n" \
+         "$(printf '%s' "${asr_token#ls_asr_}" | head -c 4)" "${asr_fp:-?}"
   printf "    posthog analytics    : %s\n" "$analytics_status"
   if [[ -n "$key_backup_path" ]]; then
     printf "    previous key saved   : %s\n" "$key_backup_path"
@@ -1461,6 +1579,18 @@ cmd_start() {
     if inspector_pid >/dev/null; then
       printf "  Inspector (web UI)           : %shttp://127.0.0.1:%s/%s   (sessions, config, char audit)\n" \
              "$c_green" "$INSPECTOR_PORT" "$c_reset"
+      # First-run auth: print the clickable URL that sets the
+      # inspector cookie. After the browser visits this once, the
+      # cookie persists 30 days so subsequent visits to / just work.
+      local inspector_url=""
+      if [[ -x "$VENV_PY" ]]; then
+        inspector_url="$("$VENV_PY" -m service_auth url inspector 2>/dev/null || true)"
+      fi
+      if [[ -n "$inspector_url" && "$inspector_url" != *"<bypass>"* ]]; then
+        printf "  First-time browser auth      : %s%s%s\n" \
+               "$c_bold" "$inspector_url" "$c_reset"
+        printf "                                 (⌘-click once to set the cookie)\n"
+      fi
     fi
   else
     printf "%s──── pipeline %sPARTIALLY%s ready ────%s\n" \
@@ -1529,6 +1659,30 @@ cmd_status() {
                           "$(inspector_pid)" "$INSPECTOR_BIND" "$INSPECTOR_PORT"
   else
     printf "  "; warn; printf "Inspector        not running (\`./run.sh inspector start\`)\n"
+  fi
+
+  # ---- Per-service auth: token fingerprints + inspector URL --------
+  #
+  # We print the fingerprint (first 6 hex chars after the prefix) so
+  # the operator can match what Char's settings.json has against what
+  # the server is currently enforcing -- a drift here is the most
+  # common cause of "Char's Generate just spins forever".
+  #
+  # The inspector URL is the one-shot link that sets the auth cookie.
+  # Printed verbatim so the user can ⌘-click it from the terminal.
+  printf "\n  %sAuthentication%s (per-service tokens; HKDF-derived from Keychain master key)\n" \
+         "$c_bold" "$c_reset"
+  if [[ -x "$VENV_PY" ]]; then
+    local asr_fp inspector_url
+    asr_fp="$("$VENV_PY" -m service_auth fingerprint asr 2>/dev/null || echo "?")"
+    inspector_url="$("$VENV_PY" -m service_auth url inspector 2>/dev/null || echo "?")"
+    if [[ "$asr_fp" == "<bypass>" ]]; then
+      printf "  "; warn; printf "AUTH BYPASS enabled (LOCAL_SCRIBE_DISABLE_AUTH=1) — every endpoint is OPEN\n"
+    else
+      printf "    ASR token fingerprint    : %s\n" "$asr_fp"
+      printf "    Inspector auth URL       : %s\n" "$inspector_url"
+      printf "    (⌘-click the URL once in the browser to set the inspector cookie.)\n"
+    fi
   fi
 }
 

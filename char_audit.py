@@ -98,6 +98,37 @@ def _safe_load_json(path: Path) -> Optional[dict[str, Any]]:
         return None
 
 
+def _expected_asr_token() -> Optional[str]:
+    """Derive the current ASR token if we have the master key available
+    *without* prompting Touch ID. We don't prompt because audit() is
+    used from non-interactive contexts (the inspector's /api/char/audit
+    endpoint, ``./run.sh doctor``). Resolution order:
+
+      1. ``LOCAL_SCRIBE_ASR_TOKEN`` env var -- explicit override.
+      2. ``LOCAL_SCRIBE_MASTER_KEY_HEX`` / test variant -- HKDF derive.
+      3. None -- caller can't do a strong match.
+    """
+    import os
+
+    import service_auth
+
+    if service_auth.is_bypass_enabled():
+        return None
+    tok = os.environ.get("LOCAL_SCRIBE_ASR_TOKEN")
+    if tok:
+        return tok.strip()
+    mk_hex = (os.environ.get("LOCAL_SCRIBE_MASTER_KEY_HEX")
+              or os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"))
+    if mk_hex:
+        try:
+            return service_auth.derive_service_token(
+                bytes.fromhex(mk_hex.strip()), "asr",
+            )
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
 def _decode_scoped(value: Any) -> dict[str, Any]:
     """tauri-plugin-store2 wraps each scoped store value as a JSON-encoded
     string. Decode tolerantly: real dicts, JSON strings, anything else."""
@@ -195,30 +226,94 @@ def audit(cfg: Config) -> AuditReport:
         ))
 
         api_key = oai.get("api_key") or ""
+        # The ASR server now requires a per-service bearer token (see
+        # service_auth.py). Char's saved api_key has to match the
+        # current HKDF-derived ASR token or every Generate click 401s.
+        # We *only* check the prefix shape here (audit is best-effort
+        # non-interactive and doesn't have access to the master key
+        # unless the caller passes it in via LOCAL_SCRIBE_MASTER_KEY_HEX
+        # or LOCAL_SCRIBE_TEST_MASTER_KEY_HEX). The full match is done
+        # by `./run.sh doctor` and `./run.sh status` (which compute the
+        # fingerprint).
         if not api_key:
             checks.append(Check(
                 key="ai.stt.openai.api_key",
                 status=WARN,
                 current="<unset>",
-                note="Char rejects requests without an api_key; configure-char sets 'local'",
+                note=(
+                    "Char rejects requests without an api_key; run "
+                    "`./run.sh configure-char` to write the current ASR "
+                    "token (HKDF-derived from the Keychain master key)."
+                ),
             ))
-        elif api_key == "local":
+        elif api_key.startswith("ls_asr_") and len(api_key) > 16:
+            # Strong drift check when we have a master key to compare.
+            expected_token = _expected_asr_token()
+            if expected_token is None:
+                checks.append(Check(
+                    key="ai.stt.openai.api_key",
+                    status=OK,
+                    current=_mask(api_key),
+                    note=(
+                        "looks like one of our derived tokens "
+                        "(ls_asr_...). Run `./run.sh status` to "
+                        "confirm the fingerprint matches."
+                    ),
+                ))
+            elif api_key == expected_token:
+                checks.append(Check(
+                    key="ai.stt.openai.api_key",
+                    status=OK,
+                    current=_mask(api_key),
+                    note=(
+                        "matches the current ASR token "
+                        f"(fingerprint = {expected_token.split('_')[-1][:6]})"
+                    ),
+                ))
+            else:
+                checks.append(Check(
+                    key="ai.stt.openai.api_key",
+                    status=WARN,
+                    current=_mask(api_key),
+                    expected=_mask(expected_token),
+                    note=(
+                        "api_key DRIFT -- saved value doesn't match the "
+                        "current ASR token. Run `./run.sh configure-char` "
+                        "to rewrite Char's settings.json."
+                    ),
+                ))
+        elif api_key in ("local", "local-auth-bypassed"):
+            # Legacy / bypass-mode placeholder.
             checks.append(Check(
                 key="ai.stt.openai.api_key",
-                status=OK,
-                current="local",
-                note="our placeholder -- the local ASR server ignores it",
+                status=WARN if api_key == "local" else INFO,
+                current=api_key,
+                note=(
+                    "legacy placeholder -- the ASR server now requires a "
+                    "real per-service token. Run `./run.sh configure-char`."
+                    if api_key == "local"
+                    else "auth bypass mode (LOCAL_SCRIBE_DISABLE_AUTH=1); not for production."
+                ),
             ))
         else:
+            # Doesn't look like our derived token. Could be a real OpenAI
+            # key (privacy red flag) or something else.
+            looks_like_openai = api_key.startswith("sk-") or len(api_key) > 40
             checks.append(Check(
                 key="ai.stt.openai.api_key",
-                status=INFO,
+                status=WARN,
                 current=_mask(api_key),
                 note=(
                     "looks like a real OpenAI key. Even though base_url "
-                    "is loopback, this string sits in plain text inside "
-                    "settings.json -- consider rotating at "
-                    "platform.openai.com/api-keys."
+                    "is loopback, this string sits in plain text in "
+                    "settings.json; consider rotating at "
+                    "platform.openai.com/api-keys. Then run "
+                    "`./run.sh configure-char` to replace with our "
+                    "ASR token."
+                    if looks_like_openai else
+                    "doesn't match the expected ls_asr_<hex> shape -- "
+                    "run `./run.sh configure-char` to write the current "
+                    "ASR token."
                 ),
             ))
 
@@ -366,10 +461,54 @@ def configure_char(cfg: Config, *, backup_existing_key: bool = True) -> dict[str
     settings_backup = settings_path.with_name(settings_path.name + f".bak.{ts}")
     settings_backup.write_bytes(settings_path.read_bytes())
 
+    # --- derive the ASR bearer token --------------------------------
+    # Inspector UI calls this from a FastAPI handler -- we *can't*
+    # block on Touch ID there (would hang the request thread until
+    # the user acks). Resolution order:
+    #
+    #   1. LOCAL_SCRIBE_ASR_TOKEN env var (explicit override).
+    #   2. LOCAL_SCRIBE_MASTER_KEY_HEX env var -- HKDF derive.
+    #   3. The inspector's already-unlocked token in memory --
+    #      callable via service_auth.client_token_for("asr") but
+    #      THAT prompts Touch ID. The inspector's lifespan has the
+    #      master key in memory; we surface a helpful error instead
+    #      of hanging.
+    #   4. LOCAL_SCRIBE_DISABLE_AUTH=1 -> "local-auth-bypassed".
+    import service_auth
+    asr_token: str
+    if service_auth.is_bypass_enabled():
+        asr_token = "local-auth-bypassed"
+    else:
+        import os
+        explicit = os.environ.get("LOCAL_SCRIBE_ASR_TOKEN")
+        if explicit:
+            asr_token = explicit.strip()
+        else:
+            mk_hex = (os.environ.get("LOCAL_SCRIBE_MASTER_KEY_HEX")
+                      or os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"))
+            if mk_hex:
+                asr_token = service_auth.derive_service_token(
+                    bytes.fromhex(mk_hex.strip()), "asr",
+                )
+            else:
+                # Last resort: Touch ID prompt. Will block the calling
+                # thread; acceptable for the CLI path, not great from
+                # the inspector. The inspector caller should pre-set
+                # LOCAL_SCRIBE_ASR_TOKEN before invoking us.
+                asr_token = service_auth.client_token_for(
+                    "asr",
+                    prompt="Authenticate local_scribe to write the ASR "
+                           "token into Char's settings.json",
+                ) or "local-auth-bypassed"
+
     # --- optional dedicated backup of an existing real key -----------
     key_backup_path: Optional[Path] = None
     cur_key = (oai.get("api_key") or "").strip()
-    if backup_existing_key and cur_key and cur_key != "local":
+    # Only treat truly-foreign keys as worth backing up: anything that
+    # doesn't look like our derived token AND isn't a legacy placeholder.
+    is_legacy_placeholder = cur_key in ("local", "local-auth-bypassed", "")
+    is_our_token = cur_key.startswith("ls_asr_")
+    if backup_existing_key and cur_key and not is_legacy_placeholder and not is_our_token:
         backup_dir = Path.home() / ".config" / "local_scribe"
         backup_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -390,7 +529,7 @@ def configure_char(cfg: Config, *, backup_existing_key: bool = True) -> dict[str
     ai["current_stt_provider"] = cfg.expected_stt_provider
     ai["current_stt_model"] = cfg.expected_stt_model
     oai["base_url"] = cfg.expected_stt_base_url
-    oai["api_key"] = "local"
+    oai["api_key"] = asr_token
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 
     # --- write/merge the analytics-disabled flag in store.json -------
@@ -413,7 +552,9 @@ def configure_char(cfg: Config, *, backup_existing_key: bool = True) -> dict[str
             "current_stt_provider": cfg.expected_stt_provider,
             "current_stt_model": cfg.expected_stt_model,
             "openai_base_url": cfg.expected_stt_base_url,
-            "openai_api_key": "local",
+            # Mask the api_key in the response so the inspector UI
+            # doesn't render it in a flash before the user sees it.
+            "openai_api_key": _mask(asr_token),
         },
         "settings_backup": str(settings_backup),
         "key_backup": str(key_backup_path) if key_backup_path else None,

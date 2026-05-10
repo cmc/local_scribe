@@ -136,10 +136,14 @@ Being honest about the parts of the stack that aren't ours:
   `127.0.0.1:8000`. macOS's firewall blocks incoming connections by
   default, but if you've allowed Python through the firewall and you're
   on a public Wi-Fi, in principle a peer on the same network could hit
-  the endpoint. Tightening the default bind to loopback (with an
-  explicit `BIND_ALL=1` opt-in for "I want this reachable from another
-  machine on my LAN") is a [TODO.md](TODO.md) item — meanwhile, run on
-  trusted networks or behind a firewall.
+  the endpoint. Even so, **every endpoint other than `/health` now
+  requires a per-service bearer token** (see
+  [§ Service authentication](#service-authentication) below) so a
+  non-local probe gets a 401 rather than access to the API. Tightening
+  the default bind to loopback (with an explicit `BIND_ALL=1` opt-in
+  for "I want this reachable from another machine on my LAN") is a
+  [TODO.md](TODO.md) item — meanwhile, run on trusted networks or
+  behind a firewall.
 - **macOS Spotlight indexes audio files** by default. To exclude Char's
   session directory:
   ```bash
@@ -153,6 +157,142 @@ Being honest about the parts of the stack that aren't ours:
   Your call recordings end up in your local backups too — usually what
   you want for safety, but it does mean they exist in more than one
   place on disk.
+
+### Service authentication
+
+Loopback-bind alone isn't enough: anyone who lands a shell on the Mac
+(malicious browser extension making CORS requests, a different user on
+the same machine, a Tauri app that isn't Char) can `curl
+http://127.0.0.1:8000/v1/audio/transcriptions` and start submitting
+audio or scraping the inspector's session list. Since v0.5 every
+exposed endpoint requires a **per-service bearer token** derived from
+the Keychain master key.
+
+#### The model
+
+There is one root secret: a 256-bit AES key generated at install time,
+stored in the macOS Keychain under `service=local_scribe /
+account=master_key` with an access control of `.userPresence` — i.e.
+**Touch ID** (passcode fallback). The key never leaves the Keychain in
+plaintext; reads require a fresh biometric session.
+
+From that single root, each service derives its own bearer token via
+HKDF-SHA256:
+
+```
+master_key  (32 bytes, Keychain, Touch ID gated)
+    │
+    ├─ HKDF(info=b"service:asr") ───────► ls_asr_<32hex>        ◄── ASR :8000
+    ├─ HKDF(info=b"service:inspector") ─► ls_inspector_<32hex>  ◄── Inspector :8001
+    └─ HKDF(info=b"service:future") ───►  ls_future_<32hex>     ◄── future services
+```
+
+Why HKDF instead of separately-stored tokens:
+
+- **One secret to back up.** The YubiKey-based master-key backup
+  ([`yubikey_backup.py`](yubikey_backup.py); wired into `run.sh` in a
+  follow-up commit) covers the master key; every per-service token is
+  recoverable from it.
+- **Deterministic.** Same master key → same tokens. Char's saved
+  OpenAI `api_key` stays valid across server restarts / vault
+  remounts.
+- **No extra ciphertext on disk.** There's nothing for an attacker to
+  scrape — the tokens only exist in the running server's memory.
+
+#### How the gate enforces it
+
+Every gated endpoint demands a token via any of these headers
+(checked constant-time):
+
+```
+Authorization: Bearer ls_asr_<token>     # OpenAI clients, Char's batch
+Authorization: Token  ls_asr_<token>     # Deepgram clients, Char's live
+X-API-Key:            ls_asr_<token>     # curl-friendly
+?api_key=<token>                         # query-string fallback
+Cookie: ls_inspector=<token>             # inspector browser (set by /auth)
+```
+
+Endpoints that **stay open** by design:
+
+- `GET /health` on the ASR server — liveness probe used by
+  `./run.sh status` and `./run.sh doctor`.
+- `GET /api/health` on the inspector — same role.
+- `GET /` on the inspector — the SPA HTML loads without auth so the
+  browser can render the "click here to authenticate" prompt before
+  the cookie has been set. The page exposes no session data.
+- `GET /auth?token=…` on the inspector — the cookie-setting handshake.
+
+Everything else returns **HTTP 401** with a `WWW-Authenticate`
+header if the token is missing or wrong.
+
+#### Where each client gets its token
+
+| Client | How it sends the token |
+|---|---|
+| **Char** (file Generate + live recording) | `./run.sh configure-char` writes the ASR token into `ai.stt.openai.api_key`. Char sends it as `Authorization: Bearer …`. |
+| **transcribe_file.py** (CLI) | Prompts Touch ID on first run, derives the ASR token in-process, sends as `Authorization: Token …`. |
+| **redo_session.py** (CLI) | Same. |
+| **Browser** (inspector UI) | Visits `http://127.0.0.1:8001/auth?token=…` once — `./run.sh status` prints the full URL. Cookie persists 30 days (HttpOnly + SameSite=Strict). |
+| **`curl` (you)** | Same headers as any other client. Run `./venv/bin/python -m service_auth token asr` to print the current token. |
+
+#### One-shot operations
+
+```bash
+./run.sh status                     # prints token fingerprints + inspector auth URL
+./run.sh doctor                     # full health + drift report
+./run.sh configure-char             # rewrite Char's settings.json with current ASR token
+./venv/bin/python -m service_auth token asr           # print ASR token (prompts Touch ID)
+./venv/bin/python -m service_auth fingerprint asr     # safe-to-log first 6 hex chars
+./venv/bin/python -m service_auth url inspector       # clickable browser auth URL
+```
+
+#### Token rotation
+
+Rotating a per-service token = rotating the master key
+(`./run.sh vault init` regenerates everything). After a rotation:
+
+1. Restart the services so they pick up the new derivations:
+   `./run.sh restart`.
+2. Re-run `./run.sh configure-char` so Char's saved `api_key` matches
+   the new ASR token. (`./run.sh doctor` flags drift loudly if you
+   forget.)
+3. Reopen the inspector with the new auth URL printed by
+   `./run.sh status` — the old cookie is silently ignored.
+
+#### What this defends — and what it doesn't
+
+It defends against:
+
+- A malicious browser extension making CORS requests to
+  `http://127.0.0.1:8000`. Without the token it gets 401.
+- A second user on the same Mac (different UID) probing your
+  loopback. Same 401.
+- An attacker who's gained code execution as your user but does
+  **not** have a Touch ID session yet — they can read tokens out of
+  `ps -E` env vars (we don't pass tokens through env) or process
+  memory, **but only after physically tapping the sensor**. The
+  Keychain item itself is unreadable without `.userPresence`.
+
+It does **not** defend against:
+
+- An attacker who has compromised your user account *and* successfully
+  prompts Touch ID by impersonating one of our binaries. macOS doesn't
+  pin the prompt to a specific process. This is the soft underbelly
+  of any "TouchID-gated Keychain item" — defence-in-depth needs full
+  app sandboxing, which we don't have on a non-Mac-App-Store install.
+- An attacker with root. Root reads everything.
+
+#### Bypass for CI / scripted tests
+
+`LOCAL_SCRIBE_DISABLE_AUTH=1` short-circuits every check. The servers
+log a loud warning on startup when this is active. Never set this in
+production; only used for the pre-auth-era test suite and for
+unattended bootstrap automation.
+
+#### Threat-model summary
+
+The full table — assets, adversaries, capabilities — lives in
+[CHAR_REVIEW.md § Threat model](CHAR_REVIEW.md#threat-model).
 
 ### Air-gap mode
 

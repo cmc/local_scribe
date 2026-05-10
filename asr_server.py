@@ -90,7 +90,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import status as http_status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 # NOTE: starlette's UploadFile (not fastapi's). request.form() yields starlette
@@ -361,7 +364,96 @@ _mlx_executor.submit(lambda: None).result()
 
 logger.info("model ready (backend=%s, model=%s)", ASR_BACKEND, MODEL_NAME)
 
-app = FastAPI(title="local-scribe-asr", version="0.4.0")
+
+# --- Per-service bearer-token auth ----------------------------------
+#
+# All routes other than /health require a token derived from the
+# Keychain master key via HKDF-SHA256 (see ``service_auth.py``). The
+# token is populated inside a FastAPI lifespan so test imports of this
+# module don't trigger a Touch ID prompt; the route decorators bind to
+# a *callable* that resolves the token at request time.
+#
+# Test hooks (none of these are for production use; documented in the
+# README "Service authentication" section):
+#
+#   LOCAL_SCRIBE_DISABLE_AUTH=1
+#       Disables the check entirely. Used by CI and the existing
+#       FastAPI TestClient suites which were written pre-auth.
+#
+#   LOCAL_SCRIBE_TEST_MASTER_KEY_HEX=<64 hex chars>
+#       Skip Touch ID; derive the ASR token from these 32 bytes. Used
+#       by the auth integration tests that need to exercise the real
+#       gating logic without a Keychain.
+
+import service_auth  # noqa: E402
+
+
+_asr_token: service_auth.ServiceToken | None = None
+
+
+def _resolve_asr_token() -> service_auth.ServiceToken | None:
+    """Token provider passed to ``make_token_dependency``. Returned
+    object is read fresh on each request so a future ``rotate-token``
+    command can swap it without restarting the server."""
+    return _asr_token
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Populate ``_asr_token`` from the Keychain (prompts Touch ID) or
+    from the test env var. Logs the token *fingerprint* (first 6 hex
+    chars after the prefix) so operators can verify "Char's saved api
+    key matches the server's current token" without ever surfacing the
+    secret itself."""
+    global _asr_token
+    if service_auth.is_bypass_enabled():
+        # Loud warning -- people forgetting to flip this back off in
+        # production would be a sharp footgun.
+        logger.warning(
+            "AUTH BYPASS ENABLED via %s=1 — every endpoint is OPEN. "
+            "Unset this env var in production.",
+            service_auth.BYPASS_ENV,
+        )
+    else:
+        test_mk = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
+        if test_mk:
+            try:
+                mk = bytes.fromhex(test_mk.strip())
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"LOCAL_SCRIBE_TEST_MASTER_KEY_HEX is not valid hex: {exc}"
+                ) from exc
+            _asr_token = service_auth.ServiceToken.from_master_key(mk, "asr")
+            logger.info(
+                "service_auth: ASR token derived from test master key "
+                "(fingerprint=%s) — production deployments use Touch ID",
+                service_auth.token_fingerprint(_asr_token.token),
+            )
+        else:
+            try:
+                _asr_token = service_auth.ServiceToken.unlock("asr")
+            except Exception as exc:  # noqa: BLE001
+                # Surface a clear startup failure rather than serving an
+                # un-authenticated API silently.
+                logger.error(
+                    "service_auth: failed to unlock master key for ASR "
+                    "service: %s — set LOCAL_SCRIBE_DISABLE_AUTH=1 to "
+                    "start without auth (NOT recommended), or run "
+                    "`./run.sh vault init` to create the Keychain item.",
+                    exc,
+                )
+                raise
+    yield
+    # Best-effort: drop the in-memory holder on shutdown so a core dump
+    # captured immediately after stop doesn't contain it.
+    _asr_token = None
+
+
+app = FastAPI(
+    title="local-scribe-asr",
+    version="0.4.0",
+    lifespan=_lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -369,6 +461,50 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Dependency bound once; the underlying token is resolved lazily.
+require_asr_token = service_auth.make_token_dependency(_resolve_asr_token)
+
+
+async def _ws_auth(ws: WebSocket) -> bool:
+    """WebSocket auth check -- FastAPI's ``Depends()`` doesn't run for
+    ``@app.websocket(...)`` handlers, so we replay the same logic
+    inline. Called BEFORE ``ws.accept()`` so we can reject the upgrade
+    cleanly instead of accepting then dropping (which leaks a 101
+    Switching Protocols on every probe).
+
+    Token sources accepted, in order:
+      1. ``Authorization: Bearer ...`` upgrade header (preferred)
+      2. ``Authorization: Token ...`` (Deepgram-style)
+      3. ``Sec-WebSocket-Protocol: <token>`` (some browsers don't let
+         you set arbitrary upgrade headers but DO let you set a
+         subprotocol — we accept either spelling)
+      4. ``?api_key=<token>`` query param
+    """
+    if service_auth.is_bypass_enabled():
+        return True
+    if _asr_token is None:
+        # 1011 = internal error. Use HTTP-style close-before-accept.
+        await ws.close(code=1011, reason="auth not initialised")
+        return False
+
+    candidate: str | None = service_auth.extract_candidate_token(ws)
+    if not candidate:
+        # Inspect subprotocols (Sec-WebSocket-Protocol). Starlette
+        # surfaces these as a list on the connection scope.
+        try:
+            for proto in (ws.scope.get("subprotocols") or []):
+                if proto:
+                    candidate = proto
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not candidate or not _asr_token.matches(candidate):
+        await ws.close(code=1008, reason="unauthorized")
+        return False
+    return True
 
 
 def _now_iso() -> str:
@@ -1292,7 +1428,7 @@ async def _stream_openai_transcription(
             pass
 
 
-@app.post("/v1/audio/transcriptions")
+@app.post("/v1/audio/transcriptions", dependencies=[Depends(require_asr_token)])
 async def openai_audio_transcriptions(request: Request):
     """OpenAI Whisper-API-compatible batch transcription.
 
@@ -1312,8 +1448,9 @@ async def openai_audio_transcriptions(request: Request):
         timestamp_granularities - silently ignored (we don't sample, prompt,
                                   or emit per-token granularity).
 
-    Auth: the Authorization: Bearer <key> header is accepted and ignored;
-    no key is required and any value works.
+    Auth: Authorization: Bearer <token> required, where <token> is the
+    HKDF-derived ASR token (see service_auth.py). Char's OpenAI
+    api_key field is wired to this token by ``./run.sh configure-char``.
     """
     request_id = str(uuid.uuid4())
     started = time.time()
@@ -1525,7 +1662,7 @@ async def health() -> dict[str, Any]:
     }
 
 
-@app.post("/v1/listen")
+@app.post("/v1/listen", dependencies=[Depends(require_asr_token)])
 async def listen(request: Request):
     """Deepgram-compatible batch transcription.
 
@@ -1594,7 +1731,7 @@ async def listen(request: Request):
     )
 
 
-@app.post("/v1/listen/stream")
+@app.post("/v1/listen/stream", dependencies=[Depends(require_asr_token)])
 async def listen_stream(request: Request):
     """Same input as /v1/listen, but streams NDJSON progress events as Whisper
     processes each segment. The final line is the same Deepgram-shaped JSON
@@ -1749,7 +1886,15 @@ async def listen_ws(ws: WebSocket):
     live partial captions during a call later, switch to a streaming-capable
     model (e.g., whisper-streaming or a Riva backend) without changing the
     wire protocol here.
+
+    Auth: same token as the HTTP endpoints. Token can be passed via the
+    Authorization upgrade header, the Sec-WebSocket-Protocol subprotocol
+    (some browsers don't allow custom upgrade headers), or ?api_key=.
     """
+    # Validate auth *before* accept() so a wrong-token request never sees
+    # the 101 Switching Protocols response.
+    if not await _ws_auth(ws):
+        return
     await ws.accept()
     request_id = str(uuid.uuid4())
     sample_rate = _query_int(ws, "sample_rate", 16000)

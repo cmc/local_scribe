@@ -187,18 +187,22 @@ class ValidatorTests(_TempConfigCase):
         errs = config.validate(d)
         self.assertTrue(any("differ" in e for e in errs))
 
-    def test_non_loopback_inspector_without_token_rejected(self):
+    def test_non_loopback_inspector_warned(self):
+        # Auth is now always on (service_auth.py / Keychain-derived
+        # tokens), but a non-loopback bind is still suspect — the
+        # inspector has no TLS / rate-limit / abuse mitigation. The
+        # validator warns regardless of any legacy auth_token value.
         d = copy.deepcopy(config.DEFAULT_CONFIG)
         d["inspector"]["bind"] = "0.0.0.0"
         d["inspector"]["auth_token"] = None
         errs = config.validate(d)
-        self.assertTrue(any("auth_token" in e or "loopback" in e for e in errs))
+        self.assertTrue(any("loopback" in e for e in errs))
 
-    def test_non_loopback_inspector_with_token_allowed(self):
-        d = copy.deepcopy(config.DEFAULT_CONFIG)
-        d["inspector"]["bind"] = "0.0.0.0"
         d["inspector"]["auth_token"] = "deadbeef" * 4
-        self.assertEqual(config.validate(d), [])
+        errs2 = config.validate(d)
+        # Setting auth_token doesn't silence the warning anymore — the
+        # field is legacy / unused. The bind is what matters.
+        self.assertTrue(any("loopback" in e for e in errs2))
 
 
 class CharPathDerivationTests(_TempConfigCase):

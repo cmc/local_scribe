@@ -749,6 +749,90 @@ Items left for a future review (also tracked in [TODO.md](TODO.md)):
   registers it, and what protocol does it speak? (Native messaging
   apps can be a lateral-movement vector.)
 
+---
+
+## Threat model
+
+This is the full attacker model the `local_scribe` stack is designed
+against. Use this when arguing about whether a proposed change adds or
+removes defences, and when deciding whether a feature request fits
+the project's privacy posture.
+
+### Assets we're protecting
+
+1. **Recorded audio** of the user's meetings + 1:1 calls
+   (Char's `audio.mp3` per session).
+2. **Transcripts** (`transcript.json` + diarisation segments +
+   confidence scores).
+3. **LLM-generated notes** (TL;DR, decisions, risks, etc.) — derived
+   from the above and equivalent in sensitivity.
+4. **Identity-revealing metadata** — speaker names inferred from
+   audio, calendar attendee names, file paths to recordings.
+
+The audio + transcripts are the crown jewels: a leak of "what was
+said" almost always reveals personal / business / legal context that
+the user would treat as confidential.
+
+### Adversary capabilities
+
+We rank adversaries by what they can do on the user's Mac. Each
+higher row strictly dominates the rows above.
+
+| # | adversary | capability | mitigated by |
+|---|---|---|---|
+| 1 | **Remote network peer** (same LAN / public Wi-Fi) | TCP probe of `127.0.0.1:8000` from another box | macOS default firewall blocks inbound; `0.0.0.0` bind made obsolete by per-service bearer-token auth (any 401 leaks nothing useful). |
+| 2 | **Browser content** (XSS / malicious extension on the user's browser) | `fetch()` to `http://127.0.0.1:8000`, `http://127.0.0.1:8001` from arbitrary origin | CORS still permissive (`*` for ASR) but **every endpoint is gated on a Keychain-derived bearer token** the browser can't see. `/auth` is the only cookie-issuing endpoint and it requires the right token in the query string (no GET-based CSRF that gets it for free). Inspector cookie is `HttpOnly` + `SameSite=Strict`. |
+| 3 | **Co-tenant on the same Mac** (different macOS user, no admin) | Read another user's files / sockets / Keychain items | Per-service tokens are derived from a Keychain item with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + `.userPresence` ACL — unreadable by another user (Keychain itself enforces per-user isolation; `.userPresence` denies even the owning user without Touch ID). Loopback bind audible to other users on the *same UID* only. |
+| 4 | **Shell-as-user** (the scenario in the headline request: an attacker has code execution as the logged-in user, e.g. via a compromised brew formula or sketchy `curl \| sh`) | `curl` localhost, read env vars / proc memory of running processes, write files in `$HOME`, but cannot bypass `.userPresence` without a fresh Touch ID tap | **Cannot curl any `/api/*` or `/v1/*` endpoint** without the token; tokens are not in env vars, argv, or any file on disk (only in the running server's RAM); Touch ID required for fresh derivation. Token rotation per `./run.sh vault init` revokes any stolen token. |
+| 5 | **Backup / forensic-imager** (lost laptop, Time Machine drive, iCloud sync, MDM image) | Read any file on disk; no live process to query | (Future, in progress) AES-256 sparse-bundle vault for Char's session directory — see [`vault.py`](vault.py). YubiKey-encrypted backup of the master key — see [`yubikey_backup.py`](yubikey_backup.py). Both modules land in `./run.sh` in a follow-up commit. |
+| 6 | **Compromised-user-with-Touch-ID-cooperation** (attacker phishes the user into tapping the sensor for a fake prompt) | Anything 4 can do, plus a fresh `.userPresence` session | **Not mitigated.** This is the soft underbelly of every Touch-ID-Keychain workflow: macOS doesn't pin the prompt copy to a specific process, so a rogue Helper could pop a plausible-looking "Unlock to sign in" prompt and exfiltrate the token after the user taps. Defence requires full app sandboxing, which a non-MAS install can't have. **Mitigation: per-request fingerprint logging** so the user can spot drift in `./run.sh status` even if a token was briefly stolen. |
+| 7 | **Root / TCC-bypass attacker** | Anything | Out of scope. Root reads everything. |
+
+### What the per-service bearer tokens specifically buy
+
+The threat the bearer tokens were added to address is row **#4**
+(shell-as-user). Before the tokens, an attacker at this tier could
+trivially:
+
+- POST audio to the ASR server and read back the transcription
+- Scrape `/api/sessions` from the inspector for every session title
+  + audio path
+- Dump `transcript.json` per session via `/api/sessions/.../history/`
+- Trigger Char-config rewrites via `/api/char/configure`
+
+After the tokens, the same attacker gets HTTP 401 on each of those.
+The defence isn't airtight (see row #6 above), but the bar moved
+from "trivial" to "social-engineer the user into pressing their
+fingerprint for an unexpected prompt".
+
+### What we explicitly do *not* defend against
+
+- An attacker who's **already running with the user's identity** and
+  has a live Touch ID session (e.g. the user tapped 30 seconds ago
+  for a different app). Cooperative attacks on the OS user are out
+  of scope for any user-mode tool.
+- Kernel-level malware / hypervisor escapes / Meltdown-style side
+  channels. These let an attacker read RAM, including our tokens.
+- Side-channel timing attacks on `secrets.compare_digest`. Tokens
+  are compared in constant time but loopback latency is high; we
+  don't claim resistance to a sophisticated timing oracle.
+- DoS against the loopback servers. A local attacker can hammer them
+  to consume CPU / fill the cache directory. We log + rate-limit at
+  the OS level only.
+
+### Open mitigations (tracked in [TODO.md](TODO.md))
+
+- Wire `vault.py` + `yubikey_backup.py` into `./run.sh bootstrap` and
+  the lifespan startup so on-disk encryption is enabled by default.
+- Bind ASR to `127.0.0.1` by default with a `BIND_ALL=1` opt-in.
+- Block Char's auto-update endpoint at the firewall and provide a
+  runtime kill-switch for the Sentry DSN.
+- Per-session delete + audit log inside the inspector so a user can
+  review what an attacker could have seen if any of the above
+  defences ever fail.
+
+---
+
 When `CHAR_KNOWN_GOOD_VERSION` in `run.sh` is bumped, the
 [§ Methodology](#methodology) section is the checklist for re-running
 this audit.

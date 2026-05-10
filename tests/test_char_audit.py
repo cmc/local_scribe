@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,9 +20,19 @@ def _make_cfg(data_dir: Path) -> config.Config:
     return config.Config(raw=raw)
 
 
+# A well-formed ASR token (ls_asr_<32hex>). The new audit code accepts
+# any value with this shape as OK when we don't have a master key to
+# compare against (the strong-match case is exercised by
+# ``CharAuditTokenDriftTests`` below).
+_FAKE_ASR_TOKEN = "ls_asr_" + "a" * 32
+
+
 def _write_settings(path: Path, **overrides) -> None:
     """Helper: build a minimal settings.json that looks like Char's
-    real one, with the supplied overrides patched in."""
+    real one, with the supplied overrides patched in. The default
+    api_key is a token-shaped string so the audit's default state is
+    OK (used to be the legacy "local" placeholder, now a warn-level
+    finding)."""
     base = {
         "ai": {
             "current_stt_provider": "openai",
@@ -29,7 +40,7 @@ def _write_settings(path: Path, **overrides) -> None:
             "stt": {
                 "openai": {
                     "base_url": "http://127.0.0.1:8000/v1",
-                    "api_key": "local",
+                    "api_key": _FAKE_ASR_TOKEN,
                 },
             },
         },
@@ -115,7 +126,11 @@ class DirtyStateTests(unittest.TestCase):
             self.assertEqual(m.status, char_audit.WARN)
             self.assertIn("60s", m.note.lower().replace(" ", ""))
 
-    def test_real_openai_key_is_masked_and_flagged_info(self):
+    def test_real_openai_key_is_masked_and_flagged_warn(self):
+        # The audit now warns on real-looking OpenAI keys (used to be
+        # INFO) because the new ASR auth model requires our derived
+        # token, not a real OpenAI secret. A leftover sk-... is both
+        # a wrong-token problem AND a privacy red flag.
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
             cfg = _make_cfg(data_dir)
@@ -126,10 +141,69 @@ class DirtyStateTests(unittest.TestCase):
             _write_store(data_dir / "store.json", analytics_disabled=True)
             report = char_audit.audit(cfg)
             k = next(c for c in report.checks if c.key == "ai.stt.openai.api_key")
-            self.assertEqual(k.status, char_audit.INFO)
+            self.assertEqual(k.status, char_audit.WARN)
             # Full key must NOT appear in the rendered current value
             self.assertNotIn("AAAAAAAAAAAAAAAAAAAAAAAA", k.current)
             self.assertIn("...", k.current)
+
+
+class CharAuditTokenDriftTests(unittest.TestCase):
+    """When the master key is reachable (env var), audit() upgrades
+    its api_key check from "looks-shaped-right" to a strong match
+    against the HKDF-derived ASR token."""
+
+    MK_HEX = "ab" * 32
+
+    def setUp(self):
+        # Inject the master key via env var so audit() can derive the
+        # expected ASR token without prompting Touch ID.
+        self._old = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
+        os.environ["LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"] = self.MK_HEX
+        # Bypass must be off so the drift check actually runs.
+        import service_auth
+        self._old_bypass = os.environ.pop(service_auth.BYPASS_ENV, None)
+
+    def tearDown(self):
+        import service_auth
+        if self._old is None:
+            os.environ.pop("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX", None)
+        else:
+            os.environ["LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"] = self._old
+        if self._old_bypass is not None:
+            os.environ[service_auth.BYPASS_ENV] = self._old_bypass
+
+    def _expected(self):
+        import service_auth
+        return service_auth.derive_service_token(bytes.fromhex(self.MK_HEX), "asr")
+
+    def test_matching_token_is_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            cfg = _make_cfg(data_dir)
+            _write_settings(
+                data_dir / "settings.json",
+                **{"ai.stt.openai.api_key": self._expected()},
+            )
+            _write_store(data_dir / "store.json", analytics_disabled=True)
+            report = char_audit.audit(cfg)
+            k = next(c for c in report.checks if c.key == "ai.stt.openai.api_key")
+            self.assertEqual(k.status, char_audit.OK)
+            self.assertIn("matches", k.note)
+
+    def test_drifted_token_is_warn(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            cfg = _make_cfg(data_dir)
+            # Right shape but wrong value.
+            _write_settings(
+                data_dir / "settings.json",
+                **{"ai.stt.openai.api_key": "ls_asr_" + "b" * 32},
+            )
+            _write_store(data_dir / "store.json", analytics_disabled=True)
+            report = char_audit.audit(cfg)
+            k = next(c for c in report.checks if c.key == "ai.stt.openai.api_key")
+            self.assertEqual(k.status, char_audit.WARN)
+            self.assertIn("DRIFT", k.note)
 
 
 class MissingFilesTests(unittest.TestCase):
@@ -146,7 +220,31 @@ class MissingFilesTests(unittest.TestCase):
 
 
 class ConfigureCharTests(unittest.TestCase):
+    MK_HEX = "ab" * 32
+
+    def setUp(self):
+        # Inject a known master key so configure_char can derive the
+        # ASR token without prompting Touch ID. Without this, the
+        # function would either prompt or fall through to bypass mode.
+        self._old = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
+        os.environ["LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"] = self.MK_HEX
+        import service_auth
+        self._old_bypass = os.environ.pop(service_auth.BYPASS_ENV, None)
+
+    def tearDown(self):
+        import service_auth
+        if self._old is None:
+            os.environ.pop("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX", None)
+        else:
+            os.environ["LOCAL_SCRIBE_TEST_MASTER_KEY_HEX"] = self._old
+        if self._old_bypass is not None:
+            os.environ[service_auth.BYPASS_ENV] = self._old_bypass
+
     def test_rewrites_four_keys_and_sets_analytics_disabled(self):
+        import service_auth
+        expected_token = service_auth.derive_service_token(
+            bytes.fromhex(self.MK_HEX), "asr",
+        )
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
             cfg = _make_cfg(data_dir)
@@ -169,7 +267,14 @@ class ConfigureCharTests(unittest.TestCase):
                 patched["ai"]["stt"]["openai"]["base_url"],
                 "http://127.0.0.1:8000/v1",
             )
-            self.assertEqual(patched["ai"]["stt"]["openai"]["api_key"], "local")
+            # The api_key field is now the HKDF-derived ASR token.
+            self.assertEqual(
+                patched["ai"]["stt"]["openai"]["api_key"], expected_token,
+            )
+            # The response masks the token so the inspector UI doesn't
+            # flash it.
+            self.assertIn("...", result["after"]["openai_api_key"])
+            self.assertNotIn(expected_token, result["after"]["openai_api_key"])
             store = json.loads((data_dir / "store.json").read_text())
             inner = json.loads(store["analytics"])
             self.assertTrue(inner["Disabled"])

@@ -405,11 +405,19 @@ def validate(data: dict[str, Any]) -> list[str]:
         errors.append(f"asr.backend must be 'parakeet' or 'whisper', got {backend!r}")
     if int(data["asr"]["port"]) == int(data["inspector"]["port"]):
         errors.append("asr.port and inspector.port must differ")
+    # Inspector auth is always required at runtime (per-service bearer
+    # token derived from the Keychain master key — see service_auth.py).
+    # The legacy ``inspector.auth_token`` config field is kept in
+    # DEFAULT_CONFIG for back-compat with older config.json files but
+    # is no longer consulted by the inspector. A non-loopback bind is
+    # still worth flagging since the inspector wasn't designed to be
+    # internet-exposed (no TLS, no rate-limiting).
     bind = data.get("inspector", {}).get("bind")
-    auth = data.get("inspector", {}).get("auth_token")
-    if bind not in ("127.0.0.1", "localhost") and not auth:
+    if bind not in ("127.0.0.1", "localhost"):
         errors.append(
-            f"inspector.bind is {bind!r} (non-loopback); set "
-            "inspector.auth_token first or rebind to 127.0.0.1"
+            f"inspector.bind is {bind!r} (non-loopback); auth is enforced "
+            "via Keychain-derived tokens but the inspector still isn't "
+            "designed for network exposure — rebind to 127.0.0.1 unless "
+            "you really know what you're doing"
         )
     return errors

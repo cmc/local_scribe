@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -506,56 +507,211 @@ class CharAuditEndpointTests(unittest.TestCase):
                     "current_stt_model": "gpt-4o-transcribe",
                     "stt": {"openai": {
                         "base_url": "http://127.0.0.1:8000/v1",
-                        "api_key": "local",
+                        # Token-shaped value so audit() treats it as OK
+                        # (the legacy "local" placeholder is now WARN).
+                        "api_key": "ls_asr_" + "a" * 32,
                     }},
                 },
             }))
             (data_dir / "store.json").write_text(json.dumps({
                 "analytics": json.dumps({"Disabled": True}),
             }))
-            cfg = _make_cfg(data_dir)
-            client = TestClient(inspector_server.create_app(cfg))
-            r = client.get("/api/char/audit")
-            self.assertEqual(r.status_code, 200)
-            d = r.json()
-            self.assertTrue(d["settings_present"])
-            self.assertGreaterEqual(d["summary"]["ok"], 4)
-            self.assertEqual(d["summary"]["warn"], 0)
+            # The /api/char/audit handler reloads config() each call
+            # (so an out-of-band edit shows up immediately), which
+            # means it ignores the cfg we pass into create_app() and
+            # reads ~/.config/local_scribe/config.json instead. Point
+            # that file at our temp data_dir for the duration of the
+            # test so we don't accidentally audit the user's REAL
+            # Char installation.
+            tmp_cfg = data_dir / "config.json"
+            raw = copy.deepcopy(config.DEFAULT_CONFIG)
+            raw["char"]["data_dir"] = str(data_dir)
+            tmp_cfg.write_text(json.dumps(raw, indent=2))
+            real = config.DEFAULT_CONFIG_PATH
+            config.DEFAULT_CONFIG_PATH = tmp_cfg
+            try:
+                cfg = _make_cfg(data_dir)
+                client = TestClient(inspector_server.create_app(cfg))
+                r = client.get("/api/char/audit")
+                self.assertEqual(r.status_code, 200)
+                d = r.json()
+                self.assertTrue(d["settings_present"])
+                self.assertGreaterEqual(d["summary"]["ok"], 4)
+                self.assertEqual(d["summary"]["warn"], 0)
+            finally:
+                config.DEFAULT_CONFIG_PATH = real
 
 
 class AuthTests(unittest.TestCase):
-    def test_no_token_means_open_api(self):
+    """Inspector now uses per-service bearer tokens derived from the
+    Keychain master key (see ``service_auth.py``). The tests inject a
+    pre-built ``ServiceToken`` via ``create_app(..., token_holder=...)``
+    so they don't need Touch ID / the real Keychain.
+
+    Cookie / Authorization / X-API-Key / ?api_key all accepted (in
+    that priority order); /api/health remains open as the liveness
+    probe; / is open so the HTML SPA can load before the cookie has
+    been set.
+    """
+
+    TEST_MK = b"\xab" * 32
+
+    @classmethod
+    def setUpClass(cls):
+        # The rest of the inspector_server suite runs with
+        # LOCAL_SCRIBE_DISABLE_AUTH=1 (set by run.sh / shell). To
+        # exercise the real auth path, this class explicitly clears
+        # the bypass.
+        import service_auth
+        cls._old_bypass = os.environ.pop(service_auth.BYPASS_ENV, None)
+
+    @classmethod
+    def tearDownClass(cls):
+        import service_auth
+        if cls._old_bypass is not None:
+            os.environ[service_auth.BYPASS_ENV] = cls._old_bypass
+
+    def _holder(self):
+        import service_auth
+        return service_auth.ServiceToken.from_master_key(self.TEST_MK, "inspector")
+
+    def _client(self, td):
+        # Auth is always required when a holder is injected, regardless
+        # of the legacy auth_token config field. Pass auth_token=None
+        # to keep the rest of the cfg shape happy.
+        cfg = _make_cfg(Path(td), auth_token=None)
+        return TestClient(
+            inspector_server.create_app(cfg, token_holder=self._holder()),
+        )
+
+    def test_health_endpoint_remains_open(self):
+        # /api/health stays open so monitoring / doctor can probe it
+        # without a token.
         with tempfile.TemporaryDirectory() as td:
-            cfg = _make_cfg(Path(td), auth_token=None)
-            client = TestClient(inspector_server.create_app(cfg))
+            client = self._client(td)
             self.assertEqual(client.get("/api/health").status_code, 200)
 
-    def test_token_required_when_set(self):
+    def test_api_sessions_401_without_auth(self):
         with tempfile.TemporaryDirectory() as td:
-            cfg = _make_cfg(Path(td), auth_token="hunter2hunter2")
-            client = TestClient(inspector_server.create_app(cfg))
-            # No header -> 401
-            self.assertEqual(client.get("/api/health").status_code, 401)
-            # Wrong header -> 401
-            self.assertEqual(
-                client.get("/api/health", headers={"authorization": "Bearer wrong"})
-                      .status_code,
-                401,
+            client = self._client(td)
+            r = client.get("/api/sessions")
+            self.assertEqual(r.status_code, 401)
+            self.assertIn("WWW-Authenticate", r.headers)
+            self.assertEqual(r.json()["detail"]["error"]["service"], "inspector")
+
+    def test_api_sessions_401_with_wrong_bearer(self):
+        with tempfile.TemporaryDirectory() as td:
+            client = self._client(td)
+            r = client.get("/api/sessions",
+                           headers={"Authorization": "Bearer ls_inspector_wrong"})
+            self.assertEqual(r.status_code, 401)
+
+    def test_api_sessions_200_with_correct_bearer(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
             )
-            # Right header -> 200
-            self.assertEqual(
-                client.get("/api/health",
-                           headers={"authorization": "Bearer hunter2hunter2"})
-                      .status_code,
-                200,
+            r = client.get(
+                "/api/sessions",
+                headers={"Authorization": f"Bearer {holder.token}"},
             )
+            self.assertEqual(r.status_code, 200)
+
+    def test_api_sessions_accepts_x_api_key(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.get("/api/sessions", headers={"X-API-Key": holder.token})
+            self.assertEqual(r.status_code, 200)
+
+    def test_api_sessions_accepts_cookie(self):
+        # Browser auth flow: cookie set by /auth?token=... must let
+        # subsequent /api/* requests through.
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            client.cookies.set("ls_inspector", holder.token)
+            r = client.get("/api/sessions")
+            self.assertEqual(r.status_code, 200)
+
+    def test_auth_endpoint_sets_cookie_on_correct_token(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            # follow_redirects=False so we can inspect the 302 + cookie.
+            r = client.get(
+                f"/auth?token={holder.token}",
+                follow_redirects=False,
+            )
+            self.assertEqual(r.status_code, 302)
+            self.assertEqual(r.headers["location"], "/")
+            self.assertIn("ls_inspector", r.cookies)
+            self.assertEqual(r.cookies["ls_inspector"], holder.token)
+            # HttpOnly + SameSite=Strict in raw Set-Cookie header.
+            raw = r.headers.get_list("set-cookie") if hasattr(r.headers, "get_list") \
+                else [r.headers.get("set-cookie", "")]
+            blob = " ".join(raw).lower()
+            self.assertIn("httponly", blob)
+            self.assertIn("samesite=strict", blob)
+
+    def test_auth_endpoint_401_on_wrong_token(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.get("/auth?token=wrong", follow_redirects=False)
+            self.assertEqual(r.status_code, 401)
+
+    def test_auth_endpoint_401_on_missing_token(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.get("/auth", follow_redirects=False)
+            self.assertEqual(r.status_code, 401)
+
+    def test_bypass_env_disables_auth_entirely(self):
+        # LOCAL_SCRIBE_DISABLE_AUTH=1 → no holder needed; all /api/* open.
+        import service_auth
+        old = os.environ.get(service_auth.BYPASS_ENV)
+        os.environ[service_auth.BYPASS_ENV] = "1"
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                cfg = _make_cfg(Path(td), auth_token=None)
+                # No token_holder passed; lifespan would normally
+                # unlock via Keychain but bypass should short-circuit.
+                client = TestClient(inspector_server.create_app(cfg))
+                self.assertEqual(client.get("/api/sessions").status_code, 200)
+        finally:
+            if old is None:
+                os.environ.pop(service_auth.BYPASS_ENV, None)
+            else:
+                os.environ[service_auth.BYPASS_ENV] = old
 
     def test_index_unauthenticated_even_with_token(self):
         # The HTML page itself loads without auth so the browser can
         # render the bearer-token entry UI before the user's pasted it.
+        holder = self._holder()
         with tempfile.TemporaryDirectory() as td:
-            cfg = _make_cfg(Path(td), auth_token="abc")
-            client = TestClient(inspector_server.create_app(cfg))
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
             self.assertEqual(client.get("/").status_code, 200)
 
 

@@ -11,11 +11,20 @@ Tabs (single page, vanilla JS):
 * Char      — runs ``char_audit.audit()`` and surfaces the OK/WARN/INFO
   list with a one-click ``configure-char`` button.
 
-By default binds to ``127.0.0.1:8001`` and skips auth — same loopback
-trust model as the rest of the stack. Set ``inspector.auth_token`` in
-config.json to enable bearer-token auth (only required if you ever
-rebind to a non-loopback address; the validator refuses that
-combination otherwise).
+Authentication
+--------------
+
+All ``/api/*`` endpoints require a per-service bearer token derived
+from the Keychain master key via HKDF (see ``service_auth.py``). The
+browser first visits ``/auth?token=<token>`` once -- the inspector
+sets an HttpOnly cookie and redirects to ``/``, after which the SPA's
+fetch() calls carry the cookie automatically. ``./run.sh start`` /
+``./run.sh status`` print the full authentication URL.
+
+The root ``/`` HTML page itself stays *un*authenticated so the browser
+can load the SPA before the cookie has been set; the SPA detects 401s
+from /api/* and renders a "click here to authenticate" prompt. The
+empty HTML doesn't reveal any session data.
 
 Sized to avoid build steps: no React, no bundler. The HTML / CSS / JS
 are inlined below as constants and served as a single page. That keeps
@@ -33,11 +42,21 @@ import secrets
 from pathlib import Path
 from typing import Any
 
+from contextlib import asynccontextmanager
+from typing import Optional
+
 import requests
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 
 import char_audit
+import service_auth
 import transcript_history
 from config import (
     DEFAULT_CONFIG_PATH,
@@ -49,6 +68,11 @@ from config import (
 )
 
 
+# Cookie name used to remember a successful ``/auth`` handshake in the
+# browser. Scoped to the inspector port (HttpOnly + SameSite=Strict).
+INSPECTOR_COOKIE_NAME = "ls_inspector"
+
+
 logger = logging.getLogger("local_scribe.inspector")
 if not logger.handlers:
     logging.basicConfig(
@@ -57,20 +81,67 @@ if not logger.handlers:
     )
 
 
-def _require_auth(request: Request, cfg: Config) -> None:
-    """Loopback + optional bearer-token auth.
+def _resolve_token_holder_at_startup() -> Optional[service_auth.ServiceToken]:
+    """Build the inspector's bearer-token holder.
 
-    By default ``inspector.auth_token`` is null and we don't enforce
-    auth -- inspector.bind=127.0.0.1 already keeps non-local clients
-    out. If a token is set, every /api/* request must carry it.
+    Production: prompt Touch ID, fetch master key from Keychain, derive
+    the inspector token via HKDF.
+
+    Test hook: ``LOCAL_SCRIBE_TEST_MASTER_KEY_HEX=<64 hex>`` skips
+    Touch ID and derives directly. Used by the FastAPI TestClient
+    integration tests.
+
+    If ``LOCAL_SCRIBE_DISABLE_AUTH=1`` is set, returns ``None``; the
+    middleware below treats ``None`` as bypass.
     """
-    if not cfg.inspector_auth_token:
+    if service_auth.is_bypass_enabled():
+        return None
+    test_mk = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
+    if test_mk:
+        return service_auth.ServiceToken.from_master_key(
+            bytes.fromhex(test_mk.strip()), "inspector",
+        )
+    return service_auth.ServiceToken.unlock(
+        "inspector",
+        prompt="Unlock local_scribe to start the inspector",
+    )
+
+
+def _require_auth(request: Request,
+                  holder: Optional[service_auth.ServiceToken]) -> None:
+    """Validate the bearer token. Raises HTTPException(401) on failure.
+
+    Accepts the token via any of:
+
+      * ``Authorization: Bearer <token>``    (curl, programmatic)
+      * ``Authorization: Token <token>``     (Deepgram-style; compatibility)
+      * ``X-API-Key: <token>``               (curl-friendly)
+      * ``?api_key=<token>``                 (one-shot URL)
+      * Cookie ``ls_inspector=<token>``      (browser, set by /auth)
+
+    Bypassed entirely when ``LOCAL_SCRIBE_DISABLE_AUTH=1`` is set OR
+    ``holder`` is ``None`` (lifespan didn't initialise — also bypass,
+    so test clients without lifespan still work).
+    """
+    if service_auth.is_bypass_enabled() or holder is None:
         return
-    header = request.headers.get("authorization", "")
-    expected = f"Bearer {cfg.inspector_auth_token}"
-    # secrets.compare_digest avoids leaking the token length via timing
-    if not (header and secrets.compare_digest(header, expected)):
-        raise HTTPException(status_code=401, detail="invalid bearer token")
+    candidate = service_auth.extract_candidate_token(
+        request, cookie_name=INSPECTOR_COOKIE_NAME,
+    )
+    if not candidate or not holder.matches(candidate):
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {
+                "type": "auth",
+                "service": "inspector",
+                "message": "missing or invalid bearer token",
+                "hint": (
+                    "Open the URL printed by `./run.sh status` "
+                    "(/auth?token=...) to set the inspector cookie."
+                ),
+            }},
+            headers={"WWW-Authenticate": "Bearer realm='inspector'"},
+        )
 
 
 def _list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
@@ -280,30 +351,124 @@ def _flatten_transcript(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_app(cfg: Config | None = None) -> FastAPI:
+def create_app(cfg: Config | None = None, *,
+               token_holder: Optional[service_auth.ServiceToken] = None) -> FastAPI:
     """Factory used by uvicorn entry-point + tests. Re-loading is the
     caller's job (each request reads the cached ``cfg`` for fast paths,
     plus a fresh ``load_config()`` for /api/config GET so an out-of-band
-    edit shows up immediately)."""
+    edit shows up immediately).
+
+    ``token_holder`` is the per-service bearer-token holder used for
+    /api/* gating. When ``None`` (default for prod), the FastAPI
+    lifespan derives it from the Keychain master key on startup
+    (Touch ID prompt). Tests can inject a ``ServiceToken.from_master_key``
+    instance to skip Touch ID entirely.
+    """
     cfg = cfg or load_config()
-    app = FastAPI(title="local_scribe inspector", docs_url=None, redoc_url=None)
+
+    # Mutable cell so the middleware sees the holder once the lifespan
+    # has populated it (similar pattern to asr_server._asr_token).
+    _holder_cell = {"v": token_holder}
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        if _holder_cell["v"] is None:
+            try:
+                _holder_cell["v"] = _resolve_token_holder_at_startup()
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "inspector auth: failed to unlock master key: %s — "
+                    "set LOCAL_SCRIBE_DISABLE_AUTH=1 to start without auth "
+                    "(NOT recommended), or run `./run.sh vault init`.", exc,
+                )
+                raise
+            holder = _holder_cell["v"]
+            if holder is None:
+                logger.warning(
+                    "inspector auth: BYPASS ENABLED — /api/* is OPEN. "
+                    "Unset LOCAL_SCRIBE_DISABLE_AUTH for production.",
+                )
+            else:
+                logger.info(
+                    "inspector auth: token derived (fingerprint=%s); "
+                    "browser auth URL: /auth?token=<token>",
+                    service_auth.token_fingerprint(holder.token),
+                )
+        yield
+        _holder_cell["v"] = None
+
+    app = FastAPI(
+        title="local_scribe inspector",
+        docs_url=None, redoc_url=None,
+        lifespan=_lifespan,
+    )
 
     @app.middleware("http")
     async def auth_mw(request: Request, call_next):
-        # The HTML page itself is unauthenticated (so the browser can
-        # load it before sending the token in headers); /api/* is gated.
-        if request.url.path.startswith("/api/"):
+        # /api/health is the liveness probe and stays open. /auth handles
+        # its own validation (it IS the way to get the cookie set).
+        # /api/* is gated. Everything else (the HTML page + static
+        # assets) is unauthenticated so the browser can load the SPA
+        # before the cookie has been set.
+        path = request.url.path
+        if path.startswith("/api/") and path != "/api/health":
             try:
-                _require_auth(request, cfg)
+                _require_auth(request, _holder_cell["v"])
             except HTTPException as exc:
                 return JSONResponse(
                     {"detail": exc.detail}, status_code=exc.status_code,
+                    headers=dict(exc.headers or {}),
                 )
         return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         return HTMLResponse(_INDEX_HTML)
+
+    @app.get("/auth")
+    async def auth(request: Request, token: str | None = None):
+        """Set the inspector cookie from a query-string token and
+        redirect to /. The link is generated + printed by
+        ``./run.sh start`` / ``./run.sh status``.
+
+        We keep this endpoint *itself* un-middlewared (it's not under
+        /api/) so the user can land here cold and authenticate. The
+        token is validated against the in-memory holder; on success we
+        write the cookie HttpOnly + SameSite=Strict so it can't be
+        read by JS in any embedded iframe or sniffed cross-origin."""
+        holder = _holder_cell["v"]
+        # Bypass on: any visit to /auth just redirects.
+        if service_auth.is_bypass_enabled() or holder is None:
+            return RedirectResponse(url="/", status_code=302)
+        if not token or not holder.matches(token):
+            # Don't leak whether the token was wrong vs absent.
+            return JSONResponse(
+                {"detail": {"error": {
+                    "type": "auth",
+                    "message": "invalid or missing token in /auth?token=...",
+                    "hint": (
+                        "Use the URL printed by `./run.sh status` — "
+                        "it contains the current token. If you rotated "
+                        "the master key, run `./run.sh status` to get "
+                        "a fresh URL."
+                    ),
+                }}},
+                status_code=401,
+            )
+        resp = RedirectResponse(url="/", status_code=302)
+        # max_age=30 days; secure=False because we're on plain-HTTP
+        # loopback (no TLS cert). HttpOnly + SameSite=Strict are what
+        # actually defend the cookie against JS exfiltration + CSRF.
+        resp.set_cookie(
+            key=INSPECTOR_COOKIE_NAME,
+            value=token,
+            max_age=30 * 24 * 3600,
+            httponly=True,
+            samesite="strict",
+            secure=False,
+            path="/",
+        )
+        return resp
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
@@ -1074,7 +1239,9 @@ const CONFIG_FIELDS = [
   ['llm',       'temperature',                'llm.temperature', 'number'],
   ['inspector', 'bind',                       'inspector.bind',  'text'],
   ['inspector', 'port',                       'inspector.port',  'number'],
-  ['inspector', 'auth_token',                 'inspector.auth_token','password_or_null'],
+  // inspector.auth_token is legacy (replaced by Keychain-derived tokens
+  // — see service_auth.py + run.sh status for the current auth URL).
+  // Kept in config.json schema for back-compat but no longer surfaced.
   ['char',      'data_dir',                   'char.data_dir',   'text_or_null'],
   ['char',      'expected_stt_provider',      'char.expected_stt_provider','text'],
   ['char',      'expected_stt_model',         'char.expected_stt_model','text'],

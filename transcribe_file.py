@@ -346,15 +346,21 @@ def transcribe(file_path: Path, whisper_url: str) -> dict:
     print(f"⏳ Transcribing {file_path.name} via {whisper_url} ...", flush=True)
     with file_path.open("rb") as f:
         audio = f.read()
-    resp = requests.post(
-        whisper_url,
-        data=audio,
-        headers={
-            "Content-Type": "application/octet-stream",
-            "Authorization": "Token local",
-        },
-        timeout=600,
+    # Auth: prompts Touch ID on first call of this process (unless
+    # LOCAL_SCRIBE_DISABLE_AUTH=1 or LOCAL_SCRIBE_ASR_TOKEN env var
+    # is set). We use the Deepgram-style ``Token <key>`` scheme on
+    # /v1/listen for symmetry with how Char's Custom provider sends it.
+    import service_auth
+    auth_h = service_auth.client_auth_header_for(
+        "asr",
+        prompt=f"Authenticate local_scribe to transcribe {file_path.name}",
+        style="token",
     )
+    headers = {
+        "Content-Type": "application/octet-stream",
+        **auth_h,
+    }
+    resp = requests.post(whisper_url, data=audio, headers=headers, timeout=600)
     resp.raise_for_status()
     return resp.json()
 
@@ -438,12 +444,18 @@ def transcribe_streaming(file_path: Path, whisper_url: str) -> dict | None:
         audio = f.read()
     final: dict | None = None
     last_render_len = 0
+    import service_auth
+    auth_h = service_auth.client_auth_header_for(
+        "asr",
+        prompt=f"Authenticate local_scribe to transcribe {file_path.name}",
+        style="token",
+    )
     with requests.post(
         stream_url,
         data=audio,
         headers={
             "Content-Type": "application/octet-stream",
-            "Authorization": "Token local",
+            **auth_h,
         },
         stream=True,
         timeout=600,

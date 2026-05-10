@@ -123,6 +123,17 @@ def _post_audio(
     if cluster_threshold is not None:
         params["cluster_threshold"] = f"{cluster_threshold:.4f}"
 
+    # Bearer token for the gated ASR endpoint. Prompts Touch ID on the
+    # first call unless LOCAL_SCRIBE_ASR_TOKEN / LOCAL_SCRIBE_DISABLE_AUTH
+    # is set in the env. The OpenAI-batch endpoint expects the
+    # ``Bearer`` scheme.
+    import service_auth
+    auth_h = service_auth.client_auth_header_for(
+        "asr",
+        prompt=f"Authenticate local_scribe to re-transcribe session "
+               f"{audio_path.parent.name}",
+        style="bearer",
+    )
     with audio_path.open("rb") as f:
         files = {"file": (audio_path.name, f, "audio/mpeg")}
         data = {
@@ -139,7 +150,7 @@ def _post_audio(
             params=params,
             files=files,
             data=data,
-            headers={"Authorization": "Bearer local"},
+            headers={**auth_h},
             stream=True,
             timeout=timeout,
         )
