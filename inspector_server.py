@@ -223,6 +223,60 @@ def _pretty_speaker(label: Any) -> str:
     return f"Speaker {int(m.group(1)) + 1}"
 
 
+_FILENAME_TOKEN_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename_token(s: str, *, max_len: int = 80) -> str:
+    """Sanitize a string so it's safe to embed in a Content-Disposition
+    filename. Replaces any run of non-portable chars with a single
+    ``_`` and bounds the length so headers stay small. We don't try to
+    be clever about Unicode — RFC 6266's filename* extension exists for
+    that, but every modern browser also honors a plain ASCII fallback,
+    and the inspector only handles UUIDs / archive timestamps here."""
+    if not s:
+        return "session"
+    token = _FILENAME_TOKEN_RE.sub("_", s).strip("._-")
+    return (token or "session")[:max_len]
+
+
+def _render_transcript_text(payload: dict[str, Any]) -> str:
+    """Flat-paragraph rendering of a transcript payload (output of
+    ``_flatten_transcript``) into the body of a downloadable ``.txt``
+    file. One line per paragraph, prefixed with the pretty speaker
+    label; an airtime summary block at the tail iff diarization
+    populated one. Shared by both the live transcript endpoint and
+    the per-archive history endpoint so downloads read identically."""
+    lines: list[str] = []
+    for p in payload.get("paragraphs", []):
+        # Pretty-print "speaker_0" -> "Speaker 1". No inline
+        # confidence here — the user explicitly wanted the
+        # transcript body to read cleanly; confidence shows up
+        # in the airtime footer below instead.
+        lines.append(
+            f"{_pretty_speaker(p.get('speaker'))}: {p.get('text', '')}"
+        )
+    body = "\n\n".join(lines)
+    # Trailing airtime summary so a downloaded ``.txt`` is
+    # standalone — no need to open the inspector to interpret it.
+    speakers = payload.get("speakers") or []
+    if speakers:
+        body += "\n\n--- Speaker airtime ---\n"
+        for s in speakers:
+            secs = float(s.get("seconds") or 0.0)
+            pct = round(float(s.get("percent") or 0.0) * 100)
+            mc = s.get("mean_confidence")
+            mc_str = (
+                f"  · {round(float(mc) * 100)}% mean confidence"
+                if mc is not None else ""
+            )
+            mins, rem = divmod(int(round(secs)), 60)
+            body += (
+                f"{_pretty_speaker(s.get('label'))}: "
+                f"{mins}m {rem:02d}s ({pct}%){mc_str}\n"
+            )
+    return body
+
+
 def _flatten_transcript(raw: dict[str, Any]) -> dict[str, Any]:
     """Parse Char's ``transcript.json`` into a UI-friendly shape:
     every word with its speaker + per-cluster-confidence, plus a
@@ -586,35 +640,49 @@ def create_app(cfg: Config | None = None, *,
             payload = _flatten_transcript(json.loads(path.read_text() or "{}"))
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail="transcript JSON malformed")
-        lines = []
-        for p in payload.get("paragraphs", []):
-            # Pretty-print "speaker_0" -> "Speaker 1". No inline
-            # confidence here — the user explicitly wanted the
-            # transcript body to read cleanly; confidence shows up
-            # in the airtime footer below instead.
-            lines.append(
-                f"{_pretty_speaker(p.get('speaker'))}: {p.get('text', '')}"
-            )
-        body = "\n\n".join(lines)
-        # Trailing airtime summary so a downloaded ``.txt`` is
-        # standalone — no need to open the inspector to interpret it.
-        speakers = payload.get("speakers") or []
-        if speakers:
-            body += "\n\n--- Speaker airtime ---\n"
-            for s in speakers:
-                secs = float(s.get("seconds") or 0.0)
-                pct = round(float(s.get("percent") or 0.0) * 100)
-                mc = s.get("mean_confidence")
-                mc_str = (
-                    f"  · {round(float(mc) * 100)}% mean confidence"
-                    if mc is not None else ""
-                )
-                mins, rem = divmod(int(round(secs)), 60)
-                body += (
-                    f"{_pretty_speaker(s.get('label'))}: "
-                    f"{mins}m {rem:02d}s ({pct}%){mc_str}\n"
-                )
-        return PlainTextResponse(body)
+        body = _render_transcript_text(payload)
+        # ``Content-Disposition: attachment`` makes the browser save
+        # the file instead of rendering it inline, regardless of
+        # whether the link had the HTML ``download`` attribute.
+        # Filename uses the session id (already filename-safe — UUID
+        # or similar) rather than the title because titles can carry
+        # punctuation that's awkward across filesystems / RFC 6266
+        # encoders; the user can rename after downloading.
+        fname = f"transcript-{_safe_filename_token(session_id)}.txt"
+        return PlainTextResponse(
+            body,
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
+    @app.get(
+        "/api/sessions/{session_id}/history/{filename}/transcript.txt",
+        response_class=PlainTextResponse,
+    )
+    async def session_history_transcript_txt(session_id: str, filename: str):
+        """Same flatten+render pipeline as the live transcript, but for
+        one archived ``.json`` from ``.local_scribe_history/``. The
+        per-paragraph layout + the trailing airtime block come straight
+        out of ``_render_transcript_text`` so downloads from the
+        history list read identically to the live transcript file."""
+        path = _session_dir(cfg, session_id)
+        if not transcript_history.is_safe_filename(filename):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        data = transcript_history.read_archive(path, filename)
+        if data is None:
+            raise HTTPException(status_code=404, detail="archive not found")
+        try:
+            payload = _flatten_transcript(json.loads(data.decode("utf-8")))
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="archive JSON malformed")
+        body = _render_transcript_text(payload)
+        # Derive the .txt name from the archive's .json name so a
+        # user with multiple archives can tell them apart at a glance.
+        base = filename[:-5] if filename.endswith(".json") else filename
+        fname = f"transcript-{_safe_filename_token(session_id)}-{_safe_filename_token(base)}.txt"
+        return PlainTextResponse(
+            body,
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
 
     # ---------- Config ------------------------------------------------
 
@@ -1020,7 +1088,7 @@ async function loadSessions() {
           <button class="btn" data-id="${s.id}">Open</button>
           <a class="btn ghost" href="/api/sessions/${s.id}/audio" download>Download audio</a>
           <a class="btn ghost" href="/api/sessions/${s.id}/transcript.txt"
-             target="_blank" rel="noopener">Transcript .txt</a>
+             download="transcript-${escapeHtml(s.id)}.txt">Download transcript</a>
           <span class="meta" style="margin-left:auto">${escapeHtml(s.id)}</span>
         </div>`;
       card.querySelector('button.btn').addEventListener('click',
@@ -1192,10 +1260,11 @@ function renderHistorySection(sessionId, hist) {
         <span class="meta">${fmtBytes(e.size_bytes)} · sha256=${escapeHtml((e.transcript_sha256 || '').slice(0, 12))}</span></div>
       <div class="meta">${escapeHtml(e.archived_at_iso)} · ${escapeHtml(sub)}</div>
       <div class="row" style="margin-top:0.4rem">
-        <a class="btn ghost" target="_blank" rel="noopener"
-           href="/api/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(e.filename)}">View JSON</a>
+        <a class="btn ghost"
+           download="transcript-${escapeHtml(sessionId)}-${escapeHtml(e.filename.replace(/\.json$/, ''))}.txt"
+           href="/api/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(e.filename)}/transcript.txt">Download historical transcript</a>
         <a class="btn ghost" download="${escapeHtml(e.filename)}"
-           href="/api/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(e.filename)}">Download</a>
+           href="/api/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(e.filename)}">Download raw .json</a>
         <button class="btn ghost" data-history-del="${escapeHtml(e.filename)}">Delete</button>
       </div>
     </div>`;

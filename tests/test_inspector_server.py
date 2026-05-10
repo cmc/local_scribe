@@ -322,6 +322,143 @@ class TranscriptConfidenceAndAirtimeTests(unittest.TestCase):
             self.assertNotIn("--- Speaker airtime ---", text)
 
 
+class TranscriptDownloadHeadersTests(unittest.TestCase):
+    """Both the live transcript.txt endpoint and the per-archive
+    history transcript.txt endpoint must send a
+    ``Content-Disposition: attachment`` header so the browser saves
+    instead of rendering inline. Verifies the UI's ``Download
+    transcript`` / ``Download historical transcript`` buttons work
+    regardless of the HTML ``download`` attribute."""
+
+    def test_live_endpoint_sets_attachment_header_with_session_id_filename(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.get("/api/sessions/abc-123/transcript.txt")
+            self.assertEqual(r.status_code, 200)
+            cd = r.headers.get("content-disposition", "")
+            self.assertIn("attachment", cd.lower())
+            self.assertIn("transcript-abc-123.txt", cd)
+
+    def test_filename_sanitization_strips_path_chars(self):
+        """Just in case a future session_id route ever lets slashes
+        through (it shouldn't), the helper must collapse them so the
+        Content-Disposition value can't smuggle directory components."""
+        from inspector_server import _safe_filename_token
+        self.assertEqual(_safe_filename_token("../etc/passwd"), "etc_passwd")
+        self.assertEqual(_safe_filename_token(""), "session")
+        self.assertEqual(_safe_filename_token("abc"), "abc")
+        # The token is the *whole* file name, but the regex collapses
+        # any non-portable run to a single underscore.
+        self.assertEqual(_safe_filename_token("a b/c"), "a_b_c")
+
+
+class HistoryTranscriptTxtEndpointTests(unittest.TestCase):
+    """``GET /api/sessions/{id}/history/{filename}/transcript.txt``
+    renders an archived transcript through the same flatten + airtime
+    pipeline as the live endpoint, so the historical download reads
+    identically to the live one."""
+
+    def _seed_archive(self, data_dir: Path, session_id: str,
+                      *, payload: dict, fname: str = "20260510T120000Z_abc1234.json") -> Path:
+        import transcript_history
+        sd = _seed_session(data_dir / "sessions", session_id)
+        h = transcript_history.ensure_history_dir(sd)
+        (h / fname).write_text(json.dumps(payload))
+        return sd
+
+    def test_archive_renders_same_shape_as_live_endpoint(self):
+        archive = {
+            "transcripts": [{
+                "id": "t1", "session_id": "abc-123",
+                "words": [
+                    {"id": "w1", "text": "hello", "start": 0.0, "end": 0.5},
+                    {"id": "w2", "text": "world", "start": 0.5, "end": 1.0},
+                ],
+                "speaker_hints": [
+                    {"id": "h1", "type": "name", "value": "Alice", "word_id": ["w1"]},
+                    {"id": "h2", "type": "name", "value": "Bob",   "word_id": ["w2"]},
+                ],
+            }],
+            "local_scribe": {"diarization": {
+                "speakers": [
+                    {"label": "Alice", "seconds": 0.5, "percent": 0.5,
+                     "mean_confidence": 0.9},
+                    {"label": "Bob",   "seconds": 0.5, "percent": 0.5,
+                     "mean_confidence": 0.8},
+                ],
+            }},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed_archive(data_dir, "abc-123", payload=archive)
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            # Discover the archive filename via the list endpoint
+            # rather than hard-coding it, mirroring how the UI does it.
+            listed = client.get("/api/sessions/abc-123/history").json()
+            fname = listed["entries"][0]["filename"]
+            r = client.get(
+                f"/api/sessions/abc-123/history/{fname}/transcript.txt",
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("Alice: hello", r.text)
+            self.assertIn("Bob: world", r.text)
+            self.assertIn("--- Speaker airtime ---", r.text)
+            # Filename has both the session id and the archive stem so
+            # multiple archives from the same session don't collide on
+            # disk for the user.
+            cd = r.headers.get("content-disposition", "")
+            self.assertIn("attachment", cd.lower())
+            self.assertIn("abc-123", cd)
+            self.assertIn("20260510T120000Z_abc1234", cd)
+            self.assertTrue(cd.endswith('.txt"'), f"bad CD: {cd!r}")
+
+    def test_history_txt_404_when_archive_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.get(
+                "/api/sessions/abc-123/history/no-such-archive.json/transcript.txt",
+            )
+            self.assertEqual(r.status_code, 404)
+
+    def test_history_txt_rejects_traversal_filenames(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            for bad in ["..foo.json", "....json", "foo..json"]:
+                r = client.get(
+                    f"/api/sessions/abc-123/history/{bad}/transcript.txt",
+                )
+                self.assertEqual(
+                    r.status_code, 400, f"{bad} -> {r.status_code}",
+                )
+
+    def test_history_txt_500_when_archive_json_malformed(self):
+        # transcript_history.read_archive returns whatever bytes are in
+        # the file; the endpoint surfaces a 500 when the JSON is bad
+        # rather than crashing or returning misleading content.
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = _seed_session(data_dir / "sessions", "abc-123")
+            import transcript_history
+            h = transcript_history.ensure_history_dir(sd)
+            (h / "broken.json").write_text("{not valid json")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.get(
+                "/api/sessions/abc-123/history/broken.json/transcript.txt",
+            )
+            self.assertEqual(r.status_code, 500)
+
+
 class TranscriptHistoryEndpointTests(unittest.TestCase):
     """Endpoint tests for the new /api/sessions/{id}/history surface."""
 
