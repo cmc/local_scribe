@@ -173,7 +173,7 @@ a `./run.sh wipe` command, and tightening loopback-only binding.
 |---|---|---|
 | `asr_server.py` | FastAPI service on `:8000`. Speaks **two** transcription contracts so both of Char's flows work: Deepgram (`/v1/listen` POST + WebSocket) for live recording, and OpenAI Whisper (`/v1/audio/transcriptions`) for "Generate" on existing audio. Routes both through Parakeet (default) or faster-whisper. | Char's transcription endpoint |
 | `parakeet_backend.py` | parakeet-mlx wrapper. Merges sub-word BPE tokens into clean words, shapes output to Deepgram's word/timing schema. | Default ASR engine |
-| `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) + an LLM pass to map `SPEAKER_00/01/...` to real names. | Speaker labeling |
+| `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) with **eigengap auto-K** clustering on top (the same approach pyannote.audio v3.1+ uses) — picks the speaker count from the data itself, plus an LLM pass that maps `SPEAKER_00/01/...` to real names. | Speaker labeling |
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
 | `redo_session.py` | Re-runs ASR + diarization on an existing Char session and overwrites its `transcript.json` via `char_persist.py`. Used when the original Generate produced the wrong number of speakers (1:1 came back as one blob, or a long meeting over-clustered). Match by full UUID, UUID prefix, or session-title substring. Invoked via `./run.sh redo-session …`. | Per-session re-do |
 | `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, and produce health reports. | Operator tool |
@@ -711,11 +711,34 @@ diarization and inlines `Speaker N: …` prefixes into the streamed text
 `json`, `text`, `srt`, and `vtt` are all supported too on the
 non-streaming path.
 
-**Diarization tuning** — sherpa-onnx with the default `CLUSTER_THRESHOLD=0.5`
-tends to over-shard on short conversational audio (you may see 6-10 speakers
-where there were really 2-3) and under-cluster on long recordings (a 2-hour
-1:1 may collapse to a single blob). The streaming flow Char uses defaults
-to `CLUSTER_THRESHOLD=0.7` for audio ≥ 10 minutes, but you can override:
+**Diarization auto-K (default)** — by default the server runs an
+**eigengap-based auto-K pipeline** that picks the speaker count from
+the data itself (no per-call tuning required). This is the same
+approach pyannote.audio v3.1+ and AWS Transcribe use:
+
+  1. Run sherpa-onnx pyannote 3.0 segmentation with a tight threshold
+     to get rich micro-clusters (often hundreds on long audio).
+  2. **Drop micro-clusters with < 3 s of total speech** — these are
+     virtually always artefacts (a cough, a music sting, brief
+     crosstalk) and their embeddings are noisy enough to swamp
+     clustering. This is the single biggest quality win for long
+     recordings: a 114-min meeting goes from 615 → ~300 reliable
+     centroids.
+  3. Extract one TitaNet embedding per surviving cluster.
+  4. Compute the affinity matrix's normalized graph Laplacian, find
+     the largest gap in the eigenvalues (eigengap heuristic) — that's
+     K_final. Default minimum K is 2; the **monologue gate** (mean
+     centroid affinity ≥ 0.80) overrides to K=1 when there really is
+     just one speaker.
+  5. Spectral cluster the centroids → final mapping → remap segments.
+
+This added ~10 s to the diarization wall time on a 114-min recording
+(~360 s → ~370 s) but eliminated the 451-phantom-speaker class of bug
+without any user input. K is now bounded by `auto_k_max` (default 10).
+
+**Manual overrides** — you can still force a specific configuration
+when auto-K gets it wrong (very noisy 1:1s where two voices sound
+similar enough that any algorithm collapses them, etc.):
 
   * **One-off, no restart:** redo the session with the speaker count you
     know to be true:
@@ -1107,7 +1130,7 @@ local_scribe/
 ├── config.py                # config loader (defaults <- file <- env)
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 215 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 234 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 
@@ -1204,7 +1227,7 @@ count with `NUM_SPEAKERS` / `CLUSTER_THRESHOLD`.
 
 ```bash
 ./run.sh setup                                  # one-shot reinstall + redownload
-venv/bin/python -m unittest discover -s tests   # 215 tests, ~0.5s, no model loads
+venv/bin/python -m unittest discover -s tests   # 234 tests, ~0.5s, no model loads
 ```
 
 The tests are fully hermetic — they mock all HTTP/MLX/sherpa-onnx so they run

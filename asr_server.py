@@ -603,11 +603,28 @@ def _attach_speakers_to_words(
                 log_id, num_speakers_override,
             )
 
-        turns = dz.diarize(
-            Path(audio_path),
-            num_clusters=num_clusters,
-            cluster_threshold=threshold,
-        )
+        # Path selection:
+        #   * Explicit num_clusters    → sherpa AHC, K forced.
+        #   * Explicit threshold ovr   → sherpa AHC, threshold honoured.
+        #   * Neither → eigengap auto-K via diarize_auto. This is the
+        #     default for Char's Generate flow and prevents the 451-
+        #     phantom-speaker blow-up that bit us on the Maus meeting.
+        if num_clusters is None and cluster_threshold_override is None:
+            logger.info(
+                "%seigengap auto-K (no num_speakers / cluster_threshold override)",
+                log_id,
+            )
+            turns = dz.diarize_auto(
+                Path(audio_path),
+                num_threads=4,
+                request_id=request_id,
+            )
+        else:
+            turns = dz.diarize(
+                Path(audio_path),
+                num_clusters=num_clusters,
+                cluster_threshold=threshold,
+            )
         if not turns:
             return [dict(w, speaker="speaker_0") for w in words], 1
         diarized = dz.attach_speaker_to_words(words, turns)

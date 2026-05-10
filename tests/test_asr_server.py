@@ -296,7 +296,16 @@ class AttachSpeakersTests(unittest.TestCase):
                           "speaker_1", "speaker_1", "speaker_1", "speaker_1"])
 
     def test_no_turns_falls_back_to_single_speaker(self):
+        # The default path (no overrides) is now eigengap auto-K
+        # (`diarize_auto`), which returns whatever segments sherpa
+        # produced after the centroid-remap. An empty return there
+        # means no speech was detected — must collapse to single
+        # speaker rather than emit a wordless transcript.
         fake_dz = mock.MagicMock()
+        fake_dz.diarize_auto.return_value = []
+        # diarize() is also exposed in case the auto-K path falls back
+        # to it; keep the mock empty so a regression that calls it
+        # surfaces a clear assertion later.
         fake_dz.diarize.return_value = []
         with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
             out, n = asr_server._attach_speakers_to_words(
@@ -307,6 +316,10 @@ class AttachSpeakersTests(unittest.TestCase):
 
     def test_diarization_exception_falls_back_to_single_speaker(self):
         fake_dz = mock.MagicMock()
+        # Both paths must be guarded; the default path now goes through
+        # diarize_auto. We explode it to confirm the catch-all in
+        # _attach_speakers_to_words still emits a valid response.
+        fake_dz.diarize_auto.side_effect = RuntimeError("sherpa exploded")
         fake_dz.diarize.side_effect = RuntimeError("sherpa exploded")
         with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
             out, n = asr_server._attach_speakers_to_words(
@@ -317,20 +330,25 @@ class AttachSpeakersTests(unittest.TestCase):
 
     def test_long_audio_auto_skips_diarization(self):
         """Audio over MAX_DIARIZE_SECONDS should bail to single-speaker
-        rather than chew through 5+ minutes of clustering."""
+        rather than chew through 5+ minutes of clustering — for both
+        the legacy AHC path AND the new auto-K path."""
         fake_dz = mock.MagicMock()
         fake_dz.diarize.return_value = [
             {"speaker": "SPEAKER_00", "start": 0.0, "end": 100.0},
         ]
+        fake_dz.diarize_auto.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 100.0},
+        ]
         with mock.patch.object(asr_server, "_MAX_DIARIZE_SECONDS", 1800), \
              mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
-            # 31 minutes -> over the cap -> diarize() must NOT be called
             out, n = asr_server._attach_speakers_to_words(
                 "/tmp/audio.wav", CANNED_WORDS, duration=1860.0,
             )
         self.assertEqual(n, 1)
         self.assertTrue(all(w["speaker"] == "speaker_0" for w in out))
+        # Neither path should fire when we're past the duration cap.
         fake_dz.diarize.assert_not_called()
+        fake_dz.diarize_auto.assert_not_called()
 
     def test_blowup_more_than_max_speakers_collapses_to_single(self):
         """If sherpa-onnx returns more than MAX_SPEAKERS distinct labels we
@@ -381,9 +399,12 @@ class AttachSpeakersTests(unittest.TestCase):
             )
         self.assertEqual(n, 15)
 
-    def test_long_audio_bumps_cluster_threshold(self):
-        """Without an explicit env override, long audio should bump the
-        threshold to 0.7 so sherpa-onnx doesn't over-shard."""
+    def test_long_audio_bumps_cluster_threshold_when_num_speakers_forced(self):
+        """The threshold-bump heuristic only runs on the legacy AHC
+        path, which is now reached only when an override is set
+        (`?num_speakers=N` or `?cluster_threshold=F`). With
+        ``num_speakers_override=2`` we go down AHC and the long-audio
+        bump should still kick in."""
         fake_dz = mock.MagicMock()
         fake_dz.diarize.return_value = [
             {"speaker": "SPEAKER_00", "start": 0.0, "end": 100.0},
@@ -391,15 +412,18 @@ class AttachSpeakersTests(unittest.TestCase):
         fake_dz.attach_speaker_to_words.return_value = [
             dict(w, speaker="SPEAKER_00") for w in CANNED_WORDS
         ]
-        # No explicit override (None), and short-audio default is 0.5.
         with mock.patch.object(asr_server, "_CLUSTER_THRESHOLD_OVERRIDE", None), \
              mock.patch.object(asr_server, "_MAX_DIARIZE_SECONDS", 0), \
              mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
             asr_server._attach_speakers_to_words(
                 "/tmp/audio.wav", CANNED_WORDS, duration=900.0,
+                num_speakers_override=2,
             )
         kwargs = fake_dz.diarize.call_args.kwargs
         self.assertAlmostEqual(kwargs["cluster_threshold"], 0.7)
+        self.assertEqual(kwargs["num_clusters"], 2)
+        # Auto path must NOT have run when an override is set.
+        fake_dz.diarize_auto.assert_not_called()
 
     def test_explicit_threshold_override_wins_over_long_audio_bump(self):
         fake_dz = mock.MagicMock()
@@ -414,9 +438,48 @@ class AttachSpeakersTests(unittest.TestCase):
              mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
             asr_server._attach_speakers_to_words(
                 "/tmp/audio.wav", CANNED_WORDS, duration=900.0,
+                # An override (any of num_speakers / cluster_threshold)
+                # forces the AHC path; we use num_speakers here so the
+                # override under test (CLUSTER_THRESHOLD_OVERRIDE=0.42)
+                # wins.
+                num_speakers_override=2,
             )
         kwargs = fake_dz.diarize.call_args.kwargs
         self.assertAlmostEqual(kwargs["cluster_threshold"], 0.42)
+
+    def test_default_path_uses_auto_eigengap(self):
+        """The new default path: no overrides → diarize_auto, NOT
+        diarize. This is the behavioral change that prevents the
+        451-phantom-speaker blow-up by replacing single-threshold AHC
+        with eigengap auto-K. Regression: before this fix, a default
+        ?Generate? hit `dz.diarize` directly with a single threshold."""
+        fake_dz = mock.MagicMock()
+        fake_dz.diarize_auto.return_value = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.5},
+            {"speaker": "SPEAKER_01", "start": 1.5, "end": 3.0},
+        ]
+        fake_dz.attach_speaker_to_words.return_value = [
+            dict(CANNED_WORDS[0], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[1], speaker="SPEAKER_00"),
+            dict(CANNED_WORDS[2], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[3], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[4], speaker="SPEAKER_01"),
+            dict(CANNED_WORDS[5], speaker="SPEAKER_01"),
+        ]
+        with mock.patch.object(asr_server, "_MAX_DIARIZE_SECONDS", 0), \
+             mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}):
+            out, n = asr_server._attach_speakers_to_words(
+                "/tmp/audio.wav", CANNED_WORDS, duration=600.0,
+            )
+        fake_dz.diarize_auto.assert_called_once()
+        # Legacy single-threshold path must NOT fire for the default flow.
+        fake_dz.diarize.assert_not_called()
+        self.assertEqual(n, 2)
+        self.assertEqual(
+            [w["speaker"] for w in out],
+            ["speaker_0", "speaker_0",
+             "speaker_1", "speaker_1", "speaker_1", "speaker_1"],
+        )
 
 
 class PickClusterThresholdTests(unittest.TestCase):
@@ -650,11 +713,13 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         self.assertTrue(first["id"].startswith("seg_"))
 
     def test_diarized_json_with_real_diarization_emits_multiple_speakers(self):
-        # End-to-end: fake sherpa-onnx returns two speaker turns, the endpoint
-        # must run diarization, attach labels, and the response segments must
-        # split at the speaker boundary.
+        # End-to-end: fake diarize_auto returns two speaker turns, the
+        # endpoint must run diarization, attach labels, and the response
+        # segments must split at the speaker boundary. Default path
+        # since v3 is auto-K eigengap (`diarize_auto`); the legacy
+        # single-threshold `diarize` only runs when overrides are set.
         fake_dz = mock.MagicMock()
-        fake_dz.diarize.return_value = [
+        fake_dz.diarize_auto.return_value = [
             {"speaker": "SPEAKER_00", "start": 0.0, "end": 1.10},
             {"speaker": "SPEAKER_01", "start": 1.20, "end": 2.30},
         ]
@@ -673,8 +738,9 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         body = resp.json()
         speakers = sorted({s["speaker"] for s in body["segments"]})
         self.assertEqual(speakers, ["speaker_0", "speaker_1"])
-        self.assertEqual(fake_dz.diarize.call_count, 1,
-                         "sherpa-onnx diarize() should run exactly once")
+        self.assertEqual(fake_dz.diarize_auto.call_count, 1,
+                         "diarize_auto() should run exactly once on the default path")
+        fake_dz.diarize.assert_not_called()
 
     def test_diarized_json_skips_diarization_when_env_disabled(self):
         # With OPENAI_BATCH_DIARIZE off, diarization_backend.diarize MUST NOT
@@ -689,10 +755,12 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         self.assertTrue(all(s["speaker"] == "speaker_0" for s in body["segments"]))
 
     def test_diarization_failure_does_not_break_endpoint(self):
-        # If sherpa-onnx blows up mid-Generate, the endpoint should still
-        # return a valid diarized_json response with placeholder labels —
-        # never a 500. This is the safety net Char relies on.
+        # If sherpa-onnx blows up mid-Generate (either path), the
+        # endpoint should still return a valid diarized_json response
+        # with placeholder labels — never a 500. This is the safety
+        # net Char relies on.
         fake_dz = mock.MagicMock()
+        fake_dz.diarize_auto.side_effect = RuntimeError("sherpa-onnx model missing")
         fake_dz.diarize.side_effect = RuntimeError("sherpa-onnx model missing")
         with mock.patch.dict(sys.modules, {"diarization_backend": fake_dz}), \
              mock.patch.object(asr_server, "_OPENAI_BATCH_DIARIZE", True):
