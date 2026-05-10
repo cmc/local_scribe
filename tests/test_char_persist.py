@@ -135,7 +135,13 @@ class WriteTranscriptTests(_Tmp):
         self.assertEqual(result.speaker_count, 2)
 
         data = json.loads((sd / "transcript.json").read_text())
-        self.assertEqual(list(data.keys()), ["transcripts"])
+        # New writes include a top-level "local_scribe" metadata block
+        # alongside Char's "transcripts" array. Char's parser ignores
+        # unknown keys (verified against tinybase's session loader) so
+        # this is invisible to Char's UI but powers the inspector's
+        # history view.
+        self.assertEqual(set(data.keys()), {"transcripts", "local_scribe"})
+        self.assertIn("written_at_iso", data["local_scribe"])
         t = data["transcripts"][0]
 
         # Exact field set Char's persister expects.

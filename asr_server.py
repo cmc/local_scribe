@@ -132,10 +132,17 @@ def _maybe_write_char_transcript(
     request_id: str,
     *,
     channel: int = 2,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Best-effort sidecar write so Char's UI can display the transcript
     despite its progressive-parser dropping our words. Failures are
-    logged but never raised: the SSE response must always succeed."""
+    logged but never raised: the SSE response must always succeed.
+
+    ``metadata`` is an optional dict describing the ASR/diarization run
+    (model name, num_speakers, override flags, etc.). It's embedded
+    in the new transcript.json so the next re-transcription can archive
+    a self-describing record of the previous run.
+    """
     if not _CHAR_PERSIST_ENABLED or not words:
         return
     try:
@@ -144,6 +151,7 @@ def _maybe_write_char_transcript(
             words=words, language=lang or "en",
             provider="openai", channel=channel,
             request_id=request_id,
+            metadata=metadata,
         )
         if result is None:
             logger.info(
@@ -154,6 +162,47 @@ def _maybe_write_char_transcript(
         logger.exception(
             "[openai %s] char_persist sidecar write failed", request_id,
         )
+
+
+def _diarization_metadata(
+    *,
+    diarize_enabled: bool,
+    duration: float | None,
+    num_speakers: int,
+    num_speakers_override: int | None,
+    cluster_threshold_override: float | None,
+    skipped_reason: str | None = None,
+) -> dict[str, Any]:
+    """Build the ``local_scribe`` metadata block embedded in each
+    transcript.json. Keeps a stable shape so the inspector UI can
+    render archives from any prior run without per-version branching.
+
+    ``algorithm`` summarises the decision tree in ``_attach_speakers_to_words``:
+      * ``manual_ahc``  -- explicit num_speakers or cluster_threshold
+      * ``auto_silhouette`` -- default ``diarize_auto`` path
+      * ``skipped``     -- diarization globally off, audio over cap, or empty words
+    """
+    if not diarize_enabled or skipped_reason:
+        algorithm = "skipped"
+    elif num_speakers_override is not None or cluster_threshold_override is not None:
+        algorithm = "manual_ahc"
+    else:
+        algorithm = "auto_silhouette"
+    return {
+        "asr_backend": ASR_BACKEND,
+        "asr_model": MODEL_NAME,
+        "audio_duration_seconds": (
+            round(float(duration), 3) if duration is not None else None
+        ),
+        "diarization": {
+            "algorithm": algorithm,
+            "enabled": bool(diarize_enabled),
+            "num_speakers": int(num_speakers),
+            "num_speakers_override": num_speakers_override,
+            "cluster_threshold_override": cluster_threshold_override,
+            "skipped_reason": skipped_reason,
+        },
+    }
 
 ASR_BACKEND = _CFG.asr_backend
 if ASR_BACKEND not in {"parakeet", "whisper"}:
@@ -1082,6 +1131,7 @@ async def _stream_openai_transcription(
 
         asr_done = time.time() - started
         num_speakers = 0
+        skipped_reason: str | None = None
         if do_diarize and words:
             logger.info(
                 "[openai %s] running diarization (sherpa-onnx) ...", request_id,
@@ -1093,6 +1143,19 @@ async def _stream_openai_transcription(
             )
             if num_speakers > 1:
                 transcript = _compose_speaker_prefixed_text(words, transcript)
+        elif not do_diarize:
+            skipped_reason = "diarize_disabled"
+        elif not words:
+            skipped_reason = "empty_words"
+
+        diar_meta = _diarization_metadata(
+            diarize_enabled=do_diarize,
+            duration=duration,
+            num_speakers=num_speakers or (1 if words else 0),
+            num_speakers_override=num_speakers_override,
+            cluster_threshold_override=cluster_threshold_override,
+            skipped_reason=skipped_reason,
+        )
 
         # Sidecar-write transcript.json into Char's session dir BEFORE
         # we send `done`. Char's progressive parser will drop our words
@@ -1102,6 +1165,7 @@ async def _stream_openai_transcription(
         await asyncio.to_thread(
             _maybe_write_char_transcript,
             audio_path, words, lang, request_id,
+            metadata=diar_meta,
         )
 
         elapsed = time.time() - started
@@ -1278,7 +1342,15 @@ async def openai_audio_transcriptions(request: Request):
 
         asr_done = time.time() - started
         num_speakers = 0
-        if response_format == "diarized_json" and _OPENAI_BATCH_DIARIZE and words:
+        diar_enabled = (
+            response_format == "diarized_json"
+            and _OPENAI_BATCH_DIARIZE
+            and bool(words)
+        )
+        num_speakers_override = None
+        cluster_threshold_override = None
+        skipped_reason: str | None = None
+        if diar_enabled:
             logger.info(
                 "[openai %s] running diarization (sherpa-onnx) ...", request_id,
             )
@@ -1290,6 +1362,22 @@ async def openai_audio_transcriptions(request: Request):
                 num_speakers_override=num_speakers_override,
                 cluster_threshold_override=cluster_threshold_override,
             )
+        else:
+            if response_format != "diarized_json":
+                skipped_reason = f"response_format={response_format}"
+            elif not _OPENAI_BATCH_DIARIZE:
+                skipped_reason = "diarize_disabled"
+            elif not words:
+                skipped_reason = "empty_words"
+
+        diar_meta = _diarization_metadata(
+            diarize_enabled=diar_enabled,
+            duration=duration,
+            num_speakers=num_speakers or (1 if words else 0),
+            num_speakers_override=num_speakers_override,
+            cluster_threshold_override=cluster_threshold_override,
+            skipped_reason=skipped_reason,
+        )
 
         # Mirror the streaming path's sidecar write: ensures the
         # non-streaming `gpt-4o-transcribe-diarize` path also lands a
@@ -1299,6 +1387,7 @@ async def openai_audio_transcriptions(request: Request):
         await asyncio.to_thread(
             _maybe_write_char_transcript,
             tmp.name, words, lang, request_id,
+            metadata=diar_meta,
         )
 
     elapsed = time.time() - started

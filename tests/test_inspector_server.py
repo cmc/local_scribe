@@ -159,6 +159,140 @@ class SessionsTests(unittest.TestCase):
             self.assertIn("Bob:", r.text)
 
 
+class TranscriptHistoryEndpointTests(unittest.TestCase):
+    """Endpoint tests for the new /api/sessions/{id}/history surface."""
+
+    def _seed_with_history(self, data_dir: Path, session_id: str,
+                            *, archives: list[dict]) -> Path:
+        import transcript_history
+        sd = _seed_session(data_dir / "sessions", session_id)
+        h = transcript_history.ensure_history_dir(sd)
+        for i, doc in enumerate(archives):
+            fname = f"2026051{i}T120000Z_{'a' * 7}.json"
+            (h / fname).write_text(json.dumps(doc))
+        return sd
+
+    def test_history_empty_when_no_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.get("/api/sessions/abc-123/history")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["count"], 0)
+            self.assertEqual(r.json()["entries"], [])
+
+    def test_history_lists_entries_with_embedded_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed_with_history(data_dir, "abc-123", archives=[
+                {
+                    "transcripts": [],
+                    "local_scribe": {
+                        "asr_model": "parakeet",
+                        "diarization": {"algorithm": "auto_silhouette",
+                                        "num_speakers": 3},
+                    },
+                },
+                {"transcripts": []},  # legacy archive, no metadata
+            ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            data = client.get("/api/sessions/abc-123/history").json()
+            self.assertEqual(data["count"], 2)
+            metadatas = [e["metadata"] for e in data["entries"]]
+            asr_models = {m.get("asr_model") for m in metadatas}
+            self.assertEqual(asr_models, {"parakeet", None})
+
+    def test_history_count_surfaces_in_sessions_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed_with_history(data_dir, "abc-123", archives=[
+                {"transcripts": []},
+                {"transcripts": []},
+            ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.get("/api/sessions").json()
+            self.assertEqual(r["sessions"][0]["history_count"], 2)
+
+    def test_history_file_get_returns_archive_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            self._seed_with_history(data_dir, "abc-123", archives=[
+                {"transcripts": [], "local_scribe": {"asr_model": "x"}},
+            ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            listed = client.get("/api/sessions/abc-123/history").json()
+            fname = listed["entries"][0]["filename"]
+            r = client.get(f"/api/sessions/abc-123/history/{fname}")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["local_scribe"]["asr_model"], "x")
+
+    def test_history_file_get_rejects_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            # Bad names that the route still matches as a single path
+            # segment -- our validator must reject these with 400, not
+            # disclose 404 or actually open the file. Starlette decodes
+            # %2F to / which falls outside the route entirely (404),
+            # so the meaningful cases are literal ".." patterns.
+            # ".." alone normalises to /api/sessions/abc-123/history
+            # (the collection GET route, returns 200), so only filename
+            # cases with ".." as a substring exercise our validator.
+            for bad in ["..foo.json", "....json", "foo..json"]:
+                r = client.get(f"/api/sessions/abc-123/history/{bad}")
+                self.assertEqual(
+                    r.status_code, 400, f"{bad} -> {r.status_code}",
+                )
+
+    def test_history_file_delete_removes_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            sd = self._seed_with_history(data_dir, "abc-123", archives=[
+                {"transcripts": [], "local_scribe": {"asr_model": "x"}},
+            ])
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            listed = client.get("/api/sessions/abc-123/history").json()
+            fname = listed["entries"][0]["filename"]
+            r = client.delete(f"/api/sessions/abc-123/history/{fname}")
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["deleted"], fname)
+            # Disk-level check.
+            self.assertFalse((sd / ".local_scribe_history" / fname).exists())
+
+    def test_history_file_delete_404_when_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            r = client.delete("/api/sessions/abc-123/history/no-such.json")
+            self.assertEqual(r.status_code, 404)
+
+    def test_history_file_delete_rejects_traversal(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td)
+            _seed_session(data_dir / "sessions", "abc-123")
+            cfg = _make_cfg(data_dir)
+            client = TestClient(inspector_server.create_app(cfg))
+            # Note: ".." alone normalises to the parent route segment
+            # (Starlette's behaviour, returns 405 against GET-only
+            # /history collection), so the meaningful traversal cases
+            # are filenames that contain ".." as a substring.
+            for bad in ["..foo.json", "....json", "foo..json"]:
+                r = client.delete(f"/api/sessions/abc-123/history/{bad}")
+                self.assertEqual(
+                    r.status_code, 400, f"{bad} -> {r.status_code}",
+                )
+
+
 class ConfigEndpointTests(unittest.TestCase):
     def test_get_returns_layered_config(self):
         with tempfile.TemporaryDirectory() as td:

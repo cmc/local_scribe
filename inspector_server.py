@@ -37,6 +37,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
 import char_audit
+import transcript_history
 from config import (
     DEFAULT_CONFIG_PATH,
     Config,
@@ -92,6 +93,16 @@ def _list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
         notes = sorted(
             p.name for p in entry.glob("*.md") if not p.name.startswith("_")
         )
+        history_count = 0
+        h = transcript_history.history_dir(entry)
+        if h.is_dir():
+            try:
+                history_count = sum(
+                    1 for p in h.iterdir()
+                    if p.is_file() and p.name.endswith(".json")
+                )
+            except OSError:
+                history_count = 0
         out.append({
             "id": meta.get("id") or entry.name,
             "title": meta.get("title") or "(untitled)",
@@ -100,6 +111,7 @@ def _list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
             "audio_bytes": audio_path.stat().st_size if audio_path.is_file() else 0,
             "has_audio": audio_path.is_file(),
             "has_transcript": transcript_path.is_file(),
+            "history_count": history_count,
             "notes": notes,
         })
     # Newest first -- Char's UI does the same.
@@ -257,6 +269,51 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             media_type="audio/mpeg",
             filename=f"{session_id}.mp3",
         )
+
+    @app.get("/api/sessions/{session_id}/history")
+    async def session_history(session_id: str) -> dict[str, Any]:
+        """List archived transcripts for a session, newest first.
+
+        Each entry includes the embedded ``local_scribe`` metadata so
+        the UI can show which ASR model / diarization params produced
+        it without a second round-trip per file. Empty list when the
+        ``.local_scribe_history`` directory hasn't been created yet
+        (i.e. the session has never been re-transcribed).
+        """
+        path = _session_dir(cfg, session_id)
+        entries = transcript_history.list_archives(path)
+        return {
+            "session_id": session_id,
+            "history_dir": str(transcript_history.history_dir(path)),
+            "count": len(entries),
+            "entries": [e.to_dict() for e in entries],
+        }
+
+    @app.get("/api/sessions/{session_id}/history/{filename}")
+    async def session_history_file(session_id: str, filename: str):
+        """Fetch one archived transcript by filename. Returns the raw
+        JSON bytes verbatim (the archive is the previous Char
+        transcript.json + a ``local_scribe`` metadata block, suitable
+        for inline display or download)."""
+        path = _session_dir(cfg, session_id)
+        if not transcript_history.is_safe_filename(filename):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        data = transcript_history.read_archive(path, filename)
+        if data is None:
+            raise HTTPException(status_code=404, detail="archive not found")
+        return JSONResponse(content=json.loads(data.decode("utf-8")))
+
+    @app.delete("/api/sessions/{session_id}/history/{filename}")
+    async def session_history_delete(session_id: str, filename: str) -> dict[str, Any]:
+        """Delete one archived transcript. Idempotent: 404 if it's
+        already gone. Loopback-only on the same trust model as the
+        rest of the inspector."""
+        path = _session_dir(cfg, session_id)
+        if not transcript_history.is_safe_filename(filename):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        if not transcript_history.delete_archive(path, filename):
+            raise HTTPException(status_code=404, detail="archive not found")
+        return {"deleted": filename}
 
     @app.get("/api/sessions/{session_id}/transcript.txt", response_class=PlainTextResponse)
     async def session_transcript_txt(session_id: str) -> PlainTextResponse:
@@ -634,12 +691,15 @@ async function loadSessions() {
     data.sessions.forEach(s => {
       const card = document.createElement('div');
       card.className = 'card';
+      const histLabel = (s.history_count || 0) > 0
+        ? ' · ' + s.history_count + ' archived'
+        : '';
       card.innerHTML = `
         <h3>${escapeHtml(s.title)}</h3>
         <div class="meta">${fmtTs(s.created_at)}
           · ${s.has_audio ? fmtBytes(s.audio_bytes) + ' audio' : 'no audio'}
           · ${s.has_transcript ? 'transcript' : 'no transcript'}
-          · ${s.notes.length} note${s.notes.length === 1 ? '' : 's'}</div>
+          · ${s.notes.length} note${s.notes.length === 1 ? '' : 's'}${histLabel}</div>
         <div class="row" style="margin-top:0.5rem">
           <button class="btn" data-id="${s.id}">Open</button>
           <a class="btn ghost" href="/api/sessions/${s.id}/audio" download>Download audio</a>
@@ -661,7 +721,13 @@ async function openSession(id) {
   detail.style.display = 'block';
   detail.innerHTML = 'loading…';
   try {
-    const s = await api('/api/sessions/' + encodeURIComponent(id));
+    // Fetch session + history in parallel so the History panel renders
+    // alongside the transcript instead of after a second visible delay.
+    const [s, hist] = await Promise.all([
+      api('/api/sessions/' + encodeURIComponent(id)),
+      api('/api/sessions/' + encodeURIComponent(id) + '/history')
+        .catch(() => ({entries: [], count: 0})),
+    ]);
     let html = `<h3>${escapeHtml(s.meta.title || '(untitled)')}</h3>
       <div class="meta">${escapeHtml(s.id)} · ${fmtTs(s.meta.created_at)}</div>`;
     if (s.has_audio) {
@@ -687,15 +753,92 @@ async function openSession(id) {
                  <div class="note-box">${escapeHtml(n.content)}</div></details>`;
       });
     }
+    html += renderHistorySection(id, hist);
     html += `<div class="row" style="margin-top:0.6rem">
              <button class="btn ghost" id="close-session">Close</button></div>`;
     detail.innerHTML = html;
     $('#close-session').addEventListener('click', () => detail.style.display = 'none');
+    wireHistoryButtons(id);
     detail.scrollIntoView({behavior: 'smooth', block: 'start'});
   } catch (e) {
     detail.innerHTML = '<div class="error-block">'
       + escapeHtml(e.message) + '</div>';
   }
+}
+
+function renderHistorySection(sessionId, hist) {
+  // Backups of previous transcript.json files (one per re-transcription).
+  // Each row shows when it was archived, which ASR model + diarization
+  // path produced it, and how many speakers were detected -- then a
+  // View / Download / Delete trio. View opens the raw JSON in a new
+  // tab so we don't have to write a separate previewer.
+  const entries = (hist && hist.entries) || [];
+  let h = `<h4 style="margin-top:1rem">Transcript history
+           <span class="meta">(${entries.length})</span></h4>`;
+  if (!entries.length) {
+    h += '<p class="meta">No archived transcripts yet. Each time you '
+      + 'regenerate the transcript (in Char or via <code>run.sh '
+      + 'redo-session</code>), the previous version is saved here.</p>';
+    return h;
+  }
+  h += '<div id="history-list">';
+  entries.forEach(e => {
+    const m = e.metadata || {};
+    const d = m.diarization || {};
+    const parts = [];
+    if (m.asr_model) parts.push('model=' + m.asr_model);
+    if (typeof d.num_speakers === 'number') parts.push('speakers=' + d.num_speakers);
+    if (d.algorithm) parts.push('diar=' + d.algorithm);
+    if (m.word_count) parts.push(m.word_count + ' words');
+    if (typeof m.audio_duration_seconds === 'number') {
+      parts.push(fmtDuration(m.audio_duration_seconds));
+    }
+    const sub = parts.length ? parts.join(' · ') : '(no metadata)';
+    h += `<div class="card" style="margin-top:0.4rem">
+      <div><strong>${escapeHtml(e.filename)}</strong>
+        <span class="meta">${fmtBytes(e.size_bytes)} · sha256=${escapeHtml((e.transcript_sha256 || '').slice(0, 12))}</span></div>
+      <div class="meta">${escapeHtml(e.archived_at_iso)} · ${escapeHtml(sub)}</div>
+      <div class="row" style="margin-top:0.4rem">
+        <a class="btn ghost" target="_blank" rel="noopener"
+           href="/api/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(e.filename)}">View JSON</a>
+        <a class="btn ghost" download="${escapeHtml(e.filename)}"
+           href="/api/sessions/${encodeURIComponent(sessionId)}/history/${encodeURIComponent(e.filename)}">Download</a>
+        <button class="btn ghost" data-history-del="${escapeHtml(e.filename)}">Delete</button>
+      </div>
+    </div>`;
+  });
+  h += '</div>';
+  return h;
+}
+
+function wireHistoryButtons(sessionId) {
+  // Single delegated click handler -- cheaper than per-button listeners
+  // and works after the DOM is mounted by innerHTML above.
+  const list = document.getElementById('history-list');
+  if (!list) return;
+  list.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-history-del]');
+    if (!btn) return;
+    const fname = btn.getAttribute('data-history-del');
+    if (!confirm('Delete archived transcript "' + fname + '"? This cannot be undone.')) {
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'deleting…';
+    try {
+      const res = await fetch('/api/sessions/' + encodeURIComponent(sessionId)
+                              + '/history/' + encodeURIComponent(fname),
+                              {method: 'DELETE'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      // Re-open the session so the badge / list refresh and any
+      // pagination updates show. Simpler than surgical DOM removal.
+      openSession(sessionId);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = 'Delete';
+      alert('Delete failed: ' + e.message);
+    }
+  });
 }
 
 function escapeHtml(s) {

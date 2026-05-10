@@ -176,6 +176,7 @@ a `./run.sh wipe` command, and tightening loopback-only binding.
 | `diarization_backend.py` | sherpa-onnx (pyannote 3.0 segmentation + NeMo TitaNet embedding) with **silhouette-validated auto-K** spectral clustering on top (the same approach AWS Transcribe and pyannote.audio v3.1+ use) — picks the speaker count from the data itself, plus an LLM pass that maps `SPEAKER_00/01/...` to real names. | Speaker labeling |
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
 | `redo_session.py` | Re-runs ASR + diarization on an existing Char session and overwrites its `transcript.json` via `char_persist.py`. Used when the original Generate produced the wrong number of speakers (1:1 came back as one blob, or a long meeting over-clustered). Match by full UUID, UUID prefix, or session-title substring. Invoked via `./run.sh redo-session …`. | Per-session re-do |
+| `transcript_history.py` | Auto-archives `transcript.json` before each overwrite into `<session>/.local_scribe_history/<timestamp>_<sha7>.json`. Each archive is the previous file verbatim plus a `local_scribe` metadata block (ASR model, diarization algorithm, K, audio sha256, timestamps). The inspector exposes list/view/download/delete per archive. | Re-transcription history |
 | `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, and produce health reports. | Operator tool |
 
 ## How the integration works (a.k.a. "the hack")
@@ -784,6 +785,86 @@ by default — generous enough for any plausible single-meeting recording
 while still bounding a runaway run on a 10-hour podcast. Set to `0` in
 `config.json` (or env) to remove the cap entirely.
 
+#### Transcript history (auto-backup on re-transcription)
+
+Every time `transcript.json` is overwritten — by `./run.sh redo-session`,
+by a fresh Generate in Char, or by any other code path that calls
+`char_persist.write_transcript_for_audio` — the previous file is copied
+to
+
+```
+<char-session>/.local_scribe_history/<YYYYMMDDTHHMMSSZ>_<sha7>.json
+```
+
+before the new one is written. Each archive is the previous file
+**verbatim**, with one extra top-level key:
+
+```json
+{
+  "transcripts": [ ... Char schema unchanged ... ],
+  "local_scribe": {
+    "written_at_iso": "2026-05-10T21:08:44Z",
+    "asr_backend": "parakeet",
+    "asr_model": "mlx-community/parakeet-tdt-0.6b-v3",
+    "audio_duration_seconds": 59.148,
+    "audio_sha256": "168eec5405db7fec...",
+    "word_count": 11,
+    "speaker_count": 2,
+    "language": "en",
+    "provider": "openai",
+    "session_id": "e02ea91c-b081-410c-b01d-71187cf545e3",
+    "diarization": {
+      "algorithm": "auto_silhouette" | "manual_ahc" | "skipped",
+      "enabled": true,
+      "num_speakers": 2,
+      "num_speakers_override": null,
+      "cluster_threshold_override": null,
+      "skipped_reason": null
+    }
+  }
+}
+```
+
+Char ignores unknown top-level keys (verified against its tinybase
+persister source), so the file is fully round-trippable — you can copy
+an archive back over `transcript.json` by hand to restore it.
+
+The inspector UI shows the history per session:
+
+```
+http://127.0.0.1:8001  →  Open session  →  Transcript history
+```
+
+…with **View JSON**, **Download**, and **Delete** for each archive.
+The session list also shows a `· N archived` badge so you know which
+sessions have backups without opening them.
+
+Programmatic surface (loopback only, same trust model as the rest of
+the inspector):
+
+```bash
+# list backups
+curl http://127.0.0.1:8001/api/sessions/<uuid>/history
+
+# fetch one
+curl http://127.0.0.1:8001/api/sessions/<uuid>/history/<filename>.json
+
+# delete one (idempotent: 404 if already gone)
+curl -X DELETE http://127.0.0.1:8001/api/sessions/<uuid>/history/<filename>.json
+```
+
+Defaults & limits:
+
+* **Location**: alongside the session in Char's data dir, so backups
+  travel with the audio if you move your `hyprnote/sessions` directory.
+* **Cap**: 50 archives per session (oldest pruned by mtime). Override
+  by editing `transcript_history.DEFAULT_MAX_BACKUPS`.
+* **Permissions**: `.local_scribe_history/` is created with mode 0o700
+  so other macOS user accounts on the same machine can't read it.
+* **Filename validation**: GET / DELETE refuse anything containing
+  `/`, `\`, or `..`. The route matcher also rejects URL-decoded path
+  separators before the validator runs.
+
 #### 3. Summary / Intelligence (LM Studio)
 
 | field | value |
@@ -1084,8 +1165,12 @@ Three tabs:
   first, with audio playback (`<audio>` streaming the same `audio.mp3`
   Char wrote), the diarised transcript flattened from
   `transcript.json` into speaker-prefixed paragraphs, every per-session
-  note (`<Template>.md`), and a one-click `transcript.txt` download.
-  Read-only — for editing the notes themselves, use Char's UI.
+  note (`<Template>.md`), a one-click `transcript.txt` download, and a
+  **Transcript history** panel per session that lists every previous
+  `transcript.json` we auto-archived on re-transcription (with the ASR
+  model + diarization algorithm + K + sha256 each archive captured) plus
+  View / Download / Delete buttons. Read-only for the notes themselves —
+  for editing those, use Char's UI.
 * **Config** — form-bound editor for `~/.config/local_scribe/config.json`.
   Each field is annotated with what it does (e.g. "set `llm.host` to a
   LAN address to run LM Studio on another Mac"). Saving runs the
@@ -1143,10 +1228,12 @@ local_scribe/
 ├── char_audit.py            # Char.app safety check + configure-char logic
 ├── char_persist.py          # SHA256-match audio -> sidecar-write transcript.json
 │                            #   (workaround for Char's progressive parser dropping words)
+├── transcript_history.py    # auto-archive previous transcript.json on overwrite
+│                            #   <session>/.local_scribe_history/<ts>_<sha7>.json
 ├── config.py                # config loader (defaults <- file <- env)
 ├── run.sh                   # service manager, bootstrap, doctor
 ├── requirements.txt
-├── tests/                   # 246 unit tests, fully hermetic (mock all I/O)
+├── tests/                   # 272 unit tests, fully hermetic (mock all I/O)
 └── .run/                    # PID files, log file, deps stamp (gitignored)
 ```
 

@@ -307,6 +307,8 @@ def write_transcript_for_audio(
     started_at_ms: Optional[int] = None,
     audio_sha: Optional[str] = None,
     request_id: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+    archive_previous: bool = True,
 ) -> Optional[WrittenTranscript]:
     """Locate Char's matching session by audio SHA and persist a
     transcript.json in Char's exact schema.
@@ -347,7 +349,7 @@ def write_transcript_for_audio(
         json.loads(h["value"]).get("speaker_index", 0) for h in out_hints
     })
 
-    payload = {
+    payload: dict[str, Any] = {
         "transcripts": [
             {
                 "created_at": time.strftime(
@@ -363,6 +365,44 @@ def write_transcript_for_audio(
             },
         ],
     }
+
+    # Embed an out-of-band ``local_scribe`` metadata block so the
+    # next overwrite can record which ASR model + diarization path
+    # produced the file we're about to archive. Char ignores unknown
+    # top-level keys (verified against tinybase's session loader), so
+    # this is invisible to Char's UI but visible to our inspector.
+    embedded_meta: dict[str, Any] = {
+        "written_at_iso": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(),
+        ),
+        "written_at_unix": time.time(),
+        "word_count": len(out_words),
+        "speaker_count": speaker_count,
+        "language": language,
+        "provider": provider,
+        "audio_sha256": audio_sha,
+        "session_id": session_dir.name,
+    }
+    if metadata:
+        for k, v in metadata.items():
+            embedded_meta.setdefault(k, v)
+    payload["local_scribe"] = embedded_meta
+
+    # Archive the previous transcript.json (if any) BEFORE we
+    # overwrite it. Imported lazily so the module's import graph stays
+    # simple in test settings that mock char_persist without the
+    # history module.
+    if archive_previous:
+        try:
+            import transcript_history as _hist
+            _hist.archive_existing_transcript(
+                session_dir, request_id=request_id,
+            )
+        except Exception:
+            logger.exception(
+                "[char_persist%s] history archive failed (continuing with "
+                "overwrite)", f" {request_id}" if request_id else "",
+            )
 
     # Atomic write: tmpfile + rename so a crashed half-write can't
     # leave Char's persister parsing a truncated JSON document.
