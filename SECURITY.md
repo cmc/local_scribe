@@ -13,6 +13,13 @@ This document is the canonical, audit-style description of how
 
 Companion documents:
 
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — every flow described here
+  as a clickable Mermaid diagram. Especially relevant:
+  [§ 4 At-rest encryption](ARCHITECTURE.md#4-at-rest-encryption-designed),
+  [§ 5 Service authentication](ARCHITECTURE.md#5-service-authentication-hkdf-tokens),
+  [§ 6 Outbound firewall](ARCHITECTURE.md#6-outbound-network-firewall),
+  [§ 14 Threat model × defence layers](ARCHITECTURE.md#14-threat-model--defence-layers),
+  [§ 15 Vault & key lifecycle](ARCHITECTURE.md#15-vault--key-lifecycle).
 - [`CHAR_REVIEW.md`](CHAR_REVIEW.md) — the bottom-up audit of the
   Char.app binary: every URL the binary references, who it actually
   talks to at runtime, and what we've done about each one. Read that

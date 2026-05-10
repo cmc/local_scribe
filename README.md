@@ -41,6 +41,31 @@ once the models are downloaded.
        └──────────────────────────────────┘
 ```
 
+## Architecture diagrams
+
+Every major flow in this codebase has a Mermaid diagram in
+[`ARCHITECTURE.md`](ARCHITECTURE.md). GitHub renders them inline, so
+the file is a clickable map of the system. Jump straight to the one
+you want:
+
+| # | diagram | when you want it |
+|---|---|---|
+| 1 | [System overview](ARCHITECTURE.md#1-system-overview) | one-screen picture of Char + ASR + LM Studio + inspector + firewall |
+| 2 | [Component dependencies](ARCHITECTURE.md#2-component-dependencies) | which Python module imports which |
+| 3 | [Bootstrap flow](ARCHITECTURE.md#3-bootstrap-flow) | what the 7 numbered steps of `./run.sh bootstrap` actually do |
+| 4 | [At-rest encryption (designed)](ARCHITECTURE.md#4-at-rest-encryption-designed) | full key + data graph (Keychain → MasterKey → HKDF tokens → vault → YubiKey backup) |
+| 5 | [Service authentication](ARCHITECTURE.md#5-service-authentication-hkdf-tokens) | how a Char "Generate" click winds up authenticated against the ASR server |
+| 6 | [Outbound network firewall](ARCHITECTURE.md#6-outbound-network-firewall) | which Char telemetry / providers / cloud hosts get blackholed |
+| 7 | [Char privacy audit](ARCHITECTURE.md#7-char-privacy-audit) | what `./run.sh doctor` actually checks about Char's settings |
+| 8 | [Live transcription](ARCHITECTURE.md#8-live-transcription-deepgram-shape) | Deepgram-shape WS flow while recording |
+| 9 | [Batch transcription](ARCHITECTURE.md#9-batch-transcription-openai-shape) | OpenAI-shape SSE flow for "Generate" on a finished session |
+| 10 | [Diarization pipeline](ARCHITECTURE.md#10-diarization-pipeline) | VAD → segmentation → embeddings → silhouette-validated clustering |
+| 11 | [Transcript history lifecycle](ARCHITECTURE.md#11-transcript-history-lifecycle) | how retranscriptions archive the previous result |
+| 12 | [Inspector UI flow](ARCHITECTURE.md#12-inspector-ui-flow) | cookie auth → sessions list → downloads → deletes |
+| 13 | [Destructive-action confirmation](ARCHITECTURE.md#13-destructive-action-confirmation-typed-delete) | the typed-DELETE modal shared by audio + history delete |
+| 14 | [Threat model × defence layers](ARCHITECTURE.md#14-threat-model--defence-layers) | which adversary tier is mitigated by which control |
+| 15 | [Vault & key lifecycle](ARCHITECTURE.md#15-vault--key-lifecycle) | full state machine for the master key (generate → rotate → backup → restore → lose) |
+
 ## Privacy and data locality
 
 The whole reason this stack exists: every recording, transcript, and
@@ -408,6 +433,9 @@ See [TODO.md](TODO.md) for planned hardening — wiring `vault.py` +
 | `service_auth.py` | HKDF-SHA256 per-service bearer tokens derived from a Keychain master key (Touch ID gated). Enforced by every gated FastAPI route. | Inter-service authentication |
 | `char_audit.py` | Reads Char's `settings.json` + `store.json` and asserts the four-key contract + firewall coverage. Surfaces drift in `./run.sh doctor` and the inspector's Char Audit tab. | Char-settings enforcement |
 | `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, manage the firewall, and produce health reports. | Operator tool |
+| `ARCHITECTURE.md` | Every major flow rendered as a Mermaid diagram (system overview, bootstrap, encryption design, auth, firewall, audit, transcription paths, diarization, history, inspector, threat model, key lifecycle). Linked from the top of this README. | Diagrammatic reference |
+| `SECURITY.md` | Threat model and per-layer defence rationale. Companion to ARCHITECTURE.md § 14 (threat model diagram). | Security policy |
+| `CHAR_REVIEW.md` | Char binary audit + network egress evidence. Companion to ARCHITECTURE.md § 6 (firewall diagram). | Char binary audit |
 
 ## How the integration works (a.k.a. "the hack")
 

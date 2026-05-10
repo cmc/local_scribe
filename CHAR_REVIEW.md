@@ -16,6 +16,11 @@ repository (commit-current `main` at the time of review). All commands
 in [§ Methodology](#methodology) are reproducible against any future
 Char build.
 
+For the diagram-first view of the mitigations described below, see
+[`ARCHITECTURE.md § 6 Outbound network firewall`](ARCHITECTURE.md#6-outbound-network-firewall),
+[`§ 7 Char privacy audit`](ARCHITECTURE.md#7-char-privacy-audit), and
+[`§ 14 Threat model × defence layers`](ARCHITECTURE.md#14-threat-model--defence-layers).
+
 > Char is open source (MIT-licensed), notarized, and signed by **Fastrepl,
 > Inc. (Team ID `6SLY7V277V`)**. Most of what's documented here is
 > verifiable by a single grep against the GitHub repo — the audit's value
