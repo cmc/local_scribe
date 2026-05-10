@@ -47,9 +47,10 @@ We back that promise with **defence in depth**:
 | layer | mechanism | module | enforces |
 |---|---|---|---|
 | network-egress | `/etc/hosts` block list with marker-delimited region; `0.0.0.0` + `::` sinks for IPv4 and IPv6 | [`firewall.py`](firewall.py) | Char's Sentry / PostHog / auto-updater + all external STT/LLM APIs are unreachable |
-| inter-service auth | HKDF-SHA256-derived per-service bearer tokens, anchored in macOS Keychain with `.userPresence` (Touch ID) ACL | [`service_auth.py`](service_auth.py), [`secret_store.py`](secret_store.py) | a process with shell-as-user access cannot `curl` any local API |
+| inter-service auth | HKDF-SHA256-derived per-service bearer tokens; the master key they're derived from lives behind Option C two-factor (Touch ID + YubiKey tap) | [`service_auth.py`](service_auth.py), [`key_lifecycle.py`](key_lifecycle.py), [`secret_store.py`](secret_store.py) | a process with shell-as-user access cannot `curl` any local API even after a Touch ID phish |
 | at-rest encryption | AES-256 sparse-bundle vault for Char's session directory | [`vault.py`](vault.py) | a stolen / imaged disk yields ciphertext, not recordings |
-| key escrow | `age-plugin-yubikey` encrypted master-key backup | [`yubikey_backup.py`](yubikey_backup.py) | a dead Keychain doesn't strand the user; lost-laptop recovery requires the physical YubiKey |
+| split-key construction | `master_key = kc_half XOR yk_half`; halves live in the Keychain (Touch ID) and an `age` file encrypted to a YubiKey | [`key_split.py`](key_split.py), [`key_lifecycle.py`](key_lifecycle.py) | Keychain pwn alone yields uniform random bytes; YubiKey theft alone yields opaque ciphertext |
+| key escrow + disaster recovery | multi-recipient `age-plugin-yubikey` enrollment (2nd YubiKey) + optional passphrase-encrypted `disaster_recovery.age` for the loss-of-both-factors case | [`yubikey_backup.py`](yubikey_backup.py), [`disaster_recovery.py`](disaster_recovery.py) | losing one factor is recoverable from the other; losing both is recoverable from the DR passphrase |
 | Char-settings enforcement | `char_audit.py` flags drift; `configure-char` rewrites the four keys atomically and disables Char's PostHog toggle | [`char_audit.py`](char_audit.py) | a settings change that would re-route audio outside the loopback shim is loud, visible, and reversible |
 | build-time supply chain | pinned Char DMG SHA256s; pinned `CHAR_KNOWN_GOOD_VERSION`; explicit cask install for LM Studio | [`run.sh`](run.sh) | tampered binaries never reach `/Applications` |
 
@@ -108,9 +109,9 @@ mitigates which row.
 | 1 | **Remote network peer** | TCP probe `127.0.0.1:{8000,8001}` from the LAN | macOS firewall blocks inbound; per-service bearer auth makes 0.0.0.0 binds opaque even when reachable |
 | 2 | **Browser content** (XSS, extension) | `fetch()` to our loopback ports from any origin | per-service bearer token in `Authorization`/cookie — browser can't read the Keychain |
 | 3 | **Co-tenant** (other macOS user on same Mac) | read files / sockets owned by other users | Keychain is per-user; `.userPresence` requires Touch ID even for the owner; loopback sockets bind to the owning UID only |
-| 4 | **Shell-as-user** (malware running as you, no Touch ID session yet) | `curl` localhost, read `$HOME`, read process env | bearer tokens are *not* in env vars / argv / disk — only in server RAM after a Touch ID unlock; vault keeps audio/transcripts as ciphertext at rest; firewall closes the *outbound* exfiltration channel even if the malware grabs a cached token |
-| 5 | **Backup / forensic imager** (stolen laptop) | read every file on disk; no live process | AES-256 sparse-bundle vault for Char's data; YubiKey-backed key escrow keeps the recovery key out of the volume itself |
-| 6 | **Phished Touch ID** (attacker tricks user into tapping for a fake prompt) | one bearer-token derivation | not fully mitigated — per-request fingerprint logging in `./run.sh status` makes silent reuse visible; rotation via `./run.sh vault init` invalidates a stolen token |
+| 4 | **Shell-as-user** (malware running as you, no Touch ID session yet) | `curl` localhost, read `$HOME`, read process env | bearer tokens are *not* in env vars / argv / disk — only in server RAM after a successful unlock; the unlock requires BOTH Touch ID AND a fresh YubiKey tap (Option C); vault keeps audio/transcripts as ciphertext at rest; firewall closes outbound exfiltration |
+| 5 | **Backup / forensic imager** (stolen laptop) | read every file on disk; no live process | AES-256 sparse-bundle vault for Char's data; the master key is split across the Keychain (encrypted at rest by macOS) and a YubiKey-encrypted age file — neither alone reconstitutes the key |
+| 6 | **Phished Touch ID** (attacker tricks user into tapping for a fake prompt) | one biometric tap | **Option C upgraded mitigation**: a successful Touch ID phish yields `kc_half` (32 random bytes) only. Without the YubiKey it does not derive the master key. Per-request fingerprint logging in `./run.sh status` still makes silent reuse visible; rotation via `./run.sh key rotate` invalidates everything in one step |
 | 7 | **Root / TCC-bypass / kernel** | anything | out of scope |
 
 Per-tier rationale, including why we chose `.userPresence` over plain
@@ -232,24 +233,34 @@ was a free `lsof`-discoverable endpoint.
 ### The control
 
 [`service_auth.py`](service_auth.py) derives a unique 32-hex bearer
-token per service from a single master key in the macOS Keychain via
-HKDF-SHA256:
+token per service from a single in-memory master key via HKDF-SHA256.
+The master key is **reconstituted from two on-disk halves** at unlock
+time (see Defence layer 4 for the split-key construction):
 
 ```
-master_key  (32 bytes, Keychain, Touch ID gated)
+              kc_half (Keychain, Touch ID)
+                       │
+                       │   XOR
+                       │
+              yk_half (age-encrypted, YubiKey tap)
+                       │
+                       ▼
+master_key  (32 bytes, in-process bytearray, forget()ed on shutdown)
     │
     ├─ HKDF(info=b"service:asr")        ─►  ls_asr_<32hex>
     ├─ HKDF(info=b"service:inspector")  ─►  ls_inspector_<32hex>
     └─ HKDF(info=b"service:future")     ─►  ls_future_<32hex>
 ```
 
-- The master key never leaves the Keychain in plaintext. Reads
-  require a fresh `.userPresence` session — i.e. a Touch ID tap
-  (passcode fallback). Stored under `service=local_scribe /
-  account=master_key` with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`.
+- The master key is **never** stored whole on disk. The two halves
+  individually carry zero information about the master (XOR of
+  uniform-random inputs).
+- Reads of `kc_half` require a fresh `.userPresence` session
+  (Touch ID, passcode fallback). Reads of `yk_half` require a
+  physical tap on the enrolled YubiKey (`touch-policy=always`).
 - Tokens are HKDF-deterministic: same master key → same tokens
   across restarts and remounts. Rotating the master key
-  (`./run.sh vault init`) rotates every token in lockstep, no
+  (`./run.sh key rotate`) rotates every token in lockstep, no
   per-service ceremony.
 - FastAPI dependencies (`make_token_dependency`) and the WebSocket
   handshake (`_ws_auth` invoked *before* `ws.accept()`) gate every
@@ -273,10 +284,10 @@ master_key  (32 bytes, Keychain, Touch ID gated)
 
 | client | mechanism |
 |---|---|
-| Char | `./run.sh configure-char` writes the ASR token into `ai.stt.openai.api_key`; Char sends `Authorization: Bearer …` on every Generate |
-| `transcribe_file.py` / `redo_session.py` | call `service_auth.client_auth_header_for("asr", …)` which prompts Touch ID on first use |
+| Char | `./run.sh configure-char` writes the ASR token into `ai.stt.openai.api_key` (via stdin to `python -m char_settings_writer` — never argv); Char sends `Authorization: Bearer …` on every Generate |
+| `transcribe_file.py` / `redo_session.py` | call `service_auth.client_auth_header_for("asr", …)` which prompts Touch ID **and** asks for a YubiKey tap on first use |
 | Browser inspector | one click on `http://127.0.0.1:8001/auth?token=…` (printed by `./run.sh status`) sets an HttpOnly, SameSite=Strict cookie for 30 days |
-| `curl` / scripting | `./venv/bin/python -m service_auth token asr` (Touch ID) → pipe into `-H "Authorization: Bearer …"` |
+| `curl` / scripting | `./venv/bin/python -m service_auth token asr` (Touch ID + YubiKey tap) → pipe into `-H "Authorization: Bearer …"` |
 
 The headers we accept (in priority order): `Authorization: Bearer …`,
 `Authorization: Token …` (Deepgram contract), `X-API-Key: …`,
@@ -300,13 +311,17 @@ It defends:
 
 It does **not** defend:
 
-- **Phished Touch ID**: macOS doesn't pin the biometric prompt to a
-  specific process. A rogue Helper popping a plausible "Unlock to
-  sign in" prompt and capturing the resulting derivation is the
-  documented soft underbelly of every Keychain-with-userPresence
-  workflow. Mitigation: fingerprint logging in `./run.sh status`
-  makes silent token theft visible, and rotation is one command.
-- **Root**: root reads everything.
+- **Phished Touch ID + Phished YubiKey tap** simultaneously: a rogue
+  helper that pops a Touch ID prompt and *also* socially engineers
+  the user into tapping their YubiKey in the same window can derive
+  tokens. The Option C split-key (Defence layer 4) raises the bar to
+  *two* phishes in one user session — a much narrower attack surface
+  than the single Touch ID phish that used to suffice. Fingerprint
+  logging in `./run.sh status` still makes silent token theft
+  visible, and rotation (`./run.sh key rotate`) is one command.
+- **Root**: root reads everything in process memory, including the
+  reconstituted master key during a legitimate unlock. We don't
+  claim TPM-isolated execution.
 
 For the live verification recipe see
 [§ Verifying it works on your machine](#verifying-it-works-on-your-machine).
@@ -316,10 +331,10 @@ For the live verification recipe see
 ## Defence layer 3 — At-rest encryption
 
 [`vault.py`](vault.py) creates an AES-256 sparse-bundle disk image
-that holds Char's session directory. The master key (Keychain-stored,
-Touch ID gated) is fed to `hdiutil` to mount the image; the volume
-appears at the same path Char already writes to
-(`~/Library/Application Support/hyprnote`), so the app sees no
+that holds Char's session directory. The master key (reconstituted
+from the two factors in layer 4 below) is fed to `hdiutil` to mount
+the image; the volume appears at the same path Char already writes
+to (`~/Library/Application Support/hyprnote`), so the app sees no
 difference. On unmount, the bytes on disk are ciphertext.
 
 This layer addresses adversary #5 (backup / forensic-imager) — a
@@ -333,27 +348,101 @@ unlock,lock,status}` wiring lands in a follow-up commit (tracked in
 
 ---
 
-## Defence layer 4 — YubiKey-escrowed key backup
+## Defence layer 4 — Option C split-key (Touch ID **and** YubiKey)
 
-[`yubikey_backup.py`](yubikey_backup.py) encrypts a copy of the
-master key with `age-plugin-yubikey`, requiring a physical tap on the
-YubiKey to decrypt. This is the recovery path for the
-laptop-died-Keychain-gone scenario.
+The master key is **never** stored whole on disk or in any single
+secure-storage item. Instead it is XOR-split into two independent
+32-byte halves and persisted across two factors:
 
-We chose YubiKey-`age` rather than "write the key into a `.txt`
-file under `~/Documents`" because:
+```
+    master_key = kc_half  XOR  yk_half
+```
 
-- the master key is the root of every other secret derived from it;
-  having a plaintext copy on disk would null out layer 3 entirely,
-- YubiKey enforces "physical presence" hardware-side, so the
-  recovery key cannot be exfiltrated by software alone,
-- `age` is a small, audited format with a public spec and a
-  Rust implementation; it doesn't impose a third-party SaaS on the
-  recovery path.
+| half | where it lives | factor to unwrap |
+|---|---|---|
+| `kc_half` | macOS Keychain (`account=master_key_kc_half_v2`, `.userPresence` ACL, `WhenUnlockedThisDeviceOnly`) | Touch ID (or device passcode fallback) |
+| `yk_half` | `~/.config/local_scribe/yk_half.age` — `age` ciphertext to one or more enrolled YubiKey PIV recipients | physical tap on the YubiKey (`touch-policy=always`) |
 
-**Status**: module implemented; `./run.sh yubikey {enroll, verify,
-restore}` wiring + the bootstrap-time enrollment prompt land in a
-follow-up commit.
+The XOR construction is information-theoretic: knowing one half
+yields *literally no bits* of the master key. Either factor alone
+forces a `2^256` brute force, not the `2^128` you would get with
+key-bit truncation.
+
+**Modules**:
+
+- [`key_split.py`](key_split.py) — pure crypto (XOR + length checks)
+- [`secret_store.py`](secret_store.py) — Keychain-side `kc_half` API
+- [`yubikey_backup.py`](yubikey_backup.py) — `age` wrapping of
+  `yk_half` + multi-recipient enrollment
+- [`key_lifecycle.py`](key_lifecycle.py) — orchestrator
+  (`init`, `unlock`, `rotate`, `add_yubikey`, `dr_restore`,
+  `migrate_v1_to_v2`) plus a thin `python -m key_lifecycle` CLI
+- [`bin/touchid_keychain.swift`](bin/touchid_keychain.swift) — Swift
+  bridge that gates Keychain access by Touch ID; now accepts
+  `--account NAME` so we can address `kc_half` separately from the
+  legacy whole-key item during migration
+
+**Operator surface**:
+
+| command | what it does |
+|---|---|
+| `./run.sh key init [--no-dr] [--force]` | enroll YubiKey + generate master key + split + persist both halves + (optional) passphrase-encrypted disaster-recovery backup |
+| `./run.sh key unlock` | smoke-test: Touch ID + YubiKey tap → prints per-service token *fingerprints* (never the tokens themselves) |
+| `./run.sh key status` | JSON snapshot, no prompts (safe for cron) |
+| `./run.sh key rotate` | generate a fresh master + replace both halves; invalidates every derived token (`service_auth` HKDF inputs change) |
+| `./run.sh key add-yubikey RECIPIENT` | enroll a second YubiKey; re-wraps `yk_half` so either YubiKey can decrypt it |
+| `./run.sh key dr-restore` | recover from passphrase-protected age backup (lost-Keychain / lost-YubiKey path) |
+| `./run.sh key migrate` | walk a legacy v1 whole-key install over to v2 split-key; idempotent |
+| `./run.sh key destroy` | delete every key artefact (typed-DESTROY confirmation) |
+
+**Disaster recovery**: split-key means losing *either* factor is
+fatal on its own. `init` therefore offers (and strongly recommends)
+a passphrase-encrypted `age` copy of the **whole** master key at
+`~/.config/local_scribe/disaster_recovery.age`. The passphrase is
+read from `/dev/tty` (no echo, never on argv) and never logged.
+Owners are expected to write it down on paper and store it offline.
+
+**What this layer defends against**:
+
+- **Adversary #4 (shell-as-user, no Touch ID)** — Keychain ACL
+  refuses to read `kc_half` without Touch ID. Even if the shell
+  steals every other byte on disk, it does not get the master key.
+- **Adversary #6 (phished Touch ID)** — phishing a biometric still
+  doesn't give you the YubiKey; without `yk_half` there is no
+  master key. The Touch ID phish goes from "data loss" to "annoying".
+- **Adversary #7 (root / TCC bypass / kernel)** — a Keychain
+  exfiltration alone yields 32 uniform-random bytes, not the master.
+  The attacker still needs to either (a) steal the YubiKey or (b)
+  social-engineer the DR passphrase.
+
+**What this layer does *not* defend against**:
+
+- A full kernel implant during a live session can read the
+  reconstituted master key out of process memory after a legitimate
+  Touch ID + tap. We don't claim TPM-isolated execution.
+- An attacker who has compromised both the Mac *and* obtained
+  physical possession of an enrolled YubiKey (with Touch ID
+  credentials they can present) can unlock as the legitimate user.
+  That's "lost laptop + lost YubiKey" — at that point the DR
+  passphrase is the only remaining secret.
+
+**Threat-model invariants enforced by tests** (in
+[`tests/test_key_lifecycle.py`](tests/test_key_lifecycle.py)):
+
+- The master key never appears on the `argv` of any subprocess
+  spawned during `init` / `unlock` / `rotate`. Verified by spying
+  on `subprocess.run`.
+- No file under `~/.config/local_scribe/` contains the master key
+  bytes after `init` (walks every file, byte-search). The only
+  ciphertext containing the master is `disaster_recovery.age`,
+  which is passphrase-locked.
+- All key material flows over Keychain ACL → stdin → in-process
+  buffers. `LOCAL_SCRIBE_MASTER_KEY_HEX` (test/CI bypass) is the
+  only intentional exception and is loud about itself.
+
+**Status**: modules + CLI + tests all implemented and committed.
+The `./run.sh key …` UX is the recommended path for all new installs.
+Existing v1 installs migrate automatically on the first `unlock`.
 
 ---
 

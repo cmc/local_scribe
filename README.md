@@ -436,11 +436,39 @@ single document covering the firewall, per-service auth, at-rest
 vault, YubiKey escrow, Char-settings enforcement, the third-party
 audit methodology, and the continuous-audit checklist.
 
+### Master key management (Option C: Touch ID **and** YubiKey)
+
+The master key that every other secret in the system is derived from
+lives behind **two factors**: a Keychain item (Touch ID-gated) and a
+YubiKey-encrypted age file. **Both are required** to unlock; either
+factor on its own yields uniform-random bytes via the XOR
+construction. See [SECURITY.md § Defence layer 4](SECURITY.md#defence-layer-4--option-c-split-key-touch-id-and-yubikey)
+for the construction details and threat-model invariants, and
+[ARCHITECTURE.md §4](ARCHITECTURE.md#4-at-rest-encryption--option-c-split-key-implemented)
+for the diagram.
+
+Operator commands:
+
+```bash
+./run.sh key init                 # first-time setup; enroll YubiKey + DR backup
+./run.sh key status               # JSON snapshot; no Touch ID / no YubiKey
+./run.sh key unlock               # smoke test; prints token fingerprints
+./run.sh key rotate               # fresh master + halves; invalidates all tokens
+./run.sh key add-yubikey RECIP    # enroll a second YubiKey (paste its age recipient)
+./run.sh key dr-restore           # recover via passphrase (lost-factor case)
+./run.sh key migrate              # walk a legacy v1 install over to v2 (idempotent)
+./run.sh key destroy              # delete every key artefact (typed-DESTROY confirm)
+```
+
+All passphrases are read from `/dev/tty` (no echo, never on argv).
+All master-key bytes flow via Keychain ACL → stdin → in-process
+buffers — never argv, never env, never logs.
+
 ### Future privacy work
 
-See [TODO.md](TODO.md) for planned hardening — wiring `vault.py` +
-`yubikey_backup.py` into `bootstrap`, an age-based auto-purge, a
-`./run.sh wipe` command, and tightening the loopback bind default.
+See [TODO.md](TODO.md) for planned hardening — wiring `vault.py` into
+`./run.sh start`, an age-based auto-purge, a `./run.sh wipe` command,
+and tightening the loopback bind default.
 
 ## What's in here
 
@@ -453,9 +481,16 @@ See [TODO.md](TODO.md) for planned hardening — wiring `vault.py` +
 | `redo_session.py` | Re-runs ASR + diarization on an existing Char session and overwrites its `transcript.json` via `char_persist.py`. Used when the original Generate produced the wrong number of speakers (1:1 came back as one blob, or a long meeting over-clustered). Match by full UUID, UUID prefix, or session-title substring. Invoked via `./run.sh redo-session …`. | Per-session re-do |
 | `transcript_history.py` | Auto-archives `transcript.json` before each overwrite into `<session>/.local_scribe_history/<timestamp>_<sha7>.json`. Each archive is the previous file verbatim plus a `local_scribe` metadata block (ASR model, diarization algorithm, K, audio sha256, timestamps). The inspector exposes list/view/download/delete per archive. | Re-transcription history |
 | `firewall.py` | `/etc/hosts` block-list manager. Marker-delimited region, `0.0.0.0`/`::` sinks, idempotent installer, DNS probe. Catches Char's Sentry / PostHog / auto-updater + every external STT/LLM provider. Driven by `./run.sh firewall …`. Full rationale in [SECURITY.md](SECURITY.md). | Outbound egress control |
-| `service_auth.py` | HKDF-SHA256 per-service bearer tokens derived from a Keychain master key (Touch ID gated). Enforced by every gated FastAPI route. | Inter-service authentication |
+| `service_auth.py` | HKDF-SHA256 per-service bearer tokens derived from the master key. Enforced by every gated FastAPI route. | Inter-service authentication |
+| `key_split.py` | Pure XOR construction (`master_key = kc_half XOR yk_half`). Stdlib only. | Split-key crypto primitive |
+| `secret_store.py` | macOS Keychain bridge via the Swift Touch ID helper. Holds the `kc_half` item (and the legacy v1 whole-key item during migration). | Keychain factor |
+| `yubikey_backup.py` | `age`-based wrapping of `yk_half`, including multi-recipient enrollment so a backup YubiKey can decrypt the same file. | YubiKey factor |
+| `disaster_recovery.py` | Passphrase-encrypted age copy of the **whole** master key. Strictly opt-in at `init` time. The recovery path for "lost both factors". | Disaster recovery |
+| `key_lifecycle.py` | Orchestrator: `init / unlock / rotate / add_yubikey / dr_restore / migrate_v1_to_v2 / status`. Plus a `python -m key_lifecycle …` CLI that `./run.sh key` delegates to. | Two-factor key lifecycle |
+| `char_settings_writer.py` | Stdin-driven JSON patcher for Char's `settings.json`. Used by `./run.sh configure-char` so the ASR bearer token never appears in argv. | Argv-leak hardening |
 | `char_audit.py` | Reads Char's `settings.json` + `store.json` and asserts the four-key contract + firewall coverage. Surfaces drift in `./run.sh doctor` and the inspector's Char Audit tab. | Char-settings enforcement |
-| `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, manage the firewall, and produce health reports. | Operator tool |
+| `bin/touchid_keychain.swift` | Compiled by `./run.sh bootstrap` into `bin/touchid-keychain`. Accepts `--account NAME` so the same binary manages both the legacy whole-key item and the new `kc_half` item. | Touch ID bridge |
+| `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, manage the firewall + keys, and produce health reports. | Operator tool |
 | `ARCHITECTURE.md` | Every major flow rendered as a Mermaid diagram (system overview, bootstrap, encryption design, auth, firewall, audit, transcription paths, diarization, history, inspector, threat model, key lifecycle). Linked from the top of this README. | Diagrammatic reference |
 | `SECURITY.md` | Threat model and per-layer defence rationale. Companion to ARCHITECTURE.md § 14 (threat model diagram). | Security policy |
 | `CHAR_REVIEW.md` | Char binary audit + network egress evidence. Companion to ARCHITECTURE.md § 6 (firewall diagram). | Char binary audit |

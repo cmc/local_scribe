@@ -201,52 +201,101 @@ flowchart TD
 
 ---
 
-## 4. At-rest encryption (designed)
+## 4. At-rest encryption — Option C split-key (implemented)
 
-The full key + data graph as it lives in code. Hot (in-memory only)
-items are red; cold (on-disk ciphertext) items are blue. The bytes
-inside `secret_store.MasterKey` are the only ones that must never
-touch argv, env vars, or any file other than the Keychain item or
-the YubiKey-encrypted backup.
+The master key is split via XOR into two independent 32-byte halves;
+**both** factors are required to unlock the vault.
+
+```
+    master_key = kc_half  XOR  yk_half
+```
+
+`kc_half` lives in the macOS Keychain under `account=master_key_kc_half_v2`,
+gated by Touch ID (`.userPresence` ACL). `yk_half` lives on disk as
+an `age` file encrypted to one or more enrolled YubiKey PIV recipients
+(touch-policy = `always`, so every decrypt requires a fresh physical
+tap). Either factor on its own yields uniform-random bytes — the XOR
+construction is information-theoretic, not just computationally hard.
+
+Hot (in-memory only) items are red; cold (on-disk ciphertext) items
+are blue. The bytes inside `secret_store.MasterKey` and the two halves
+during XOR reconstitution are the **only** master-key-derived bytes
+in process memory at any one time.
 
 ```mermaid
 flowchart TD
     subgraph SEP["Secure Enclave Processor (Apple Silicon)"]
         TouchID["Touch ID sensor"]
-        KCh["macOS Keychain item<br/>service=local_scribe<br/>account=master_key<br/>ACL: .userPresence<br/>(WhenUnlockedThisDeviceOnly)"]
+        KCh["macOS Keychain item<br/>service=local_scribe<br/>account=master_key_kc_half_v2<br/>ACL: .userPresence<br/>(WhenUnlockedThisDeviceOnly)<br/><b>kc_half (32 random bytes)</b>"]
     end
-    Swift["bin/touchid-keychain<br/>(Swift helper)"]
+    Swift["bin/touchid-keychain --account ...<br/>(Swift helper; --account whitelist:<br/>alphanumerics + _-)"]
+    YK["YubiKey PIV slot 9a<br/>touch-policy=always<br/>pin-policy=never"]
+    YKHalf[("~/.config/local_scribe/<br/>yk_half.age<br/><b>(multi-recipient age file)</b>")]
+    Recipients[("yubikey_recipients.txt<br/>1..N enrolled keys")]
+    DR[("~/.config/local_scribe/<br/>disaster_recovery.age<br/>(age -p, scrypt KDF,<br/>opt-in at init)")]
+
+    KS["key_split<br/>combine_halves(kc,yk)"]
     SS["secret_store.MasterKey<br/>32-byte bytearray<br/>forget() zeros on exit"]
-    SA["service_auth<br/>HKDF-SHA256"]
+
+    SA["service_auth<br/>HKDF-SHA256(salt, mk, info='service:asr')"]
     AsrTok["ls_asr_… token<br/>(in server RAM only)"]
+    SA2["service_auth<br/>HKDF info='service:inspector'"]
     InsTok["ls_inspector_… token<br/>(in server RAM only)"]
+
     Vault["vault.sparsebundle<br/>AES-256-XTS via hdiutil<br/>password from stdin (-stdinpass)"]
     Mount["~/Library/Application Support/<br/>local_scribe-vault/hyprnote/<br/>(decrypted under our mount)"]
     Symlink["~/Library/Application Support/hyprnote<br/>→ symlink to mount"]
     Data[("audio.mp3, transcript.json,<br/>note .md, app.db<br/>(plaintext only while mounted)")]
-    YK["YubiKey PIV slot 9a<br/>(touch-policy=always)"]
-    Backup[("~/.config/local_scribe/<br/>key_backup.age")]
+
+    Passphrase["operator passphrase<br/>(read from /dev/tty,<br/>piped on stdin)"]
 
     TouchID -.->|"biometric attest"| KCh
     KCh -->|"hex on stdout<br/>(NEVER argv)"| Swift
-    Swift -->|"32 bytes via stdin"| SS
+    Swift -->|"32 bytes (kc_half) via stdin"| KS
+    Recipients --> YKHalf
+    YK -.->|"physical tap<br/>(touch-policy=always)"| YKHalf
+    YKHalf -->|"age -d -i identity<br/>(32 bytes yk_half via stdin)"| KS
+    KS -->|"kc XOR yk = master_key"| SS
+
     SS -->|"HKDF info=service:asr"| SA
     SA --> AsrTok
-    SS -->|"HKDF info=service:inspector"| SA2["service_auth<br/>HKDF-SHA256"]
+    SS -->|"HKDF info=service:inspector"| SA2
     SA2 --> InsTok
     SS -->|"hdiutil attach -stdinpass<br/>(password via pipe)"| Vault
     Vault -->|"transparent decrypt"| Mount
     Mount --> Data
     Symlink --> Mount
-    SS -->|"age -r recipient<br/>(stdin master key)"| Backup
-    Backup -.->|"age -d -i identity<br/>(YubiKey tap required)"| YK
-    YK -.->|"recovered 32 bytes"| SS
+
+    Passphrase -.->|"age -p (init time only)"| DR
+    SS -.->|"whole master key encrypted<br/>at init / rotation"| DR
+    DR -.->|"age -d (passphrase)<br/>dr-restore path"| SS
 
     classDef hot fill:#fee,stroke:#c33,color:#900
     classDef cold fill:#eef,stroke:#33c
-    class SS,AsrTok,InsTok hot
-    class Vault,Backup,Data cold
+    class SS,AsrTok,InsTok,KS hot
+    class Vault,YKHalf,DR,Data,Recipients cold
 ```
+
+Key threat-model properties this construction buys:
+
+* **Keychain pwn alone** (TCC bypass, malicious admin) yields 32 bytes
+  of uniform-random `kc_half`. Without the YubiKey, no `yk_half`,
+  no master key. `2^256` brute-force, not `2^128`.
+* **YubiKey theft alone** yields an opaque `age` file. Without the
+  Keychain, no `kc_half`, no master key. The attacker also needs
+  Touch ID / passcode to recover from the same Mac.
+* **Either factor lost** (Mac wiped, every YubiKey destroyed) is
+  recoverable via the optional `disaster_recovery.age` file — but
+  only if the operator opted into one at `init` and remembers the
+  passphrase. We surface this trade-off in the prompt copy.
+* **Adding a second YubiKey** (`./run.sh key add-yubikey RECIPIENT`)
+  decrypts `yk_half` with the current YubiKey, then re-encrypts to
+  the union of recipients. Either YubiKey then unlocks; we never
+  need to write the cleartext to disk in between.
+
+All key bytes flow over **Keychain ACL → stdin → in-process buffers**.
+Never argv, never env, never logs. The argv-leak property is asserted
+by `tests/test_key_lifecycle.py::ThreatModelInvariantTests::test_master_key_never_in_subprocess_argv`.
 
 ---
 
@@ -277,7 +326,7 @@ sequenceDiagram
     SA->>SA: HKDF(salt=app+ver,<br/>ikm=mk, info="service:asr")
     SA-->>RunSh: ls_asr_<32-hex>
     RunSh->>Char: write settings.json::stt.openai.api_key
-    Note over RunSh,Char: Token MUST NOT be passed on<br/>the inline-Python argv (open audit item).
+    Note over RunSh,Char: Token passed via stdin to<br/>python -m char_settings_writer<br/>(never argv; tested by<br/>test_char_settings_writer.py).
     User->>Char: click "Generate" on a session
     Char->>ASR: POST /v1/audio/transcriptions<br/>Authorization: Bearer ls_asr_…
     ASR->>SA: extract_candidate_token(request)
@@ -573,6 +622,7 @@ flowchart LR
       D5["char_audit + configure-char"]
       D6["pinned Char DMG + LM Studio cask"]
       D7["fingerprint logging<br/>(token reuse detection)"]
+      D8["Option C split-key<br/>(Touch ID AND YubiKey tap)"]
     end
 
     Out[(Out of scope:<br/>see SECURITY.md § Out of scope)]
@@ -584,54 +634,98 @@ flowchart LR
     A4 --> D2
     A4 --> D3
     A4 --> D4
+    A4 --> D8
     A5 --> D3
     A5 -.->|"laptop must<br/>be unmounted"| D3
     A6 -.->|"partial"| D2
     A6 -.->|"partial"| D7
+    A6 --> D8
     A1 -.->|"settings drift"| D5
     A4 -.->|"settings drift"| D5
     A1 -.->|"supply chain"| D6
+    A7 -.->|"Keychain pwn alone<br/>still lacks YubiKey"| D8
     A7 -.-> Out
 ```
 
+**D8 — Option C split-key**: the master key is XOR-split across the
+Keychain (Touch ID-gated `kc_half`) and a YubiKey-encrypted `yk_half`.
+For an attacker on tier 4–7 to derive the master key they need
+**both** factors, not just biometric unlock. This is the strongest
+new mitigation in the current release; see §4 for the construction
+diagram and §15 for the full lifecycle.
+
 ---
 
-## 15. Vault & key lifecycle
+## 15. Vault & key lifecycle (Option C)
 
-The complete state machine for the master key from
-"freshly cloned repo" through compromise / loss / recovery.
-`./run.sh vault init`, `./run.sh vault lock`, `./run.sh yubikey
-enroll`, and `./run.sh vault rotate` are the operator-facing
-transitions. The "Compromised → Rotated" path is the one we exercise
-when a Touch ID phish is suspected — re-generating the master key
-invalidates every derived bearer token in one step.
+The complete state machine for the **split-key** master key from
+"freshly cloned repo" through compromise / loss / recovery. The
+operator-facing transitions all live behind `./run.sh key <verb>`:
+
+| transition | command |
+|---|---|
+| `NoKey → SplitStored` | `./run.sh key init [--no-dr]` |
+| `SplitStored → Unlocked` | `./run.sh key unlock` (or app startup) |
+| `SplitStored → SplitStored'` | `./run.sh key rotate` |
+| `SplitStored → SplitStored` (add 2nd YubiKey) | `./run.sh key add-yubikey RECIPIENT` |
+| `LegacyV1 → SplitStored` | `./run.sh key migrate` (auto-runs on first unlock) |
+| `KcHalfLost → SplitStored` | `./run.sh key dr-restore` |
+| `BothFactorsLost → Empty` | `./run.sh key dr-restore` (requires DR passphrase) |
+| `* → NoKey` | `./run.sh key destroy` (typed-DESTROY confirm) |
+
+The "Compromised → Rotated" path stays the same as before: generate
+a fresh master key, write the new halves, and every derived bearer
+token (HKDF over the master) becomes a 401 in one step. Rotation
+also re-writes the DR file if the operator supplies a passphrase.
 
 ```mermaid
 stateDiagram-v2
     [*] --> NoKey : fresh clone
 
-    NoKey --> Generating : ./run.sh vault init<br/>(future: ./run.sh key init)
-    Generating --> Stored : 32 random bytes →<br/>Keychain (.userPresence)
+    NoKey --> Generating : ./run.sh key init [--no-dr]
+    Generating --> SplitStored : kc_half → Keychain<br/>(.userPresence ACL)<br/>yk_half → age(YK)<br/>optional: master → age(p)
 
-    Stored --> Mounted : hdiutil attach -stdinpass<br/>(Touch ID prompt)
-    Mounted --> Working : services running, vault mounted,<br/>Char data symlinked
+    LegacyV1 --> Migrating : ./run.sh key migrate<br/>(auto-runs on unlock)
+    Migrating --> SplitStored : split existing master_key,<br/>delete v1 item
 
-    Working --> Unmounted : ./run.sh stop / vault lock
-    Unmounted --> Mounted : ./run.sh start (Touch ID)
+    SplitStored --> Unlocking : ./run.sh key unlock<br/>or service startup
+    Unlocking --> Unlocked : Touch ID prompt → kc_half<br/>YubiKey tap → yk_half<br/>XOR in memory
 
-    Stored --> BackedUp : ./run.sh yubikey enroll<br/>+ backup_key()
-    BackedUp --> Stored : (no flow back — escrow is<br/>a one-way write of the key bytes)
+    Unlocked --> Working : tokens derived,<br/>vault mounted,<br/>Char data symlinked
+    Working --> Locked : ./run.sh stop / vault lock
+    Locked --> Unlocking : ./run.sh start
+
+    SplitStored --> AddingYubiKey : ./run.sh key add-yubikey
+    AddingYubiKey --> SplitStored : decrypt yk_half (tap)<br/>re-encrypt to {old, new}
 
     Working --> Compromised : Keychain ACL bypass /<br/>leaked token suspected
-    Compromised --> Rotated : ./run.sh vault rotate<br/>(re-encrypt keybag, refresh tokens)
-    Rotated --> Stored
+    Compromised --> Rotating : ./run.sh key rotate
+    Rotating --> SplitStored : fresh master + halves<br/>+ optional new DR
 
-    Stored --> Lost : Keychain wiped / Mac dead
-    Lost --> Restored : age -d -i yubikey_identity backup.age<br/>(YubiKey tap required)
-    Restored --> Stored
+    SplitStored --> KcHalfLost : Keychain wiped<br/>(Mac reinstall, etc.)
+    KcHalfLost --> DRecovering : ./run.sh key dr-restore<br/>(needs DR passphrase)
+    DRecovering --> SplitStored : age -d → master_key<br/>re-split + re-store
 
-    Lost --> [*] : no YubiKey backup →<br/>data unrecoverable
+    SplitStored --> YkHalfLost : YubiKey lost/destroyed
+    YkHalfLost --> Recovered2YK : 2nd YK enrolled?<br/>just insert it
+    Recovered2YK --> SplitStored
+    YkHalfLost --> DRecovering : no 2nd YK →<br/>fall back to DR
+
+    SplitStored --> BothFactorsLost : Keychain wiped<br/>AND every YK lost
+    BothFactorsLost --> DRecovering : DR file + passphrase
+    BothFactorsLost --> [*] : no DR file →<br/>data unrecoverable
+
+    SplitStored --> NoKey : ./run.sh key destroy
 ```
+
+**Invariant**: the master-key bytes only ever live as a bytearray
+inside `secret_store.MasterKey`, for the lifetime of a single API
+call or a single CLI subcommand. Everything else on disk is one of:
+
+* `kc_half` (random; cleartext only inside the Keychain item)
+* `yk_half` (random; ciphertext-only outside the YubiKey)
+* `disaster_recovery.age` (master-key ciphertext under scrypt-derived KDF)
+* `vault.sparsebundle` (data ciphertext under AES-256-XTS, hdiutil-managed)
 
 ---
 

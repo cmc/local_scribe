@@ -14,24 +14,44 @@ sweep whenever `CHAR_KNOWN_GOOD_VERSION` is bumped.
 
 ## Privacy & security (P0)
 
+- [x] **Two-factor master-key unlock (Option C split-key).** ✅
+      Landed: `master_key = kc_half XOR yk_half`. `kc_half` in
+      Keychain (Touch ID), `yk_half` in an `age` file encrypted to
+      one or more enrolled YubiKeys (touch-policy=always). Either
+      factor alone yields uniform random bytes. Optional
+      passphrase-encrypted disaster-recovery backup for the
+      lose-both-factors case. Operator surface:
+      `./run.sh key {init|unlock|rotate|add-yubikey|dr-restore|migrate|destroy}`.
+      Tests (in `tests/test_key_lifecycle.py`) assert the master key
+      never appears on argv, never as plaintext on disk, and that
+      both factors are required to unlock. See
+      [SECURITY.md § Defence layer 4](SECURITY.md#defence-layer-4--option-c-split-key-touch-id-and-yubikey)
+      and [ARCHITECTURE.md §4](ARCHITECTURE.md#4-at-rest-encryption--option-c-split-key-implemented).
+- [x] **Per-service bearer tokens never on argv.** ✅ Landed: the ASR
+      token now reaches Char's `settings.json` via stdin to
+      `python -m char_settings_writer` (was: argv[3] of an inline
+      Python heredoc, which was both a leak AND silently broken). All
+      remaining heredoc-with-pipe call sites in `run.sh` audited and
+      converted to `python -m <module>` form.
 - [ ] **Encrypt audio at rest.** Char writes raw `audio.mp3` to
       `~/Library/Application Support/hyprnote/sessions/<uuid>/`. If the
       laptop is stolen, image-restored, or its volume mounted from
-      another OS, recordings are readable as-is. Plan: a `local_scribe`
-      daemon that watches Char's session directory, generates a
-      256-bit AES key per session in macOS Keychain (`security
-      add-generic-password ...`), encrypts `audio.mp3` to
-      `audio.mp3.enc`, zeroes the plaintext. Decrypts on demand by
-      either intercepting Char's player path or exposing a transparent
-      mountpoint (FUSE). The Keychain ACL would require user
-      authentication (Touch ID) on each unlock.
+      another OS, recordings are readable as-is. Plan: wire
+      `vault.py` (already implemented; AES-256 sparse bundle keyed by
+      the Option C master key) into `./run.sh start` so Char's data
+      directory is a mounted volume rather than a plain folder. The
+      vault module + tests are already in tree; only the start/stop
+      glue + the bootstrap "create the sparse bundle" step remain.
 - [ ] **Encrypt transcripts and summaries at rest.** Same approach
       applied to `transcript.json`, `_summary.md`, and the per-template
-      note markdown files. Char reads/writes these on Generate; the
-      encryption shim has to mediate.
+      note markdown files. Falls out of the vault-mount work above:
+      once the whole session directory is on a mounted ciphertext
+      volume, every file Char writes inherits the AES-256 envelope.
 - [ ] **Encrypt the local-scribe transcript cache** at
       `~/.cache/local_scribe/transcripts/`. Currently keyed by audio
-      sha256 with the cached output stored as plain JSON.
+      sha256 with the cached output stored as plain JSON. Either
+      move it inside the vault mount or AES-GCM each entry with a
+      key derived from the master via HKDF (`info=b"transcript_cache"`).
 - [ ] **`./run.sh wipe`** — single command that finds and securely
       overwrites everything under Char's session directory + our
       transcript cache + Time Machine local snapshots that include
