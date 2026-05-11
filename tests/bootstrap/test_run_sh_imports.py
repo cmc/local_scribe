@@ -4,34 +4,41 @@ must resolve against the actual codebase.
 Why this file exists
 --------------------
 
-``run.sh`` is the bootstrap entry point and contains TWO classes of
-Python-module references:
+``run.sh`` is the bootstrap entry point and contains THREE classes of
+Python-module references — and the 2026-05-11 reorg missed all three:
 
-  (a) ``import`` / ``from ... import`` lines inside ``$VENV_PY - <<'PY'``
-      heredocs (and inline ``-c '...'`` blocks).
-  (b) ``$VENV_PY -m <module>`` invocations as plain bash subprocess calls.
+  (a) ``import`` / ``from ... import`` lines at column 0 inside
+      ``$VENV_PY - <<'PY' ... PY`` heredocs.
+      → broke at stage 7 with confusing ModuleNotFoundError on
+        ``from config import ...`` etc.
 
-When we reorganised the codebase into ``local_scribe/`` packages on
-2026-05-11 the reorg missed both kinds. Heredoc imports like
-``from config import ...`` produced confusing ``ModuleNotFoundError``s
-during bootstrap stage 7; bash-level ``python -m char_settings_writer``
-invocations exploded at bootstrap stage 9 with ``No module named
-char_settings_writer`` AFTER the operator had already typed Touch ID +
-done a YubiKey tap to mint the bearer token. Both are exactly the same
-regression class but at different parsing layers.
+  (b) ``$VENV_PY -m <module>`` invocations as plain bash subprocess
+      calls.
+      → broke at stage 9 with ``No module named char_settings_writer``
+        AFTER the operator did Touch ID + a YubiKey tap to mint
+        the bearer.
 
-This module ships two complementary tests:
+  (c) ``import`` / ``from ... import`` lines INSIDE ``$VENV_PY -c
+      '...'`` (or ``"..."``) inline-Python strings.
+      → broke at stage 10 with NO error message at all (``set -e`` +
+        ``2>/dev/null`` killed the bootstrap silently after printing
+        "Full rationale + threat model: SECURITY.md"). The visible
+        failure mode was "bootstrap exited without printing the
+        completion banner".
 
-  RunShPythonImportsResolveTests
-        Heredoc/inline-Python ``import`` statements — pre-existing.
+This module ships three complementary tests, one per class:
 
-  RunShPythonDashMResolveTests
-        ``$VENV_PY -m <module>`` (and ``python -m <module>``) bash-level
-        invocations — added 2026-05-11 after the char_settings_writer
-        regression.
+  RunShPythonImportsResolveTests        (class a)
+        Column-0 imports inside heredocs.
 
-Both run entirely in-process against this checkout (no subprocess, no
-fakes). Fast and high-signal.
+  RunShPythonDashMResolveTests          (class b)
+        Bash-level ``-m`` invocations.
+
+  RunShPythonDashCImportsResolveTests   (class c)
+        Imports INSIDE ``-c '...'`` inline Python blocks.
+
+All three run entirely in-process against this checkout — no subprocess,
+no fakes, no PATH gymnastics. Fast (< 1 s) and high-signal.
 """
 
 from __future__ import annotations
@@ -275,6 +282,160 @@ class RunShPythonDashMResolveTests(unittest.TestCase):
             unresolved,
             [],
             msg="\n\n".join(unresolved),
+        )
+
+
+# ---------------------------------------------------------------------------
+# ``-c '...'`` inline-Python imports.
+#
+# Bash quoting makes this slightly fiddly: a ``-c`` block can span
+# multiple lines (single-quoted strings happily include newlines until
+# the closing quote) and can also be a single-line one-liner. We scan
+# line-by-line, switching to "inside a -c block" state when we see an
+# opening ``-c '`` or ``-c "`` and back to "outside" when we hit the
+# matching close quote.
+#
+# Limitations (acceptable for this codebase):
+#   - We don't handle escaped quotes inside the block.
+#   - We assume the block delimiter doesn't change mid-stream (no shell
+#     dynamic quoting tricks).
+# If either becomes a problem, the test would either over-match
+# (catchable by the false-positive caps below) or under-match (visible
+# as a missed regression — at which point we just enrich the parser).
+
+# Opening delimiters we accept. Anchored on a python invocation so we
+# don't match unrelated ``-c`` flags (e.g. someone's ``foo -c "..."``).
+_DASH_C_OPEN_RE = re.compile(
+    r"""
+    (?:\$\("\$VENV_PY"|"\$VENV_PY"|\$VENV_PY|python3?)
+    \s+(?:-[A-Za-z0-9]+\s+)*
+    -c\s+
+    (?P<quote>['"])
+    (?P<rest>.*)$
+    """,
+    re.VERBOSE,
+)
+
+
+def _extract_dash_c_imports(run_sh: Path) -> Iterable[tuple[int, str, str]]:
+    """Yield ``(line_number, raw_line, module)`` for every ``import`` /
+    ``from ... import`` statement found inside a ``$VENV_PY -c '...'``
+    inline-Python block.
+
+    ``line_number`` is the line on which the import appears (NOT the
+    opening ``-c``), so the failure message points the operator at the
+    exact source line that needs editing.
+    """
+    inside = False
+    quote = ""
+    for lineno, line in enumerate(run_sh.read_text().splitlines(), start=1):
+        stripped = line.lstrip()
+        # Whole-line bash comments are never inside a -c block.
+        if not inside and stripped.startswith("#"):
+            continue
+        if not inside:
+            m = _DASH_C_OPEN_RE.search(line)
+            if not m:
+                continue
+            inside = True
+            quote = m.group("quote")
+            rest = m.group("rest")
+            # The -c block might close on the same line (one-liner) or
+            # continue on subsequent lines (multi-line block).
+            if quote in rest:
+                # One-liner: extract the inner body and scan it.
+                body = rest.split(quote, 1)[0]
+                yield from _imports_from_body(lineno, body)
+                inside = False
+            else:
+                yield from _imports_from_body(lineno, rest)
+            continue
+        # Inside a multi-line -c block.
+        if quote in line:
+            body = line.split(quote, 1)[0]
+            yield from _imports_from_body(lineno, body)
+            inside = False
+        else:
+            yield from _imports_from_body(lineno, line)
+
+
+def _imports_from_body(lineno: int, body: str) -> Iterable[tuple[int, str, str]]:
+    """Extract top-level module names from a python source fragment."""
+    # A -c block can have multiple statements separated by ``;`` on a
+    # single line. Split conservatively so we don't miss multi-statement
+    # one-liners like ``import foo; print(foo.x())``.
+    for stmt in body.split(";"):
+        s = stmt.strip()
+        if not s:
+            continue
+        m = _IMPORT_LINE_RE.match(s)
+        if not m:
+            continue
+        if m.group("from_mod"):
+            yield lineno, body.strip(), m.group("from_mod")
+        else:
+            mods_blob = m.group("import_mod") or ""
+            for piece in mods_blob.split(","):
+                mod = piece.strip().split()[0] if piece.strip() else ""
+                if mod:
+                    yield lineno, body.strip(), mod
+
+
+class RunShPythonDashCImportsResolveTests(unittest.TestCase):
+    """Every ``import`` / ``from ... import`` inside a ``-c '...'``
+    inline-Python block must resolve.
+
+    Caught regression: on 2026-05-11 a stale ``import char_sandbox``
+    inside the firewall stage of bootstrap killed ``./run.sh
+    bootstrap`` SILENTLY (``set -e`` + ``2>/dev/null``). The previous
+    iteration of this analyzer only saw heredoc imports and ``-m``
+    invocations; it missed inline ``-c`` blocks entirely.
+    """
+
+    def test_every_dash_c_import_resolves(self) -> None:
+        unresolved: list[str] = []
+        local_imports_seen = 0
+        for lineno, raw, mod in _extract_dash_c_imports(_RUN_SH):
+            root = mod.split(".")[0]
+            if root in _STDLIB_ALLOWED:
+                continue
+            if root in _THIRD_PARTY_ALLOWED:
+                continue
+            if root != "local_scribe":
+                unresolved.append(
+                    f"run.sh:{lineno}: {raw}\n"
+                    f"  -> import inside ``-c '...'``: '{mod}' is not "
+                    "allowed: must be a local_scribe.* subpackage. The "
+                    "flat-module layout was retired during the 2026-05-11 "
+                    "reorg; ``import char_sandbox`` inside the firewall "
+                    "stage silently killed bootstrap until this test "
+                    "was added."
+                )
+                continue
+            local_imports_seen += 1
+            try:
+                importlib.import_module(mod)
+            except Exception as e:
+                unresolved.append(
+                    f"run.sh:{lineno}: {raw}\n"
+                    f"  -> import_module({mod!r}) failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+        self.assertEqual(
+            unresolved,
+            [],
+            msg="\n\n".join(unresolved),
+        )
+
+    def test_finds_at_least_one_dash_c_import(self) -> None:
+        """Sanity: pin a floor on the number of ``-c`` imports we
+        discover. If the parser breaks and finds zero, the resolver
+        test would vacuously pass."""
+        found = list(_extract_dash_c_imports(_RUN_SH))
+        self.assertGreaterEqual(
+            len(found), 3,
+            msg=f"unexpectedly few imports inside -c blocks ({len(found)}) — "
+                "parser regression?",
         )
 
 

@@ -1601,7 +1601,7 @@ sys.exit(0 if vault.exists() else 1)
   # Render the SBPL profile so it's on disk before the first start.
   if "$VENV_PY" -m local_scribe.egress.char_sandbox write >/dev/null 2>&1; then
     local profile_path
-    profile_path="$("$VENV_PY" -c 'import char_sandbox; print(char_sandbox.profile_path())' 2>/dev/null)"
+    profile_path="$("$VENV_PY" -c 'from local_scribe.egress import char_sandbox; print(char_sandbox.profile_path())' 2>/dev/null)"
     say "${c_green}wrote sandbox profile to $profile_path${c_reset}"
     # Validate while we're here so a bad render fails loudly NOW
     # rather than at the first ./run.sh char launch.
@@ -3847,7 +3847,7 @@ cmd_char_launch() {
   fi
   "$VENV_PY" -m local_scribe.egress.char_sandbox write >/dev/null
   local profile; profile="$(
-    "$VENV_PY" -c 'import char_sandbox; print(char_sandbox.profile_path())'
+    "$VENV_PY" -c 'from local_scribe.egress import char_sandbox; print(char_sandbox.profile_path())'
   )"
   if [[ ! -f "$profile" ]]; then
     say "${c_red}sandbox profile missing at $profile after write${c_reset}"
