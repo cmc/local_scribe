@@ -5,6 +5,51 @@
 // stack stays pure-Python (no PyObjC dependency, ~0 install size beyond what
 // Xcode CLT already provides).
 //
+// Biometric gating: application-level, not Keychain-level
+// -------------------------------------------------------
+//
+// On macOS 15 (Sequoia) and later, the Keychain-level ``SecAccessControl``
+// flags that *automatically* prompt for biometric on item access
+// (``.userPresence``, ``.biometryCurrentSet``, ``.biometryAny``) require a
+// codesigned binary holding a ``keychain-access-groups`` entitlement bound
+// to an Apple Developer Team ID. ``swiftc -O`` + ad-hoc ``codesign -s -``
+// CANNOT obtain that entitlement: ``SecItemAdd`` then fails with
+// ``errSecMissingEntitlement`` (-34018), and on the older path with the
+// suppress-UI flag it failed with ``errSecParam`` (-50). This broke
+// bootstrap on 2026-05-11; see SECURITY.md § Threat model.
+//
+// We work around the tightening by moving the biometric check OUT of the
+// Keychain ACL and INTO this binary:
+//
+//   * ``store``  → ``SecItemAdd`` with ``kSecAttrAccessible =
+//                  WhenUnlockedThisDeviceOnly`` (NO ACL). The item is
+//                  readable whenever the Mac is unlocked.
+//   * ``load``   → ``LAContext.evaluatePolicy(.deviceOwnerAuthentication)``
+//                  prompts for Touch ID, with passcode fallback. On
+//                  success, ``SecItemCopyMatching`` reads the item.
+//   * ``exists`` → unchanged; no auth needed.
+//   * ``delete`` → unchanged; no auth needed.
+//
+// Security delta vs. the old ACL-gated design
+// -------------------------------------------
+//
+//   * Biometric UX is identical: the operator still taps Touch ID once
+//     per unlock with our custom prompt string.
+//   * An attacker who can already execute code inside the calling Python
+//     process can bypass the LAContext gate and read the kc_half via a
+//     direct ``SecItemCopyMatching``. The old design's ACL would have
+//     blocked that. We accept this: our threat model targets "passer-by
+//     at an unlocked screen", not "code execution in our process". A
+//     local code-exec adversary is game-over for the vault regardless,
+//     because the master key has to live unencrypted in memory while
+//     the vault is mounted.
+//   * iCloud-sync and locked-screen exposure are unchanged: the
+//     ``WhenUnlockedThisDeviceOnly`` accessible class still ensures the
+//     item never syncs and is unreadable when the Mac is locked.
+//
+// If/when local_scribe ships a notarized .app bundle, restoring the
+// ACL-gated path is a 1-commit revert plus the entitlement plist.
+//
 // Usage:
 //
 //   touchid-keychain [--account NAME] <store|load|exists|delete> [prompt]
@@ -57,13 +102,6 @@ import LocalAuthentication
 let SERVICE = "local_scribe"
 let DEFAULT_ACCOUNT = "master_key"
 
-// errSecUserCanceled is defined as -128 in macOS SDKs; pull from the
-// Security framework so we don't hardcode an integer.
-let kCanceledStatuses: Set<OSStatus> = [
-    errSecUserCanceled,
-    errSecAuthFailed,
-]
-
 func die(_ msg: String, code: Int32 = 1) -> Never {
     FileHandle.standardError.write(Data("error: \(msg)\n".utf8))
     exit(code)
@@ -104,33 +142,19 @@ func deleteItem(account: String) {
 }
 
 func storeKey(_ key: Data, account: String) {
-    var err: Unmanaged<CFError>?
-    // .userPresence = Touch ID *or* device passcode. We deliberately accept
-    // the passcode fallback so users without enrolled fingerprints (or with
-    // a finger sensor that briefly fails) can still unlock with their login
-    // password. The vault is already gated by the Mac login session.
-    guard let access = SecAccessControlCreateWithFlags(
-        nil,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        .userPresence,
-        &err
-    ) else {
-        die("SecAccessControlCreateWithFlags: \(err?.takeRetainedValue().localizedDescription ?? "?")")
-    }
-
     // Replace-on-add: simplest correct semantics for "store the latest key".
     deleteItem(account: account)
 
+    // Biometric gating is enforced at LOAD time via LAContext; the keychain
+    // item itself just has the "device unlocked, never sync" accessibility
+    // class. See the file-header docstring for the threat-model trade-off
+    // and why we no longer attach a SecAccessControl ACL here.
     let attrs: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: SERVICE,
         kSecAttrAccount as String: account,
         kSecValueData as String: key,
-        kSecAttrAccessControl as String: access,
-        // We *want* the auth UI on read (later); the add itself happens
-        // unattended right after vault creation, so suppress UI here so
-        // bootstrap doesn't pop an extra Touch ID prompt for the *add*.
-        kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
+        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
     ]
     let status = SecItemAdd(attrs as CFDictionary, nil)
     if status != errSecSuccess {
@@ -139,28 +163,63 @@ func storeKey(_ key: Data, account: String) {
 }
 
 func loadKey(account: String, prompt: String) -> Data {
-    // Modern replacement for the deprecated kSecUseOperationPrompt: build
-    // an LAContext with our user-facing reason string and pass it via
-    // kSecUseAuthenticationContext. The result is identical (Touch ID
-    // sheet with custom copy) but works on macOS 11+ without warnings.
+    // Step 1: prove the live operator is here. We use
+    // .deviceOwnerAuthentication (Touch ID with passcode fallback) so a
+    // user without enrolled fingerprints — or with a sensor that briefly
+    // fails — can still unlock with their login password. The choice
+    // mirrors the .userPresence ACL flag we used to attach to the
+    // keychain item; see file-header docstring for the macOS 15 reason
+    // we had to move this check out of the SecAccessControl path.
+    //
+    // evaluatePolicy is synchronous from the CLI's perspective (we wait
+    // on the semaphore) so the parent process — secret_store.py via
+    // subprocess.run() — sees a blocking call exactly like the old ACL
+    // path. The prompt sheet appears in front of every window.
     let ctx = LAContext()
-    ctx.localizedReason = prompt
+    var laErr: NSError?
+    if !ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &laErr) {
+        let detail = laErr?.localizedDescription ?? "no biometry / passcode configured"
+        die("local auth unavailable: \(detail)", code: 4)
+    }
 
+    let sem = DispatchSemaphore(value: 0)
+    var authOK = false
+    var authErr: Error?
+    ctx.evaluatePolicy(
+        .deviceOwnerAuthentication,
+        localizedReason: prompt
+    ) { ok, err in
+        authOK = ok
+        authErr = err
+        sem.signal()
+    }
+    sem.wait()
+
+    if !authOK {
+        // LAError codes: userCancel/.appCancel/.systemCancel/.userFallback
+        // all map to our "user dismissed" code (3). Anything else
+        // (authenticationFailed after too many retries, biometryLockout,
+        // etc.) also gets exit 3 because from the caller's standpoint
+        // the user simply can't unlock right now.
+        if let err = authErr as NSError? {
+            die("Touch ID cancelled / auth failed (LAError \(err.code))", code: 3)
+        }
+        die("Touch ID cancelled / auth failed", code: 3)
+    }
+
+    // Step 2: read the keychain item. Item has no ACL (only an
+    // accessibility class) so this is a plain query — no extra prompt.
     let q: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: SERVICE,
         kSecAttrAccount as String: account,
         kSecReturnData as String: true,
         kSecMatchLimit as String: kSecMatchLimitOne,
-        kSecUseAuthenticationContext as String: ctx,
     ]
     var item: CFTypeRef?
     let status = SecItemCopyMatching(q as CFDictionary, &item)
     if status == errSecItemNotFound {
         die("key not stored (run \"./run.sh key init\")", code: 2)
-    }
-    if kCanceledStatuses.contains(status) {
-        die("Touch ID cancelled / auth failed", code: 3)
     }
     if status != errSecSuccess {
         die("SecItemCopyMatching: OSStatus=\(status)", code: 4)

@@ -1,10 +1,12 @@
 """Touch-ID-gated storage of the local_scribe master encryption key.
 
 The master key (32 random bytes, AES-256) is held in the macOS Keychain
-under ``service=local_scribe / account=master_key`` with an access control
-of ``.userPresence`` — i.e. Touch ID, falling back to the device passcode.
-Once the user authenticates, the OS hands the bytes back to us; we keep
-them in memory only and pass them to ``hdiutil`` to mount the encrypted
+under ``service=local_scribe / account=master_key`` (legacy v1) or
+``master_key_kc_half_v2`` (split-key v2). The biometric prompt fires on
+every load — Touch ID with passcode fallback, configured via
+``LAContext.evaluatePolicy(.deviceOwnerAuthentication)``. After the
+operator authenticates, the OS hands the bytes back to us; we keep them
+in memory only and pass them to ``hdiutil`` to mount the encrypted
 vault. Nothing else on disk needs to know the key.
 
 Why a Swift helper instead of PyObjC:
@@ -19,6 +21,20 @@ Why a binary instead of inlining via ``swift -e``:
     cold disk), which is unacceptable when ``./run.sh start`` calls us a
     handful of times in a row. Pre-compiled binary is ~5 ms.
 
+Why biometric gating lives in our binary instead of a Keychain ACL:
+    On macOS 15+ (Sequoia), ``SecAccessControl`` with ``.userPresence`` /
+    ``.biometryCurrentSet`` requires the calling binary to hold a
+    ``keychain-access-groups`` entitlement bound to an Apple Developer
+    Team ID. A swiftc-built + ad-hoc-codesigned binary cannot obtain
+    that entitlement — ``SecItemAdd`` returns ``errSecMissingEntitlement``
+    (-34018), and an earlier conflicting flag combination produced
+    ``errSecParam`` (-50). To keep the install path "no Apple Developer
+    account required", the Swift helper performs the biometric check
+    via ``LAContext`` itself BEFORE issuing ``SecItemCopyMatching``,
+    and the keychain item carries only the accessibility class. See
+    ``bin/touchid_keychain.swift`` and SECURITY.md § Threat model for
+    the trade-off.
+
 Threat model:
     - Plaintext key never appears in argv (passed on stdin / returned on
       stdout, hex-encoded). ``ps`` listings only see ``touchid-keychain
@@ -27,9 +43,12 @@ Threat model:
       ``forget()`` zeroes the bytearray as a defense-in-depth gesture,
       acknowledging that CPython's GC + interned strings make true
       "secure erase" impossible from Python.
-    - The Keychain ACL is ``kSecAttrAccessibleWhenUnlockedThisDeviceOnly``:
-      the item never syncs to iCloud and is unreadable when the Mac is
-      locked.
+    - The keychain item uses ``kSecAttrAccessibleWhenUnlockedThisDeviceOnly``:
+      it never syncs to iCloud and is unreadable when the Mac is locked.
+      The biometric check is performed by the helper (not enforced at
+      the Keychain layer) — an attacker with code execution in our
+      process can bypass the LAContext gate, but is already game-over
+      for the unlocked vault, so we accept this.
 """
 
 from __future__ import annotations
