@@ -62,3 +62,66 @@ outputs/
 # ``./run.sh bootstrap``). The source is tracked; the binary is not.
 bin/touchid-keychain
 
+# === Privacy: never commit key material or operator-secret artefacts ===
+#
+# These categories are not currently generated inside the repo —
+# real key material lives in the macOS Keychain and under
+# ``~/.config/local_scribe/`` and ``~/.cache/local_scribe/``,
+# which are outside the working tree. The patterns below are
+# defense-in-depth: if anything (a buggy test, a leaked copy, a
+# YubiKey-helper dropping artefacts into $PWD) ever lands a
+# secret-bearing file inside the repo, git will refuse to track
+# it even if the operator absent-mindedly types ``git add .``.
+
+# Encrypted-but-still-key-shaped material (yk_half.age, DR backups,
+# any ad-hoc age-encrypted blob). The contents are ciphertext, but
+# the ciphertext is keyed to a specific YubiKey + master key and
+# should never leave the operator's machine.
+*.age
+
+# Classic PEM / DER / PKCS containers — TLS keys, SSH keys,
+# PGP-armored secret blocks, X.509 client certs, code-signing certs.
+# This project does not legitimately commit any of these; if one
+# shows up it is a mistake.
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+
+# Signature sidecars for signed_config (operator HMACs over
+# ~/.config/local_scribe/*.json). The canonical store is outside
+# the repo; ignore any stray copy that ends up inside.
+*.sig
+*.sig.json
+
+# Dotenv / direnv / asdf / IDE-secrets files often carry API keys
+# and access tokens. We don't use them, so reject them outright.
+.env
+.env.*
+.envrc
+.secrets
+.secrets.*
+secrets/
+keys/
+credentials.json
+
+# Per-operator state directories. Real instances live under $HOME
+# but defense-in-depth: if a script ever resolves these relative
+# to $PWD, refuse to track the result.
+.config/
+.cache/
+
+# Refactor scratchpad files (operator workflow artefacts) —
+# committed values would just confuse future readers.
+.refactor-baseline-*.txt
+.refactor-tools/
+

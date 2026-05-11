@@ -1,0 +1,38 @@
+# Local-dev convenience for the Linux-portable subset of local_scribe.
+#
+# This is NOT a production deployment — see ./README.md for what
+# macOS-only facilities aren't reproducible in containers.
+#
+# Use:
+#   docker compose -f containers/compose.yaml up --build
+#
+# Then point a test client at http://127.0.0.1:8000 (ASR) or
+# http://127.0.0.1:8001 (inspector). The egress proxy is on :8889 but
+# isn't wired to actually filter anything in this dev setup.
+
+services:
+  asr:
+    build:
+      context: ..
+      dockerfile: containers/asr.Dockerfile
+    environment:
+      ASR_BACKEND: faster-whisper
+      LOCAL_SCRIBE_DISABLE_AUTH: "1"
+    ports:
+      - "8000:8000"
+
+  inspector:
+    build:
+      context: ..
+      dockerfile: containers/inspector.Dockerfile
+    environment:
+      LOCAL_SCRIBE_DISABLE_AUTH: "1"
+    ports:
+      - "8001:8001"
+
+  egress-proxy:
+    build:
+      context: ..
+      dockerfile: containers/egress-proxy.Dockerfile
+    ports:
+      - "8889:8889"

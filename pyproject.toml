@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local_scribe"
+version = "0.1.0"
+description = "Secure local call-recording transcription + summarisation sidecar for Char.app"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Security",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    # Pins are mirrored in requirements.txt for the same range; if you bump
+    # one, bump the other. See docs/ARCHITECTURE.md for why we keep both.
+    "fastapi>=0.110,<1.0",
+    "uvicorn[standard]>=0.27,<1.0",
+    "python-multipart>=0.0.9,<1.0",
+    "parakeet-mlx>=0.5,<1.0",
+    "faster-whisper>=1.1,<2.0",
+    "sherpa-onnx>=1.13,<2.0",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "requests>=2.31",
+    "huggingface_hub>=0.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.2",
+]
+
+[project.scripts]
+# CLI entry points land in Phase 9 of the refactor; declared empty for now
+# so `pip install -e .` doesn't trip on a missing module.
+
+[tool.setuptools.packages.find]
+include = ["local_scribe*"]
+exclude = ["tests*", "tools*", "docs*", "bin*", "containers*", "venv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The full suite hangs on aggregate runs due to cross-test state leakage
+# (a pre-existing issue, see .refactor-baseline-pytest.txt). Per-file
+# invocation (tools/run_tests.sh — added in Phase 8) is the supported path.
+# Defaults below apply to both modes.
+timeout = 30
+timeout_method = "signal"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

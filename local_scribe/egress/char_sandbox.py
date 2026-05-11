@@ -1,0 +1,287 @@
+"""macOS ``sandbox-exec`` profile for containing Char.
+
+Renders the SBPL (Sandbox Profile Language) file that
+:mod:`egress_proxy`'s containment layer relies on. The profile's
+shape is intentionally permissive *except* for network egress:
+
+* ``(allow default)`` — Char retains every other capability it has
+  outside the sandbox (file IO, mach IPC, the codesign syscalls,
+  exec, etc.). We are explicitly NOT trying to build a defense
+  against Char itself being malicious -- the threat model is "Char
+  is a normal Tauri app that happens to phone home for telemetry
+  and provider plugins, and we want to prevent that traffic without
+  affecting the rest of the machine."
+
+* ``(deny network*)`` then ``(allow ... 127.0.0.1/::1)`` — Char's
+  only network reach is loopback. Combined with the proxy on
+  ``127.0.0.1:8889`` (see :data:`firewall.PROXY_BIND`), every
+  outbound connection is forced through our policy. A Char build
+  that ignored ``HTTPS_PROXY`` would simply fail to reach anywhere.
+
+* Mach lookups stay open. macOS DNS resolution happens via
+  ``mDNSResponder`` over mach (not socket/53), so Char can still
+  resolve hostnames -- it just can't connect to the resolved IPs
+  unless they're loopback. Our proxy does the actual resolution
+  for permitted hosts on Char's behalf.
+
+About ``sandbox-exec``
+======================
+
+The ``/usr/bin/sandbox-exec`` binary is technically deprecated
+(Apple's docs marked it deprecated in 10.7), but it continues to
+ship with current macOS and is used by Apple's own daemons. There is
+no public successor for the CLI use case. The SBPL itself is the
+underlying ``Sandbox.kext`` policy engine that gates every sandboxed
+Apple-shipped app on macOS today; deprecating the loader binary does
+not affect the policy engine.
+
+If a future macOS removes ``sandbox-exec`` we have two options:
+
+  * Drop containment and rely solely on the proxy + HTTPS_PROXY env.
+    Bypass-able only if Char ignores HTTPS_PROXY, which it doesn't
+    today.
+  * Re-host the launcher in a tiny Swift CLI that calls
+    ``sandbox_init_with_extension(3)`` directly. Same kext, just a
+    different loader.
+
+We pick the runtime path in :func:`is_available`; the launcher in
+``run.sh`` falls back gracefully if sandbox-exec ever disappears.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+import textwrap
+from pathlib import Path
+from typing import Iterable
+
+from local_scribe.egress import firewall
+
+
+logger = logging.getLogger("local_scribe.char_sandbox")
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+
+def profile_path() -> Path:
+    """Where the rendered SBPL file lives. Under
+    ``~/.config/local_scribe/`` alongside the YubiKey + key-half
+    artefacts. Overridable via ``LOCAL_SCRIBE_CHAR_SANDBOX_PATH``
+    for tests."""
+    override = os.environ.get("LOCAL_SCRIBE_CHAR_SANDBOX_PATH")
+    if override:
+        return Path(override)
+    return Path.home() / ".config" / "local_scribe" / "char.sb"
+
+
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+# ---------------------------------------------------------------------------
+# Profile generator
+# ---------------------------------------------------------------------------
+
+
+def render_profile(
+    *,
+    proxy_host: str = firewall.PROXY_BIND,
+    proxy_port: int = firewall.PROXY_PORT,
+) -> str:
+    """Return the SBPL text we want to feed to ``sandbox-exec -f``.
+
+    The profile is intentionally short + comment-heavy so a
+    suspicious user can audit it by hand. Key invariants:
+
+      * ``(version 1)``           — required first form
+      * ``(allow default)``       — start permissive
+      * ``(deny network*)``       — then deny ALL network
+      * loopback re-allowed       — so Char can reach the proxy + our
+                                     ASR / Inspector / LM Studio
+                                     services on 127.0.0.1
+      * mach lookups untouched    — DNS via mDNSResponder still works
+
+    We accept the proxy host/port as parameters so a future change
+    to :data:`firewall.PROXY_PORT` doesn't require regenerating the
+    profile by hand.
+    """
+    # SBPL ``remote ip``/``local ip`` restrictions accept only
+    # ``"localhost:PORT"`` or ``"*:PORT"`` for the host portion -- a
+    # numeric ``127.0.0.1`` triggers
+    #   "host must be * or localhost in network address".
+    # ``localhost`` in this context resolves to both 127.0.0.1 and
+    # ::1 at policy-load time, so a single rule covers v4+v6
+    # loopback. The proxy port is parameterised but the actual
+    # allow rule has to cover ``*`` for loopback because Char also
+    # talks to LM Studio (:1234), our ASR (:8000), and the inspector
+    # (:8001) on loopback. Restricting to one port would break
+    # those.
+    return textwrap.dedent(f"""\
+        ;; local_scribe Char.app sandbox profile (managed; do not hand-edit)
+        ;;
+        ;; Generated by char_sandbox.render_profile().
+        ;; Audit: `cat ~/.config/local_scribe/char.sb`
+        ;;
+        ;; The goal of this profile is *narrow*: prevent Char from
+        ;; reaching any non-loopback host. Everything else (file IO,
+        ;; mach lookups, code-signing checks, IPC, exec) is left
+        ;; permissive because (a) Char is a complex Tauri/WebKit app
+        ;; that needs broad system access to function, and (b) the
+        ;; threat model addressed here is *outbound network leakage*,
+        ;; not arbitrary Char misbehaviour.
+        ;;
+        ;; The matching deny / allow pair below forces Char's only
+        ;; network path through the local_scribe egress proxy on
+        ;; {proxy_host}:{proxy_port}. The proxy then consults
+        ;; firewall.BLOCK_CATALOG to decide allow / deny per CONNECT
+        ;; hostname.
+        ;;
+        ;; macOS DNS resolution happens via mDNSResponder over mach,
+        ;; not over a socket on port 53, so denying network-outbound
+        ;; does NOT break getaddrinfo(). Char can resolve any
+        ;; hostname it wants -- it just can't connect to the result
+        ;; unless the result is loopback (i.e. our proxy).
+
+        (version 1)
+
+        ;; Start permissive: Char is a GUI app with broad system
+        ;; needs (Keychain, microphone, screen recording, file
+        ;; pickers, etc.). Locking those down is out of scope here.
+        (allow default)
+
+        ;; Deny ALL network egress. Network operations are NOT
+        ;; covered by ``allow default`` in SBPL -- they're a
+        ;; separate class -- so this is the actual policy gate.
+        (deny network-outbound)
+        (deny network-bind)
+
+        ;; ... then re-allow loopback (both v4 + v6 -- ``localhost``
+        ;; resolves to both at policy-load time) and unix sockets.
+        ;; Loopback is opened on all ports, not just the proxy port,
+        ;; because Char also talks to our ASR ({proxy_host}:8000),
+        ;; Inspector ({proxy_host}:8001), and LM Studio
+        ;; ({proxy_host}:1234). Restricting to {proxy_port} would
+        ;; break those.
+        (allow network-outbound (remote ip "localhost:*"))
+        (allow network-outbound (remote unix-socket))
+        (allow network-bind     (local  ip "localhost:*"))
+        (allow network-bind     (local  unix-socket))
+    """)
+
+
+def write_profile(*, path: Path | None = None,
+                  proxy_host: str = firewall.PROXY_BIND,
+                  proxy_port: int = firewall.PROXY_PORT) -> Path:
+    """Render and persist the profile. Idempotent: if the on-disk
+    contents already match what we'd render, no write happens (and
+    we don't bump the mtime). Returns the path."""
+    target = path or profile_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    text = render_profile(proxy_host=proxy_host, proxy_port=proxy_port)
+    if target.is_file():
+        try:
+            existing = target.read_text()
+        except OSError:
+            existing = None
+        if existing == text:
+            return target
+    target.write_text(text)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    logger.info("wrote sandbox profile to %s (%d bytes)",
+                target, len(text))
+    return target
+
+
+# ---------------------------------------------------------------------------
+# Runtime probes
+# ---------------------------------------------------------------------------
+
+
+def is_available() -> bool:
+    """``True`` if ``sandbox-exec`` is present and executable. False
+    on non-macOS or on a hypothetical future macOS that has removed
+    the CLI loader."""
+    return os.path.isfile(SANDBOX_EXEC) and os.access(SANDBOX_EXEC, os.X_OK)
+
+
+def validate_profile(path: Path | None = None) -> tuple[bool, str]:
+    """Smoke-test the profile by asking sandbox-exec to evaluate it
+    against a trivial ``/bin/true`` invocation. Returns
+    ``(ok, message)``. Used by doctor + by the launcher wrapper
+    before it actually launches Char (so a bad profile fails fast
+    with a useful diagnostic rather than letting Char start
+    half-sandboxed)."""
+    target = path or profile_path()
+    if not is_available():
+        return False, "sandbox-exec not available on this macOS"
+    if not target.is_file():
+        return False, f"profile missing at {target}"
+    try:
+        rc = subprocess.run(
+            [SANDBOX_EXEC, "-f", str(target), "/usr/bin/true"],
+            capture_output=True, text=True, timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"sandbox-exec invocation failed: {exc}"
+    if rc.returncode != 0:
+        return False, (
+            f"sandbox-exec exited rc={rc.returncode}: "
+            f"{rc.stderr.strip() or rc.stdout.strip() or '<no output>'}"
+        )
+    return True, "profile parses + applies cleanly"
+
+
+# ---------------------------------------------------------------------------
+# CLI surface (drives ./run.sh char sandbox …)
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys, json as _json
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print("usage: python -m char_sandbox "
+              "{render|write|validate|status}")
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "render":
+        print(render_profile(), end="")
+        return 0
+    if cmd == "write":
+        p = write_profile()
+        print(_json.dumps({"path": str(p)}))
+        return 0
+    if cmd == "validate":
+        ok, msg = validate_profile()
+        print(_json.dumps({"ok": ok, "message": msg}, indent=2))
+        return 0 if ok else 1
+    if cmd == "status":
+        target = profile_path()
+        info = {
+            "sandbox_exec_available": is_available(),
+            "profile_path": str(target),
+            "profile_present": target.is_file(),
+            "profile_size_bytes": (target.stat().st_size
+                                   if target.is_file() else 0),
+        }
+        if target.is_file():
+            ok, msg = validate_profile(target)
+            info["profile_valid"] = ok
+            info["profile_message"] = msg
+        print(_json.dumps(info, indent=2))
+        return 0
+    print(f"unknown subcommand: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

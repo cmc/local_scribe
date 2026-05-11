@@ -1,0 +1,13 @@
+{
+  "captured_at": "2026-05-11T02:47:40Z",
+  "viewport": "1440x900",
+  "demo_url": "http://127.0.0.1:8765",
+  "shots": [
+    {"file": "01-sessions-list.png",     "url": "http://127.0.0.1:8765/?tab=sessions",                                                 "caption": "Sessions tab — the card grid of every Char session on disk."},
+    {"file": "02-session-detail.png",    "url": "http://127.0.0.1:8765/?tab=sessions&session=demo-001-q1-product-review",              "caption": "A team-meeting session with per-speaker diarization + per-paragraph confidence."},
+    {"file": "03-customer-discovery.png","url": "http://127.0.0.1:8765/?tab=sessions&session=demo-002-customer-discovery",             "caption": "A 2-speaker customer-discovery session with the summary note rendered inline."},
+    {"file": "04-char-audit.png",        "url": "http://127.0.0.1:8765/?tab=char",                                                     "caption": "Char-audit tab — every setting we care about, OK / WARN / INFO."},
+    {"file": "05-config.png",            "url": "http://127.0.0.1:8765/?tab=config",                                                   "caption": "Config tab — ground-truth ~/.config/local_scribe/config.json with form-bound editing."},
+    {"file": "06-about.png",             "url": "http://127.0.0.1:8765/?tab=about",                                                    "caption": "About tab — what local_scribe is, what it isn't, and where its docs live."}
+  ]
+}

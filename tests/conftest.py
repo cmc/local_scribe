@@ -26,3 +26,22 @@ import os
 
 def pytest_configure(config):  # noqa: ARG001  (pytest hook signature)
     os.environ.setdefault("LOCAL_SCRIBE_DISABLE_AUTH", "1")
+    # Layer C (launch-session gate) is also disabled by default for
+    # the same reason: the legacy E2E suites pre-date it and don't
+    # mint a launch.lock. ``LaunchGateIntegrationTests`` (in
+    # ``test_launch_session.py``) and the auth integration suites
+    # re-enable it explicitly when they need to exercise the gate.
+    os.environ.setdefault("LOCAL_SCRIBE_DISABLE_LAUNCH_GATE", "1")
+    # Layer 0 — the SIP gate. The FastAPI service lifespans
+    # (asr_server, inspector_server) refuse to start when SIP is
+    # not fully enabled. CI machines and developer laptops may
+    # legitimately have SIP off (e.g. for kernel work), so we fake
+    # a "fully enabled" csrutil output by default. The dedicated
+    # SIP-check tests in ``test_sip_check.py`` exercise both
+    # directions explicitly by patching the env var. Tests that
+    # specifically want to see the gate REJECT can override the
+    # value in their own setUp.
+    os.environ.setdefault(
+        "LOCAL_SCRIBE_TEST_CSRUTIL_OUTPUT",
+        "System Integrity Protection status: enabled.\n",
+    )

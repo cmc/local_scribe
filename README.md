@@ -5,13 +5,15 @@ Drops in as a Deepgram-compatible endpoint behind [Char](https://char.com) and
 uses your local LM Studio + Qwen3 for note generation. Everything runs offline
 once the models are downloaded.
 
-> **Why Char?** Char is the **open-source**, local-first AI meeting notetaker —
-> source at [github.com/fastrepl/anarlog](https://github.com/fastrepl/anarlog)
-> (MIT licensed, ~8.4k stars), product page at [char.com](https://char.com).
-> Unlike closed-source SaaS notetakers like Granola, the entire client is code
-> you can read, fork, and self-host, and your audio/notes stay on disk as plain
-> markdown. `local_scribe` is the on-device transcription + summarization
-> backend that pairs with it — so the whole stack, app *and* models, is yours.
+> **What this actually is.** `local_scribe` aims to be a secure side-`char`
+> (sidecar — pun intended) to the
+> [Char](https://github.com/fastrepl/anarlog) project: a thin
+> privacy-and-security wrapper around an already-good open-source call
+> notetaker, so the recordings, transcripts, and summaries of your day
+> never leave the machine without a YubiKey tap saying so. It's a fun
+> weekend side project, it offers **no guarantees of any kind**, and
+> none of it has been audited by anyone but its author. Overkill?
+> Maybe — depends who you are.
 
 ```
                  ┌──────────────────────────────────────────────────────┐
@@ -41,10 +43,571 @@ once the models are downloaded.
        └──────────────────────────────────┘
 ```
 
+## Why this exists — the SaaS-AI default and the locally-controlled alternative
+
+The default way to use AI in 2026 is to hand your bytes to a
+vendor. **That's not a value judgment; it's the shape of the
+industry.** ChatGPT, Claude.ai, Copilot, Notion AI, Gemini, and
+their notetaker counterparts — [Granola](https://granola.ai),
+[Otter.ai](https://otter.ai), [Fireflies](https://fireflies.ai),
+[Fathom](https://fathom.video), [Read.ai](https://read.ai),
+[tl;dv](https://tldv.io), [Avoma](https://avoma.com), and so on —
+are all SaaS services. You give them your microphone feed, your
+calendar, your meeting transcripts, your summaries, the text of
+your follow-up emails, and you trust their public commitments
+about what happens to that data on the way through. Most of them
+are well-intentioned. Several of them publish thoughtful security
+white papers. None of them give you the actual primitives to
+verify, end-to-end, what they say they do.
+
+What you're trusting when you use a SaaS AI notetaker:
+
+- **The vendor's security posture.** Every well-known SaaS
+  product, including the big ones with serious security teams,
+  has had a meaningful incident over the last decade. Atlassian,
+  Okta, LastPass, MongoDB Atlas, Twilio, Slack, MailChimp — and
+  the smaller AI-tool category has had its share too. Breaches
+  are not hypothetical; they're a base-rate fact about running
+  any sufficiently large service.
+- **That the stated data-handling actually matches the running
+  code.** Privacy policies describe intent; they don't compile
+  into enforcement. There's no public-attestable bridge between
+  "we don't train on your data" in a Terms of Service and "the
+  actual production binary never sends a logging payload to a
+  training-pipeline endpoint." You can't audit it from outside.
+- **That the policy won't change.** Acquisition, pivot, new
+  investor, new CEO, new monetization model — every one of these
+  rewrites the data deal. A product you trusted when it was
+  funded by a privacy-aligned investor in year 1 is not
+  necessarily the same product when it's owned by a different
+  parent in year 4.
+- **The sub-processor chain.** Most AI-tool vendors don't run
+  their own inference. They route audio through one or more of
+  Deepgram / AssemblyAI / Rev.com for ASR, and one or more of
+  OpenAI / Anthropic / Azure OpenAI / Bedrock for the LLM. Each
+  is a separate trust boundary, governed by its *own* privacy
+  policy and *its own* sub-processors, and the chain is rarely
+  fully disclosed.
+- **The vendor's jurisdiction.** A US-based vendor is one
+  national-security-letter away from disclosing data without
+  notifying you. A vendor in any jurisdiction is one subpoena
+  away from disclosing it to a civil litigant. Whether or not
+  this matters to you depends on what your meetings cover; the
+  point is that the vendor, not you, is in the loop.
+- **Auto-update.** Even when the SaaS app is an "open-source
+  client" (the Char model), the client typically auto-updates,
+  and the next update can change the network surface, the
+  default provider list, the telemetry payload, or the meaning
+  of any toggle. Without a binary-pin on the client and an
+  outbound firewall around it, "open source" doesn't translate
+  into "the build running on my machine right now is the build I
+  audited."
+- **Tampering and supply-chain risk.** Each vendor depends on
+  hundreds of npm / pip / brew / Cargo packages, each with its
+  own maintainer set, each with its own credential hygiene.
+  Recent supply-chain incidents (`xz-utils`, the dependency-graph
+  attacks on `event-stream`, on `ua-parser-js`, on `coa`, on
+  `solana/web3.js`, on `@ctrl/tinycolor`, on `polyfill.io`) are
+  routine in modern software. A SaaS vendor inherits all of
+  these risks on your behalf, and you find out after the fact.
+
+None of those bullets says "SaaS-AI is bad". A small business
+without a dedicated security person, an individual user who
+doesn't want to think about key management, a team whose
+meetings are genuinely low-sensitivity — all of those are fine
+fits for SaaS-AI tools, and the vendors really are trying. The
+point of the list is that the trust model is **"we promise"**,
+not **"here are the primitives that make us promise-able"**, and
+a reader should be able to choose which trust model they accept.
+
+### What "locally-controlled" actually buys you
+
+`local_scribe` is the alternative for the user who wants to opt
+out of the promise-based model entirely. It is **not** a claim
+that local is automatically more secure than SaaS — local trades
+vendor-trust for self-trust, and self-trust has its own failure
+modes (you can lose a YubiKey, you can configure something wrong,
+you can be socially engineered, you become your own IT
+department). What local *does* give you is the ability to
+verify, on every start, that the trust statements you care about
+are true:
+
+- **A specific pinned Char.app build, not "whatever Char ships
+  next".** `char_integrity_gate` (see
+  [docs/CHAR_REVIEW.md](docs/CHAR_REVIEW.md) and
+  [SECURITY.md § Layer 4](SECURITY.md#layer-4--char-binary-integrity--side-load-detection))
+  refuses to run if Char's CDHash, Team ID, Bundle ID, or
+  linked-library prefix list has drifted from the baseline you
+  blessed. An auto-update doesn't slip past — it requires a
+  Touch ID + YubiKey re-bless before the next start succeeds.
+- **All inference local, full stop.** ASR is
+  [Parakeet-TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+  on MLX (default) or
+  [faster-whisper-large-v3-turbo](https://github.com/SYSTRAN/faster-whisper)
+  as a fallback. Summarisation is [Qwen3-30B-Instruct via LM
+  Studio](https://lmstudio.ai/models/qwen/qwen3-30b). Both
+  run on your machine. **There are no Deepgram / AssemblyAI /
+  OpenAI / Anthropic / Azure / Bedrock endpoints in the audio
+  path.** This is provable, not aspirational — see the next
+  bullet.
+- **An outbound firewall that enforces it.** Char runs inside a
+  `sandbox-exec` profile with `HTTPS_PROXY` pointed at our
+  local [`egress_proxy.py`](local_scribe/egress_proxy.py). Every
+  outbound connection Char attempts goes through the proxy,
+  which enforces a per-host allowlist defaulting to the loopback
+  ASR endpoint. Any non-allowlisted host returns 403 with a log
+  line surfaced in the inspector. So "everything stays local"
+  isn't a promise; it's a property the kernel + the proxy
+  enforce on every request, and any deviation shows up in the
+  log immediately. See [SECURITY.md § Defense layer 1](SECURITY.md#defense-layer-1--per-char-outbound-firewall).
+- **Operator-controlled keys.** The master key is reconstituted
+  from a Touch ID-gated Keychain item (`kc_half`) combined with
+  a YubiKey-PIV-wrapped age secret (`yk_half`). Per-service
+  bearer tokens are HKDF-derived from the master. No bytes of
+  the master key, ever, leave your machine. See [CRYPTO.md](CRYPTO.md)
+  and [SECURITY.md § Defense layer 2](SECURITY.md#defense-layer-2--option-c-split-key-touch-id--yubikey).
+  The forthcoming HSM path
+  ([docs/HARDWARE.md](docs/HARDWARE.md)) tightens this to "no
+  bytes of the master key, ever, appear in our Python heap"
+  — but even today's Keychain + YubiKey model already removes
+  any vendor from the custody chain.
+- **A documented threat model with a named adversary list.** The
+  [SECURITY.md](SECURITY.md) document walks through nine
+  defense layers, an explicit threat-model table, an "out of
+  scope" list of things we deliberately don't try to defend
+  against, and a self-attestation chapter that compares our
+  layers honestly against what macOS already does (so we're not
+  pretending to reinvent Gatekeeper). The whole point of writing
+  it down is that you can read it and disagree with our
+  assumptions. You cannot do that with a SaaS vendor's privacy
+  policy because there's no published threat model to disagree
+  with.
+- **No cloud, no sub-processors, no jurisdiction.** Char's
+  notes are on your disk, encrypted at rest in an APFS
+  AES-256 vault; the master key for that vault never leaves the
+  Keychain unless you provide both a Touch ID tap and a YubiKey
+  tap. There is no third party in the loop. There is no entity
+  to subpoena. There is no telemetry channel to disable. The
+  only thing leaving your machine during a Char session is
+  whatever Char's own UI explicitly does (calendar OAuth, etc.),
+  and that's gated by the egress proxy's allowlist.
+
+### Why this is even possible now
+
+A small but important point: `local_scribe` is feasible today and
+wasn't five years ago. The technological inflection point is
+real:
+
+- A 30B-parameter instruction-tuned LLM (Qwen3-30B-Instruct,
+  released July 2025) at Q5 quantisation fits in 22 GB and runs
+  at 30–50 tokens/second on an M-series laptop. In 2020 the
+  comparable quality bar required a >100B-parameter model on a
+  multi-GPU server.
+- A real streaming ASR (Parakeet-TDT 0.6B v3) ships an MLX
+  port that runs in real-time on Apple Silicon with a word error
+  rate competitive with cloud Deepgram. In 2020 the comparable
+  accuracy required a cloud round-trip.
+- Apple Silicon's unified memory architecture gives consumer
+  laptops the GPU-side memory budget that previously needed a
+  workstation GPU. The same model weights run on a laptop and
+  on a Mac Studio.
+
+So the framing "local is the privacy-preserving alternative to
+SaaS-AI" is only viable *because* the AI capability frontier has
+arrived at consumer hardware in the same window that the SaaS-AI
+industry has trained the world to hand its data away by default.
+It's a coincidence of timing, and it's a small window of
+opportunity to demonstrate that fully-locally-controlled AI
+tools can be good enough for daily use. That demonstration is
+what `local_scribe` is for.
+
+### What this is not
+
+To be clear about what this project *isn't* claiming:
+
+- It is **not** a critique of any specific vendor named above.
+  Granola, Otter.ai, Fireflies and the rest are real products
+  built by real engineers solving real problems. The
+  comparison is structural (SaaS trust model vs operator-trust
+  model), not editorial.
+- It is **not** a claim that you should never use SaaS-AI.
+  Plenty of meetings genuinely don't need this level of
+  protection. The right tool depends on the sensitivity of the
+  conversation.
+- It is **not** a claim of "we are more secure". Same threat-
+  modelled diligence on a SaaS service might be more secure
+  than this proof-of-concept; we're trading a vendor's
+  professional security team for our own scripts. What we're
+  trading *for* is verifiability, jurisdiction-elimination, and
+  end-to-end operator control.
+- It is **not** an "anti-cloud" stance more broadly. Cloud
+  infrastructure remains the right answer for vast classes of
+  workload. This is specifically about the audio + transcript +
+  summary path for one user's meetings on one user's machine.
+
+If you're the kind of operator for whom the trust-vendors model
+is unacceptable for your audio specifically — journalist with
+source meetings, lawyer with privileged calls, therapist with
+patient sessions, security researcher with vulnerability
+disclosures, executive with M&A discussions, individual user
+who simply doesn't want their voice in someone else's training
+pipeline — `local_scribe` is the alternative built for that
+threat model. If you're not that operator, a SaaS notetaker is
+probably the better tool for you.
+
+## Status — proof of concept
+
+`local_scribe` is a **proof-of-concept secure stack** for recording and
+transcribing calls (1:1s, customer interviews, internal meetings, sales
+calls) locally on a laptop, with a threat model strong enough to use in a
+daily workflow or a small-business setting. The goal is to demonstrate
+what a privacy-first, MFA-protected, locally-hosted note-taking pipeline
+can look like end-to-end — not to ship a polished 1.0 product. Treat the
+security primitives as production-grade-ish (extensively tested,
+threat-modeled, documented; see the test suite and
+[SECURITY.md](SECURITY.md)) and the UX as research-grade. None of this is
+audited by a third-party security firm. If you wouldn't trust a single-
+maintainer GitHub project with the recording of your salary
+negotiation, don't trust this one either — read the source first.
+
+### Why scaffold around Char rather than fork it?
+
+[Char](https://char.com) is the open-source, local-first AI meeting
+notetaker that already solves the hardest macOS plumbing on the client
+side: simultaneous system + microphone capture, a polished session UI, a
+note canvas, calendar integration, OAuth flows, Apple code signing,
+notarization, Tauri auto-update. The source is at
+[fastrepl/anarlog](https://github.com/fastrepl/anarlog) (MIT licensed,
+~8.4k stars). Unlike closed-source SaaS notetakers like Granola, the
+entire client is code you can read, fork, and self-host — and your audio
+and notes stay on disk as plain markdown.
+
+Rather than fork that engineering work, `local_scribe` **scaffolds
+around** the released Char binary:
+
+- The ASR server speaks Char's existing Deepgram / OpenAI "Custom
+  provider" wire format on `127.0.0.1` — no Char code changes needed,
+  we just configure it via its own `store.json`.
+- A local sandbox + CONNECT proxy restrict Char's outbound network to
+  loopback only, so the firewall is *per-Char* rather than machine-wide.
+- The encrypted vault relocates Char's `~/Library/Application
+  Support/hyprnote` data dir into an AES-256 sparse bundle, transparently
+  to Char.
+- A binary-integrity check ([`CHAR_REVIEW.md`](docs/CHAR_REVIEW.md)) baselines
+  Char's CDHash so a tampered or unexpected update is caught at startup
+  before any key is unlocked.
+
+**The Char team is welcome to adopt any of these controls upstream.**
+Every primitive — key splitting, vault, sandbox + proxy firewall, binary
+integrity baseline, SIP-gated unlock, the inspector UI, the typed-DELETE
+gate — is documented in plain English with the design rationale, threat
+model, and test coverage spelled out. See
+[SECURITY.md](SECURITY.md),
+[ARCHITECTURE.md](docs/ARCHITECTURE.md),
+[CHAR_REVIEW.md](docs/CHAR_REVIEW.md),
+[FORK_CONSIDERATIONS.md](docs/FORK_CONSIDERATIONS.md).
+
+### Threat model in one paragraph
+
+`local_scribe` treats the laptop it runs on as **potentially compromised
+in the future** and asks: can an attacker who lands a shell on this
+machine — or a forensic analyst who powers it off and clones the disk —
+read your call audio or transcripts? The design answer is **not without
+all three of:**
+
+1. **Something you have** — the *physical* enrolled YubiKey (the on-disk
+   `yk_half.age` is decryptable only by a YubiKey holding the right PIV
+   slot identity; an attacker without the hardware token sees only age-
+   encrypted ciphertext).
+2. **Something you have, and do** — a fresh *touch* on that YubiKey at
+   unlock time (`touch-policy=always`, no caching; every unlock requires
+   a new physical tap).
+3. **Something you know** — your macOS user password, which gated the
+   Touch ID enrolment that protects the Keychain half of the split key.
+
+That's MFA in the classical *something you have + something you know*
+sense, with an explicit physical-tap requirement layered on top so a
+remote attacker who somehow stole both halves still can't perform the
+unlock without being at the keyboard. On-disk audio + transcripts live
+inside an AES-256 sparse-bundle vault whose passphrase is HKDF-derived
+from `kc_half XOR yk_half`; the master key never persists outside
+process memory and is zeroized between operations. SIP must be enabled
+or `./run.sh start` refuses to launch — without SIP, a userspace process
+running as you could read the unlocked master key straight out of our
+heap via `task_for_pid()`. See [SECURITY.md](SECURITY.md) for the full
+per-adversary breakdown and
+[ARCHITECTURE.md § 4](docs/ARCHITECTURE.md#4-at-rest-encryption-designed)
+for the key + data graph.
+
+### Future direction — private-cloud transcription over Tailscale
+
+For teams that need bigger context windows than a MacBook can load —
+genuinely large meetings, multi-hour customer-research sessions, the
+ability to summarize across a quarter of calls at once — the same threat
+model extends naturally to **on-prem or private-cloud LLMs** without
+giving up the "audio never reaches a multi-tenant SaaS" property:
+
+- **[Tailscale](https://tailscale.com)** as the VPN substrate (peer-to-
+  peer WireGuard, no exit-node trust required, ACLs keyed on machine
+  identity + tags).
+- **AWS Nitro Enclaves** (or Apple Private Cloud Compute, or AMD SEV-SNP,
+  or Intel TDX) hosting the LLM inside a hardware-attested TEE, with the
+  cloud operator cryptographically unable to read prompts or
+  completions even with root on the host VM.
+- **CloudHSM / YubiHSM** for the cloud-side keys; mTLS auth keyed on the
+  *same* enrolled YubiKey so reaching the private LLM still requires a
+  physical tap by the human at the keyboard.
+
+This is **future work** — [`TODO.md`](TODO.md) §
+"Multi-tenant / org deployments" has a 350-line design exploration
+covering the trade-offs (HSM-mediated key release vs. confidential
+compute, self-hosted Mac Studio appliance vs. AWS Nitro, the full TEE
+attestation chain), and the final subsection sketches a Terraform
+manifest that would stand the AWS Nitro path up end-to-end. For now,
+everything runs on your laptop and the only network boundary that
+matters is your Wi-Fi router.
+
+### Skeptical? Good.
+
+If you're reading this and thinking *"wait, what about X?"* — that's
+the right reaction, and the answer is probably already in
+[`QUESTIONS.md`](docs/QUESTIONS.md). It's the FAQ for the questions a
+security or developer reader is most likely to have after skimming
+the rest, with honest answers (including a *"Where the criticism is
+fair"* section that lists 10 known weaknesses we haven't fixed yet).
+A few of the questions it addresses:
+
+- **"Why didn't you just fork Char and contribute upstream?"**
+  (Q1; tl;dr: we cost-modelled it, it's
+  [`FORK_CONSIDERATIONS.md`](docs/FORK_CONSIDERATIONS.md), the sidecar
+  wins on every dimension *except* compile-time capability removal.)
+- **"If my laptop is compromised, the master key is in process
+  memory after Touch ID + YubiKey, so what does the YubiKey
+  actually buy me?"** (Q7; tl;dr: pre-unlock confidentiality + per-
+  operation physical-presence proof, *not* post-unlock memory
+  isolation, which is why SIP is mandatory.)
+- **"`sandbox-exec` is Apple-deprecated; you're building on sand."**
+  (Q10; tl;dr: yes, acknowledged, the Network Extension is the
+  long-term answer, and the system-mode `/etc/hosts` fallback is
+  the defense-in-depth.)
+- **"Char launched from the Dock bypasses your firewall."**
+  (Q11; tl;dr: documented, prominent, and the same Network
+  Extension answer as Q10.)
+- **"CONNECT proxies don't see TLS — can't Char tunnel anything
+  out?"** (Q12; tl;dr: hostname-level enforcement is enough for
+  the threats we're targeting; the *strict allowlist* hardening
+  is a known migration.)
+- **"You talk about AWS Nitro + CloudHSM + Signal-style ratchets +
+  Tailscale + private-cloud LLM. None of that is built. Why is it
+  in the docs?"** (Q20; tl;dr: it's a design specification, not a
+  roadmap commitment, and writing the threat-model continuation
+  down lets a reader decide whether the trajectory matches their
+  needs.)
+
+22 questions across 6 categories, plus the self-critical list. If
+your question isn't there, file it — open a GitHub issue with
+`[question]` in the title and the answer will land in that file.
+
+## Security control coverage — Char alone vs. Char + `local_scribe`
+
+The table below summarises which security-relevant controls
+[**Char**](https://github.com/fastrepl/anarlog) ships with by default
+versus which ones `local_scribe` adds on top of it, **ordered by the
+severity of the risk if the control is missing**. Char is an excellent
+open-source notetaker — better than every closed-source SaaS competitor
+in the same category — and the rows below are *not* a knock on it; Char
+simply does not market itself as a security project. `local_scribe`
+exists to add the security posture for users who need one.
+
+**Legend.** ✅ control present and working as designed · ❌ control
+absent · ⚠️ control partial, user-configurable, or depends on a
+separate user action.
+
+| Risk if missing | Security control | Char alone | + `local_scribe` | Where in this repo |
+|---|---|:---:|:---:|---|
+| **Critical** — audio reaches a third-party STT API | STT endpoint forced to loopback `127.0.0.1` | ⚠️ user-selectable per provider; default is OpenAI cloud unless changed | ✅ enforced + audited every doctor pass + every inspector load | [`char_audit.py`](local_scribe/char/char_audit.py), [`asr_server.py`](local_scribe/asr/asr_server.py) |
+| **Critical** — recordings exfiltrated via crash / analytics SDK | No Sentry / PostHog / analytics SDK bundled in the binary | ❌ Tauri plugins for Sentry, PostHog, and an auto-updater ship enabled by default | ⚠️ we cannot *remove* the SDKs without forking (see [`FORK_CONSIDERATIONS.md`](docs/FORK_CONSIDERATIONS.md)); we *can* and do unreachable-by-default their destinations + flip the `analytics.Disabled` toggle | [`firewall.py`](local_scribe/egress/firewall.py), [`char_settings_writer.py`](local_scribe/char/char_settings_writer.py) |
+| **Critical** — Char dials out to external AI / telemetry hosts | Per-app outbound egress filter | ❌ no per-app egress control | ✅ `sandbox-exec` containment + local CONNECT proxy with blocklist; Dock/Spotlight bypass documented as known trade-off | [`egress_proxy.py`](local_scribe/egress/egress_proxy.py), [`char_sandbox.py`](local_scribe/egress/char_sandbox.py) |
+| **Critical** — auto-updater fetches + runs unexpected code | Updater channel blocked | ❌ updater plugin enabled by default | ✅ updater hostnames blackholed by firewall + Char version pinned by SHA256 in `run.sh` | [`firewall.py`](local_scribe/egress/firewall.py), [`CHAR_REVIEW.md`](docs/CHAR_REVIEW.md) |
+| **High** — stolen / imaged disk yields plaintext recordings | At-rest encryption of audio + transcripts | ⚠️ relies entirely on the user having FileVault on; transcripts and audio live as plaintext files in `~/Library/Application Support/hyprnote` | ✅ AES-256 sparse-bundle vault mounted only while running; ciphertext bands on unmount | [`vault.py`](local_scribe/security/vault.py), [`SECURITY.md` Defense layer 3](SECURITY.md#defense-layer-3--at-rest-encryption) |
+| **High** — encryption key auto-unlocks on login (no MFA) | Key material hardware-anchored | ⚠️ FileVault auto-unlock if the user enabled it that way | ✅ YubiKey PIV with `touch-policy=always` + Touch ID-gated Keychain half; XOR split-key construction | [`yubikey_backup.py`](local_scribe/security/yubikey_backup.py), [`secret_store.py`](local_scribe/security/secret_store.py), [`key_split.py`](local_scribe/security/key_split.py) |
+| **High** — single phishable factor unlocks transcripts | MFA for every key operation (something you have *and* know) | ❌ logging into the laptop is enough | ✅ Touch ID + fresh YubiKey tap per operation, no caching | [`key_lifecycle.py`](local_scribe/security/key_lifecycle.py), [`SECURITY.md` Defense layer 4](SECURITY.md#defense-layer-4--option-c-split-key-touch-id-and-yubikey) |
+| **High** — runs on an OS where userspace boundaries are off | System Integrity Protection check at startup | ❌ no SIP check | ✅ refuses to launch unless `csrutil status` reports fully enabled; no operator override | [`sip_check.py`](local_scribe/security/sip_check.py) |
+| **High** — tampered / swapped binary silently changes contract | Binary integrity check at every startup | ❌ Char does not self-baseline | ✅ CDHash of `Char.app` + script-integrity baseline of our own files, checked before any key unlocks | [`char_integrity.py`](local_scribe/char/char_integrity.py), [`script_integrity.py`](local_scribe/security/script_integrity.py) |
+| **High** — any local process can `curl` the loopback API and read transcripts | Inter-service bearer auth on every `/api/*` route | ❌ Char keeps the `sk-…` API key for its STT provider in `settings.json` as plaintext, and any local process can read it | ✅ HKDF-derived per-service token, never persisted, gates every gated route via FastAPI dependency + WebSocket handshake | [`service_auth.py`](local_scribe/security/service_auth.py), [`SECURITY.md` Defense layer 2](SECURITY.md#defense-layer-2--inter-service-authentication) |
+| **High** — settings drift silently re-routes audio to a cloud STT | Settings-contract enforcement | ❌ no runtime contract; Char will use whatever provider is configured | ✅ `char_audit.py` walks `settings.json` + `store.json` on every doctor pass and every inspector page load; any drift is loud | [`char_audit.py`](local_scribe/char/char_audit.py), [`SECURITY.md` Defense layer 5](SECURITY.md#defense-layer-5--char-settings-enforcement) |
+| **Medium** — destructive operations have no friction | Typed-confirm body on destructive endpoints | ❌ delete = click | ✅ server-side requires JSON body `{"confirm": "DELETE"}` on every destructive `/api/*` route; SPA modal is UX, server is the gate | [`inspector_server.py`](local_scribe/inspector/inspector_server.py), [`SECURITY.md` § typed-DELETE](SECURITY.md#defense-in-depth-typed-delete-confirm-body) |
+| **Medium** — re-transcription silently overwrites previous result | History of transcript revisions preserved | ❌ overwrite-in-place | ✅ `transcript.json` auto-archived to `<session>/.local_scribe_history/<ts>_<sha7>.json` before every overwrite | [`transcript_history.py`](local_scribe/inspector/transcript_history.py) |
+| **Medium** — stolen bearer / API key is valid until manually rotated | One-command key rotation that invalidates *every* derived token | ❌ no concept | ✅ `./run.sh key rotate` regenerates the master and re-derives every per-service token in lockstep | [`key_lifecycle.py`](local_scribe/security/key_lifecycle.py) |
+| **Medium** — both factors lost ⇒ permanent data loss | Disaster-recovery escrow without trusting a vendor | ❌ no key management | ✅ optional passphrase-encrypted `age` copy of the master at install; passphrase read from `/dev/tty`, never logged | [`disaster_recovery.py`](local_scribe/security/disaster_recovery.py), [`KEY_SAFETY.md`](docs/KEY_SAFETY.md) |
+| **Medium** — destructive key op leaves no recovery path | Pre-flight snapshots before every destructive key operation | ❌ no key management | ✅ every `rotate` / `init --force` / `dr-restore` / `add-yubikey` / `destroy` writes a timestamped snapshot first; reversible until explicitly pruned | [`key_safety.py`](local_scribe/security/key_safety.py) |
+| **Medium** — no visibility into what's actually on disk | Auditable inspector with a typed API | ⚠️ Char has its own settings UI but no "show me everything stored, by session, with audio + transcript + history" view | ✅ loopback inspector with session grid, audio player, diarized transcript, char-audit, config editor | [`inspector_server.py`](local_scribe/inspector/inspector_server.py) |
+| **Medium** — install scripts modified post-install run silently | Operator-script integrity baseline | ❌ N/A | ✅ `script_integrity.py` baselines `run.sh` and the demo / capture scripts; tamper detection fires before key ops | [`script_integrity.py`](local_scribe/security/script_integrity.py) |
+| **Low** — fake / malicious binary impersonates Char | Code-signing + notarisation of the upstream binary | ✅ signed by Fastrepl (Team ID `6SLY7V277V`), notarised, hardened-runtime, stapled ticket | ✅ Char DMG SHA256 pinned in `run.sh` *before* `cp -R` to `/Applications` | [`run.sh`](run.sh), [`CHAR_REVIEW.md`](docs/CHAR_REVIEW.md) |
+| **Low** — covert recording mode hidden from the user | Visible recording indicator while capturing | ✅ Char shows it | ✅ we inherit Char's behaviour and don't disable it; [`LEGAL.md` § 2](LEGAL.md#2-our-position-on-recording-without-consent) explicitly forbids forking to remove it | (Char UI behaviour) |
+| **Low** — no published security stance | Documented threat model + per-adversary defenses | ❌ Char does not publish a formal threat model | ✅ `SECURITY.md` per-adversary breakdown + `ARCHITECTURE.md` § 14 threat-model diagram + `QUESTIONS.md` self-criticism appendix | [`SECURITY.md`](SECURITY.md), [`QUESTIONS.md`](docs/QUESTIONS.md) |
+| **Low** — covert recording endorsed in practice | Documented ethical stance against recording without consent | ❌ no published stance | ✅ [`LEGAL.md` § 2](LEGAL.md#2-our-position-on-recording-without-consent) explicitly refuses to endorse covert recording for any reason | [`LEGAL.md`](LEGAL.md) |
+
+### How to read this table
+
+- **Char's column is not a list of bugs.** It's the baseline a privacy-
+  aware notetaker reaches without explicitly positioning itself as a
+  security product. Compared to closed-source SaaS notetakers
+  (Granola, Otter, Fireflies, Notion AI), every Char ✅ in the table
+  is already an *improvement* — the entire client is auditable code,
+  audio and notes stay on disk as plain markdown, and the recording
+  indicator is visible. `local_scribe` is the next ratchet up from
+  that baseline.
+- **The ⚠️ rows are the ones to read carefully.** They mean *"the
+  control is partial or depends on the user doing the right thing."*
+  In the Char column, ⚠️ almost always means "the user can configure
+  this safely, but the default isn't safe and there's no audit." In
+  the `local_scribe` column, ⚠️ almost always means "we cannot remove
+  the underlying capability without forking, so we constrain it
+  instead — see [`FORK_CONSIDERATIONS.md`](docs/FORK_CONSIDERATIONS.md) for
+  the trade-off."
+- **Every ✅ in the `local_scribe` column is one of the modules listed
+  in [§ "What's in here"](#whats-in-here)**. The "Where in this repo"
+  column points at it directly.
+- **Everything in this table is also a [`QUESTIONS.md`](docs/QUESTIONS.md)
+  entry waiting to be poked at.** The self-criticism appendix at the
+  bottom of `QUESTIONS.md` lists the rows we *know* are weakest
+  (Dock-launch bypass on the firewall row, `sandbox-exec` deprecation
+  risk, lack of third-party audit). If you find another, please file
+  an issue.
+- **The two integrity rows ("tampered / swapped binary" and
+  "install scripts modified post-install") may be deprecated by a
+  future trusted execution environment.** The
+  [`script_integrity.py`](local_scribe/security/script_integrity.py)
+  and operator-HMAC mechanisms backing those rows are software-only
+  stand-ins for the hardware-rooted remote attestation we'd run if
+  Apple Silicon exposed one to userspace. macOS has no equivalent
+  of TPM-style remote attestation today, but
+  [Private Cloud Compute](https://security.apple.com/documentation/private-cloud-compute/)
+  demonstrates Apple can build attestable enclaves.   If/when an
+  equivalent surface lands on the local Mac, these rows simplify
+  to a single hardware-attestation check. Until then, hash-on-disk
+  + operator HMAC is the best userspace approximation. Full
+  framing: [SECURITY.md § "Future direction — trusted execution
+  environment"](SECURITY.md#future-direction--trusted-execution-environment).
+  The complementary path — moving the LLM-side services onto a
+  separate compute box that *does* expose hardware attestation
+  (AMD SEV-SNP or Intel TDX), with key custody on a YubiHSM 2 —
+  is explored end-to-end in
+  [docs/HARDWARE.md](docs/HARDWARE.md). It compares the
+  pragmatic Mac Studio + YubiHSM 2 path against the strongest
+  bare-metal SEV-SNP path against everything in between, with a
+  decision tree by use case + budget.
+- **Yes, macOS already runs Gatekeeper + XProtect + notarization.**
+  We layer our own integrity checks on top anyway, because Apple's
+  stack answers "is this binary signed by *someone* Apple
+  recognises?" — not the questions we actually care about, which
+  are "is this *the specific* Char.app the operator audited",
+  "did anything change since the last start", and "was the
+  pinned configuration approved by the operator's YubiKey?".
+  Gatekeeper runs **once** per quarantine xattr; we re-verify on
+  every `./run.sh start`. Notarization accepts *any* validly
+  signed build from Char.dev; we pin to one specific CDHash.
+  XProtect catches *known* malware; we catch *any* drift from
+  the blessed state. Full pro / con accounting (including the
+  honest costs — maintenance overhead, false-positive rate,
+  performance cost of the start-time hash) is in
+  [SECURITY.md § "Self-attestation — why we layer integrity
+  checks on top of macOS's built-ins"](SECURITY.md#self-attestation--why-we-layer-integrity-checks-on-top-of-macoss-built-ins).
+
+## Screenshots
+
+The inspector is a small loopback web UI (`inspector_server.py`) over
+the data Char already collects, plus our config + Char-audit + key
+diagnostics. Captured against a **disposable demo dataset**
+(`tools/seed_demo.py`) — every name, transcript, and note in these
+screenshots is synthetic. Reproduce them yourself with two commands
+(see § "Run the inspector demo + reproduce these screenshots" below).
+
+### Sessions tab — the card grid of every session on disk
+
+![Sessions tab — five demo sessions: a team meeting, a customer-discovery call, a 1:1, an all-hands, and a sales call.](docs/screenshots/01-sessions-list.png)
+
+The top-bar status pills (`ASR down · LM Studio up · Char 1 warn`)
+show the live state of the data plane; here `ASR down` is expected
+because the demo inspector runs alone — `./run.sh start` would bring
+ASR up alongside it.
+
+### Session detail — diarised transcript, speaker airtime, audio scrubber
+
+![Session detail — Q1 product review, four detected speakers, per-paragraph speaker labels, inline audio player, and a "Speaker airtime" footnote explaining how the clustering works.](docs/screenshots/02-session-detail.png)
+
+Every paragraph carries a mean per-cluster confidence (joined back
+from `local_scribe.diarization.word_confidences` in `transcript.json`).
+The `Speaker airtime` footer is the same explanation the
+`transcript.txt` download embeds at the bottom of the plain-text
+export, so the UI and the file agree.
+
+### Char audit — every setting we care about, OK / WARN / INFO
+
+![Char audit tab — five OK checks plus one WARN for the firewall not being installed (expected on the demo). Each row shows current vs. expected with a note explaining the privacy implication.](docs/screenshots/04-char-audit.png)
+
+The audit reads Char's `settings.json` + `store.json`, checks the
+four "is Char pointed at our local shim?" keys, the PostHog kill
+switch, and whether the outbound firewall is installed. The
+`Run configure-char` button is the one-click fix for any drift —
+calls into the same code path as `./run.sh configure-char` but
+through the inspector's auth-gated POST endpoint.
+
+### Config tab — `~/.config/local_scribe/config.json` with form-bound editing
+
+![Config tab — every typed field of config.json rendered as a form, with hints next to network fields and a save / reset pair at the bottom. Saving writes a timestamped backup before overwriting.](docs/screenshots/05-config.png)
+
+The save handler round-trips through `config.validate()` so a
+malformed save returns a 400 instead of corrupting the file; the
+hint under `asr.bind` is the kind of small UX nudge worth pointing
+at — every loopback-vs-LAN config gets a one-line explanation
+inline.
+
+### Run the inspector demo + reproduce these screenshots
+
+```bash
+# 1. Seed an isolated Char data dir at ~/.cache/local_scribe-demo/
+python3 tools/seed_demo.py --clean
+
+# 2. Start the demo inspector on a separate port (8765 by default).
+#    No Touch ID / YubiKey prompt: the demo uses LOCAL_SCRIBE_DISABLE_AUTH
+#    and is deliberately walled off from your real config + Char data.
+./tools/run_demo.sh start
+
+# 3. Open in any browser
+open http://127.0.0.1:8765/
+
+# 4. (optional) regenerate all six PNGs under docs/screenshots/
+./tools/capture_screenshots.sh
+
+# 5. When done
+./tools/run_demo.sh stop
+```
+
+The demo runner sets:
+
+- `LOCAL_SCRIBE_DISABLE_AUTH=1` — skip the HKDF bearer-token gate,
+- `LOCAL_SCRIBE_TEST_CSRUTIL_OUTPUT="System Integrity Protection status: enabled."`
+  — pretend SIP is enabled (the real `./run.sh start` correctly
+  *refuses* to start without it; the test hook is here just so the
+  demo works on dev machines with SIP disabled),
+- `LOCAL_SCRIBE_CONFIG_DIR=~/.cache/local_scribe-demo/config` — fully
+  isolated config so the demo cannot read or write your real
+  `~/.config/local_scribe/`,
+- `LOCAL_SCRIBE_CHAR_DATA_DIR=~/.cache/local_scribe-demo/hyprnote` —
+  fully isolated Char data so the demo cannot read or write your
+  real `~/Library/Application Support/hyprnote/`.
+
+**None of these bypasses are honoured by the production `./run.sh
+start` path.** They are test/CI hooks that live in the codebase
+specifically so the demo + the test suite + headless-screenshot
+tooling can drive the surface without forging a YubiKey tap.
+
 ## Architecture diagrams
 
 Every major flow in this codebase has a Mermaid diagram in
-[`ARCHITECTURE.md`](ARCHITECTURE.md). **30 diagrams** total, split
+[`ARCHITECTURE.md`](docs/ARCHITECTURE.md). **30 diagrams** total, split
 into top-level flows (Part I) and reference / internals (Part II).
 GitHub renders them inline, so the file is a clickable map of the
 system.
@@ -53,41 +616,41 @@ system.
 
 | # | diagram | when you want it |
 |---|---|---|
-| 1 | [System overview](ARCHITECTURE.md#1-system-overview) | one-screen picture of Char + ASR + LM Studio + inspector + firewall |
-| 2 | [Component dependencies](ARCHITECTURE.md#2-component-dependencies) | which Python module imports which |
-| 3 | [Bootstrap flow](ARCHITECTURE.md#3-bootstrap-flow) | what the 7 numbered steps of `./run.sh bootstrap` actually do |
-| 4 | [At-rest encryption (designed)](ARCHITECTURE.md#4-at-rest-encryption-designed) | full key + data graph (Keychain → MasterKey → HKDF tokens → vault → YubiKey backup) |
-| 5 | [Service authentication](ARCHITECTURE.md#5-service-authentication-hkdf-tokens) | how a Char "Generate" click winds up authenticated against the ASR server |
-| 6 | [Outbound network firewall](ARCHITECTURE.md#6-outbound-network-firewall) | which Char telemetry / providers / cloud hosts get blackholed |
-| 7 | [Char privacy audit](ARCHITECTURE.md#7-char-privacy-audit) | what `./run.sh doctor` actually checks about Char's settings |
-| 8 | [Live transcription](ARCHITECTURE.md#8-live-transcription-deepgram-shape) | Deepgram-shape WS flow while recording |
-| 9 | [Batch transcription](ARCHITECTURE.md#9-batch-transcription-openai-shape) | OpenAI-shape SSE flow for "Generate" on a finished session |
-| 10 | [Diarization pipeline](ARCHITECTURE.md#10-diarization-pipeline) | VAD → segmentation → embeddings → silhouette-validated clustering |
-| 11 | [Transcript history lifecycle](ARCHITECTURE.md#11-transcript-history-lifecycle) | how retranscriptions archive the previous result |
-| 12 | [Inspector UI flow](ARCHITECTURE.md#12-inspector-ui-flow) | cookie auth → sessions list → downloads → deletes |
-| 13 | [Destructive-action confirmation](ARCHITECTURE.md#13-destructive-action-confirmation-typed-delete) | the typed-DELETE modal shared by audio + history delete |
-| 14 | [Threat model × defence layers](ARCHITECTURE.md#14-threat-model--defence-layers) | which adversary tier is mitigated by which control |
-| 15 | [Vault & key lifecycle](ARCHITECTURE.md#15-vault--key-lifecycle) | full state machine for the master key (generate → rotate → backup → restore → lose) |
+| 1 | [System overview](docs/ARCHITECTURE.md#1-system-overview) | one-screen picture of Char + ASR + LM Studio + inspector + firewall |
+| 2 | [Component dependencies](docs/ARCHITECTURE.md#2-component-dependencies) | which Python module imports which |
+| 3 | [Bootstrap flow](docs/ARCHITECTURE.md#3-bootstrap-flow) | what the 7 numbered steps of `./run.sh bootstrap` actually do |
+| 4 | [At-rest encryption (designed)](docs/ARCHITECTURE.md#4-at-rest-encryption-designed) | full key + data graph (Keychain → MasterKey → HKDF tokens → vault → YubiKey backup) |
+| 5 | [Service authentication](docs/ARCHITECTURE.md#5-service-authentication-hkdf-tokens) | how a Char "Generate" click winds up authenticated against the ASR server |
+| 6 | [Outbound network firewall](docs/ARCHITECTURE.md#6-outbound-network-firewall) | which Char telemetry / providers / cloud hosts get blackholed |
+| 7 | [Char privacy audit](docs/ARCHITECTURE.md#7-char-privacy-audit) | what `./run.sh doctor` actually checks about Char's settings |
+| 8 | [Live transcription](docs/ARCHITECTURE.md#8-live-transcription-deepgram-shape) | Deepgram-shape WS flow while recording |
+| 9 | [Batch transcription](docs/ARCHITECTURE.md#9-batch-transcription-openai-shape) | OpenAI-shape SSE flow for "Generate" on a finished session |
+| 10 | [Diarization pipeline](docs/ARCHITECTURE.md#10-diarization-pipeline) | VAD → segmentation → embeddings → silhouette-validated clustering |
+| 11 | [Transcript history lifecycle](docs/ARCHITECTURE.md#11-transcript-history-lifecycle) | how retranscriptions archive the previous result |
+| 12 | [Inspector UI flow](docs/ARCHITECTURE.md#12-inspector-ui-flow) | cookie auth → sessions list → downloads → deletes |
+| 13 | [Destructive-action confirmation](docs/ARCHITECTURE.md#13-destructive-action-confirmation-typed-delete) | the typed-DELETE modal shared by audio + history delete |
+| 14 | [Threat model × defense layers](docs/ARCHITECTURE.md#14-threat-model--defense-layers) | which adversary tier is mitigated by which control |
+| 15 | [Vault & key lifecycle](docs/ARCHITECTURE.md#15-vault--key-lifecycle) | full state machine for the master key (generate → rotate → backup → restore → lose) |
 
 **Part II — deep dives (CLIs, APIs, internals, data shapes)**
 
 | # | diagram | when you want it |
 |---|---|---|
-| 16 | [`./run.sh` subcommand map](ARCHITECTURE.md#16-runsh-subcommand-map) | which subcommand maps to which handler / Python module |
-| 17 | [`./run.sh start` orchestration](ARCHITECTURE.md#17-runsh-start-orchestration) | full start sequence with timeouts and bail points |
-| 18 | [`./run.sh stop` orchestration](ARCHITECTURE.md#18-runsh-stop-orchestration) | shutdown sequence (and why LM Studio is intentionally left alive) |
-| 19 | [`transcribe_file.py` flow](ARCHITECTURE.md#19-transcribe_filepy-flow) | the manual one-shot CLI: cache → ASR → LLM → markdown |
-| 20 | [`redo_session.py` flow](ARCHITECTURE.md#20-redo_sessionpy-flow) | re-running ASR + diarization on an existing Char session |
-| 21 | [ASR HTTP API surface](ARCHITECTURE.md#21-asr-http-api-surface) | every route, its contract, its response shape |
-| 22 | [Inspector HTTP API surface](ARCHITECTURE.md#22-inspector-http-api-surface) | same for the inspector |
-| 23 | [Touch ID Swift helper subcommands](ARCHITECTURE.md#23-touch-id-swift-helper-subcommands) | `bin/touchid-keychain`'s 4 subcommands and stdin/stdout contracts |
-| 24 | [HKDF-SHA256 derivation visual](ARCHITECTURE.md#24-hkdf-sha256-derivation-visual) | master key → salt + info → bearer token, step by step |
-| 25 | [age + YubiKey PIV decryption chain](ARCHITECTURE.md#25-age--yubikey-piv-decryption-chain) | what happens inside `age -d -i identity backup.age` |
-| 26 | [Char data directory layout](ARCHITECTURE.md#26-char-data-directory-layout) | filesystem tree of `~/Library/Application Support/hyprnote/` |
-| 27 | [Transcript JSON data model](ARCHITECTURE.md#27-transcript-json-data-model) | the shape `transcript.json` carries on disk |
-| 28 | [LM Studio summary flow](ARCHITECTURE.md#28-lm-studio-summary-flow) | finished transcript → Qwen → structured markdown sections |
-| 29 | [Char telemetry channels (3)](ARCHITECTURE.md#29-char-telemetry-channels-3-separate-concerns) | Sentry / PostHog / auto-updater and which control catches each |
-| 30 | [Key rotation flow](ARCHITECTURE.md#30-key-rotation-flow) | `./run.sh key rotate` — invalidate every derived token in one shot |
+| 16 | [`./run.sh` subcommand map](docs/ARCHITECTURE.md#16-runsh-subcommand-map) | which subcommand maps to which handler / Python module |
+| 17 | [`./run.sh start` orchestration](docs/ARCHITECTURE.md#17-runsh-start-orchestration) | full start sequence with timeouts and bail points |
+| 18 | [`./run.sh stop` orchestration](docs/ARCHITECTURE.md#18-runsh-stop-orchestration) | shutdown sequence (and why LM Studio is intentionally left alive) |
+| 19 | [`transcribe_file.py` flow](docs/ARCHITECTURE.md#19-transcribe_filepy-flow) | the manual one-shot CLI: cache → ASR → LLM → markdown |
+| 20 | [`redo_session.py` flow](docs/ARCHITECTURE.md#20-redo_sessionpy-flow) | re-running ASR + diarization on an existing Char session |
+| 21 | [ASR HTTP API surface](docs/ARCHITECTURE.md#21-asr-http-api-surface) | every route, its contract, its response shape |
+| 22 | [Inspector HTTP API surface](docs/ARCHITECTURE.md#22-inspector-http-api-surface) | same for the inspector |
+| 23 | [Touch ID Swift helper subcommands](docs/ARCHITECTURE.md#23-touch-id-swift-helper-subcommands) | `bin/touchid-keychain`'s 4 subcommands and stdin/stdout contracts |
+| 24 | [HKDF-SHA256 derivation visual](docs/ARCHITECTURE.md#24-hkdf-sha256-derivation-visual) | master key → salt + info → bearer token, step by step |
+| 25 | [age + YubiKey PIV decryption chain](docs/ARCHITECTURE.md#25-age--yubikey-piv-decryption-chain) | what happens inside `age -d -i identity backup.age` |
+| 26 | [Char data directory layout](docs/ARCHITECTURE.md#26-char-data-directory-layout) | filesystem tree of `~/Library/Application Support/hyprnote/` |
+| 27 | [Transcript JSON data model](docs/ARCHITECTURE.md#27-transcript-json-data-model) | the shape `transcript.json` carries on disk |
+| 28 | [LM Studio summary flow](docs/ARCHITECTURE.md#28-lm-studio-summary-flow) | finished transcript → Qwen → structured markdown sections |
+| 29 | [Char telemetry channels (3)](docs/ARCHITECTURE.md#29-char-telemetry-channels-3-separate-concerns) | Sentry / PostHog / auto-updater and which control catches each |
+| 30 | [Key rotation flow](docs/ARCHITECTURE.md#30-key-rotation-flow) | `./run.sh key rotate` — invalidate every derived token in one shot |
 
 ## Privacy and data locality
 
@@ -96,6 +659,19 @@ summary lives only on your laptop's disk, processed by models that run
 locally on Apple Silicon. There is no "send-to-cloud" toggle hiding
 somewhere that could flip on. Once `bootstrap` finishes pulling code
 and models, you can disable Wi-Fi and the pipeline keeps working.
+
+> **Hard prerequisite: System Integrity Protection must be fully
+> enabled.** `local_scribe` refuses to start (no operator override)
+> on any macOS host where `csrutil status` reports anything other
+> than `enabled.`. Without SIP, the kernel can't enforce the
+> user-space process boundaries every other defense in the project
+> relies on — `task_for_pid()`, `DYLD_INSERT_LIBRARIES`, `dtrace
+> -p`, replacing `/usr/bin/codesign`, NVRAM-set `boot-args` — and
+> the master key in our process memory becomes trivially
+> exfiltrable. Verify with `csrutil status` (or `./venv/bin/python
+> -m sip_check status`); fix by booting to Recovery, running
+> `csrutil enable`, and rebooting. Full rationale:
+> [SECURITY.md § Defense layer 0](SECURITY.md#defense-layer-0--system-integrity-protection-mandatory).
 
 ### What stays local
 
@@ -169,7 +745,7 @@ Being honest about the parts of the stack that aren't ours:
   doesn't transmit your chat content. Disabling LM Studio's telemetry
   by default at bootstrap is on the [TODO](TODO.md).
 - **Char.app is open source** ([source](https://github.com/fastrepl/anarlog),
-  MIT-licensed). The full audit lives in [CHAR_REVIEW.md](CHAR_REVIEW.md);
+  MIT-licensed). The full audit lives in [CHAR_REVIEW.md](docs/CHAR_REVIEW.md);
   the short version: the data plane (audio / transcripts / notes) stays
   local, but Char ships with **Sentry crash reporting and PostHog product
   analytics enabled by default**, plus a Tauri auto-updater that polls
@@ -365,7 +941,7 @@ It does **not** defend against:
 - An attacker who has compromised your user account *and* successfully
   prompts Touch ID by impersonating one of our binaries. macOS doesn't
   pin the prompt to a specific process. This is the soft underbelly
-  of any "TouchID-gated Keychain item" — defence-in-depth needs full
+  of any "TouchID-gated Keychain item" — defense-in-depth needs full
   app sandboxing, which we don't have on a non-Mac-App-Store install.
 - An attacker with root. Root reads everything.
 
@@ -376,29 +952,90 @@ log a loud warning on startup when this is active. Never set this in
 production; only used for the pre-auth-era test suite and for
 unattended bootstrap automation.
 
+#### Dev mode — explicit, loud SIP-gate bypass for development
+
+`LOCAL_SCRIBE_DEV_MODE=1` (or `./run.sh start --dev`) is the one
+documented operator override of the System Integrity Protection
+gate. Production operators must never set it. Concretely it lets
+the pipeline start on a host where SIP is off, partially off, or
+unverifiable — at the cost of the kernel boundary that normally
+keeps the reconstituted master key out of cohabiting processes'
+heaps.
+
+The bypass surfaces on every UI:
+
+- `./run.sh sip_gate` prints a coloured `[DEV MODE] sip_gate
+  bypassed` line on every gated verb.
+- `./run.sh doctor` shows a four-line red block at the top of
+  its output.
+- `./run.sh status` and `python -m local_scribe status` print a
+  `[DEV MODE]` marker above the service table.
+- The ASR + Inspector services emit the full red banner once per
+  process to their log + a `WARNING`-level log line.
+- The inspector web UI renders a **sticky, non-dismissible red
+  banner across the top of every page**, pulsing slowly,
+  driven by the unauthenticated `GET /api/dev_mode/status`
+  endpoint (so the banner shows even on the `/auth`
+  cold-landing view before any token is typed in).
+
+Dev mode bypasses *only* the SIP gates. Every other layer
+(script integrity, Char integrity, pinned-config HMAC,
+service-auth bearer tokens, master-key unlock via Touch ID +
+YubiKey) still applies in full. The full threat-model walkthrough
+(what dev mode actually costs you, what the strict-no-matter-what
+caller is, and how to exit dev mode) is in [SECURITY.md § 'Dev
+mode'](SECURITY.md#dev-mode--explicit-sip-bypass-for-development).
+
 #### Threat-model summary
 
 The full table — assets, adversaries, capabilities — lives in
-[CHAR_REVIEW.md § Threat model](CHAR_REVIEW.md#threat-model), and
+[CHAR_REVIEW.md § Threat model](docs/CHAR_REVIEW.md#threat-model), and
 the cross-layer security posture document is
 [SECURITY.md](SECURITY.md).
 
-### Outbound firewall
+### Outbound firewall (per-Char, by default)
 
 Loopback + bearer-token auth defends our *own* services. The
-**outbound** problem is different: Char and LM Studio also have
-their own opinions about who they should phone home to. Char in
-particular has three always-on channels with no in-app toggle — its
-Sentry DSN (panic + 100%-rate tracing), the Tauri auto-updater
-(`desktop2.hyprnote.com` proxied through Scarf), and the Sentry
-browser CDN — plus a long catalog of external STT/LLM provider plugins
-(`api.openai.com`, `api.deepgram.com`, `api.anthropic.com`, …) that
-a settings drift could silently re-enable.
+**outbound** problem is different: Char has three always-on channels
+with no in-app toggle — its Sentry DSN (panic + 100%-rate tracing),
+the Tauri auto-updater (`desktop2.hyprnote.com` proxied through
+Scarf), and the Sentry browser CDN — plus a long catalog of external
+STT/LLM provider plugins (`api.openai.com`, `api.deepgram.com`,
+`api.anthropic.com`, …) that a settings drift could silently
+re-enable.
 
-`local_scribe` ships an opt-in `/etc/hosts` block-list manager that
-blackholes the lot. The default catalog catches every host with no
-in-app toggle, plus every external STT/LLM provider Char ships
-plugins for. Categories:
+#### Why a custom proxy?
+
+macOS doesn't ship a CLI-installable per-app outbound firewall.
+
+- The **macOS Application Firewall** (System Settings → Network →
+  Firewall) is **inbound-only**.
+- **`pf`** supports per-user rules but not per-app — Apple's port
+  stripped FreeBSD's `pid` / `binary` keywords.
+- **Network Extension** (`NEContentFilterProvider`, what Little
+  Snitch / LuLu use) is the right answer, but it requires an
+  Apple-granted entitlement that an open-source repo can't ship.
+- **`sandbox-exec`** can deny network egress but only by IP, not
+  hostname (DNS rotation defeats hostname pins).
+
+So we compose the two primitives Apple **does** give us into a
+per-Char egress filter:
+
+1. **Containment** — `sandbox-exec` restricts Char's network reach to
+   loopback only.
+2. **Policy** — Char's `HTTPS_PROXY` env var points at a local
+   asyncio CONNECT proxy that consults `firewall.BLOCK_CATALOG` and
+   refuses blocked hostnames with `403`.
+
+Together, Char's only network path is the local proxy, and the
+proxy enforces our hostname-level allow/deny rules. **Other apps on
+the same Mac are completely unaffected.**
+
+This is the **default**. The legacy machine-wide `/etc/hosts` mode
+is still available as `--mode system` for operators who explicitly
+want it.
+
+#### Block catalog
 
 | category | default | example hosts | rationale |
 |---|---|---|---|
@@ -406,58 +1043,60 @@ plugins for. Categories:
 | `providers` | **on** | `api.openai.com`, `api.deepgram.com`, `api.anthropic.com`, `api.mistral.ai`, … | fail-safe — if a settings change ever re-points STT/LLM off-loopback, the connection fails fast instead of silently exfiltrating |
 | `char_cloud` | off | `api.char.com`, `cloudsync.sqlite.ai` | Char's hosted backend for calendar OAuth + integrations. Off by default so calendar sync keeps working; opt in with `--strict` |
 
-We deliberately use `/etc/hosts` (rather than `pf` / Little Snitch /
-LuLu) because it works with no kernel extensions, no third-party
-tools, no SIP gymnastics, and is plainly auditable with
-`cat /etc/hosts`. The block region is marker-delimited so add / remove
-is non-destructive to your existing entries; every change is backed
-up to `/etc/hosts.local_scribe.bak.<timestamp>` before being applied
-atomically via `rename(2)`. Resolution uses `0.0.0.0` (IPv4) and `::`
-(IPv6) sinks so connections fail-fast (~2 ms) rather than looping
-back to whatever's listening on `127.0.0.1`.
-
 #### Operator commands
 
 ```bash
-./run.sh firewall status         # is the block installed? coverage by category?
-./run.sh firewall list           # print the full host catalog (no sudo)
-./run.sh firewall enable         # install (asks for admin password)
-./run.sh firewall enable --strict # also block api.char.com (no calendar sync)
-./run.sh firewall disable        # remove (asks for admin password)
-./run.sh firewall verify         # DNS-probe every catalog host; exit 1 if any resolves
+# Default per-Char mode (no sudo)
+./run.sh start                    # also starts the egress proxy on :8889
+./run.sh char launch              # launches Char under sandbox-exec + HTTPS_PROXY
+./run.sh char firewall-status     # is the proxy up? is Char going through us?
+./run.sh proxy verify             # send CONNECT api.openai.com:443; assert 403
+./run.sh proxy recent             # last 20 DENY/ALLOW/ERROR decisions
+
+# Inspect / configure
+./run.sh firewall mode            # show effective mode + proxy port
+./run.sh firewall list            # print the host catalog (no sudo)
+./run.sh firewall verify          # DNS-probe every catalog host
+
+# Opt-in machine-wide mode
+./run.sh firewall enable --mode system    # asks for admin password
+./run.sh firewall disable --mode system   # asks for admin password
 ```
 
-`./run.sh bootstrap` (step 7/7) offers to install the block list on
-first setup. `./run.sh doctor` reports installation status + per-
-category coverage and flags drift if a `local_scribe` upgrade has
-added new hosts the current install doesn't cover (re-run
-`./run.sh firewall enable` to refresh). `./run.sh firewall enable` is
-idempotent — re-applying on an already-correct file is a zero-diff
-write.
+`./run.sh bootstrap` (step 10/10) writes + validates the SBPL profile
+and prints how to launch Char. It does **not** ask for sudo — the
+system-hosts mode is left as an explicit opt-in. The egress proxy
+auto-starts alongside the ASR + Inspector services on every
+`./run.sh start`. `./run.sh doctor` reports both layers (proxy
+running? sandbox profile valid?) plus the system-hosts state if it
+is also installed.
+
+#### Caveat: Dock / Spotlight launches bypass the firewall
+
+This is the trade-off of the wrapper-based approach. A Char
+launched from the Dock inherits neither `sandbox-exec` nor the
+`HTTPS_PROXY` env, so its traffic is **not** filtered.
+`./run.sh char firewall-status` and `./run.sh doctor` both detect
+and flag this; the only mitigation is to kill the bypassed process
+and relaunch via `./run.sh char launch`. A future Network Extension
+build signed under our own Developer ID would close this gap (see
+[TODO.md](TODO.md)).
 
 #### Removal
 
-Either `./run.sh firewall disable` (clean, asks for admin password)
-or `sudo $EDITOR /etc/hosts` (delete the lines between the
-`>>> local_scribe firewall` and `<<< local_scribe firewall` markers).
-Either way the backup at `/etc/hosts.local_scribe.bak.<latest>` is
-the pre-change reference for diffs.
+- **Process mode**: `./run.sh stop` (stops the proxy). The sandbox
+  profile is harmless on disk; delete it with
+  `rm ~/.config/local_scribe/char.sb` if you want.
+- **System mode**: `./run.sh firewall disable --mode system`
+  (clean, asks for admin password) or `sudo $EDITOR /etc/hosts`
+  (delete the lines between the `>>> local_scribe firewall` and
+  `<<< local_scribe firewall` markers). Either way the backup at
+  `/etc/hosts.local_scribe.bak.<latest>` is the pre-change
+  reference for diffs.
 
-#### What it does **not** do
-
-- Block IP literals — `/etc/hosts` only catches name resolution.
-  An app that hard-codes an IP bypasses it. Char's plugins all use
-  hostnames (verified by `strings`-sweep against the signed
-  binary).
-- Block DNS-over-HTTPS clients with their own resolver. Char doesn't
-  ship one (verified); if a future version did, we'd add the DoH
-  endpoint hostname to the catalog.
-- Restrict loopback traffic. Char ↔ `127.0.0.1:8000` (our ASR shim)
-  and our own services ↔ each other stay unaffected.
-
-Catalog source of truth: [`firewall.py`](firewall.py) →
-`BLOCK_CATALOG`. Full rationale + per-host reasons in
-[SECURITY.md § Defence layer 1](SECURITY.md#defence-layer-1--network-egress-firewall).
+Catalog source of truth: [`firewall.py`](local_scribe/egress/firewall.py) →
+`BLOCK_CATALOG`. Full rationale + per-host reasons + threat model
+in [SECURITY.md § Defense layer 1](SECURITY.md#defense-layer-1--network-egress-firewall).
 
 ### Air-gap mode
 
@@ -481,9 +1120,9 @@ The master key that every other secret in the system is derived from
 lives behind **two factors**: a Keychain item (Touch ID-gated) and a
 YubiKey-encrypted age file. **Both are required** to unlock; either
 factor on its own yields uniform-random bytes via the XOR
-construction. See [SECURITY.md § Defence layer 4](SECURITY.md#defence-layer-4--option-c-split-key-touch-id-and-yubikey)
+construction. See [SECURITY.md § Defense layer 4](SECURITY.md#defense-layer-4--option-c-split-key-touch-id-and-yubikey)
 for the construction details and threat-model invariants, and
-[ARCHITECTURE.md §4](ARCHITECTURE.md#4-at-rest-encryption--option-c-split-key-implemented)
+[ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-at-rest-encryption--option-c-split-key-implemented)
 for the diagram.
 
 Operator commands:
@@ -492,22 +1131,89 @@ Operator commands:
 ./run.sh key init                 # first-time setup; enroll YubiKey + DR backup
 ./run.sh key status               # JSON snapshot; no Touch ID / no YubiKey
 ./run.sh key unlock               # smoke test; prints token fingerprints
-./run.sh key rotate               # fresh master + halves; invalidates all tokens
+./run.sh key rotate               # fresh master + halves; typed ROTATE + YK tap + auto-snapshot
 ./run.sh key add-yubikey RECIP    # enroll a second YubiKey (paste its age recipient)
-./run.sh key dr-restore           # recover via passphrase (lost-factor case)
+./run.sh key dr-restore           # recover via passphrase; auto-detects live v2 + typed gate
 ./run.sh key migrate              # walk a legacy v1 install over to v2 (idempotent)
-./run.sh key destroy              # delete every key artefact (typed-DESTROY confirm)
+./run.sh key destroy              # typed DESTROY + YK tap + auto-snapshot (reversible)
+./run.sh key destroy --purge-everything  # typed DESTROY *and* PURGE-EVERYTHING — irreversible
+./run.sh key backups list         # list pre-flight snapshots written before destructive ops
+./run.sh key backups prune <id>   # delete one snapshot (typed DELETE)
+./run.sh key backups restore-kc-half <account>   # roll back kc_half from a backup account
 ```
+
+**The pipeline refuses to start without a master key.** `./run.sh
+start` checks the Keychain for a `kc_half` (Option C) or a legacy v1
+whole-key item before any service comes up; absent both, it prints a
+red banner pointing at `./run.sh bootstrap` (first install) or
+`./run.sh key dr-restore` (recovery) and exits non-zero. This is the
+master-key start-guard — there is no override, because starting with
+no master key would mean services come up with no bearer-token auth
+and on-disk artefacts would be unencrypted.
+
+**Every destructive op is two-factor + reversible by default.** A
+YubiKey tap is required to prove physical possession before any
+state changes, and a pre-flight snapshot of the about-to-be-replaced
+material is written to `~/.config/local_scribe/key-backups/<ts>-<op>/`
+so the operation can be rolled back. Snapshots are NEVER auto-pruned
+— see [`KEY_SAFETY.md`](docs/KEY_SAFETY.md) for the full enumeration of
+data-loss scenarios and recovery flowcharts.
 
 All passphrases are read from `/dev/tty` (no echo, never on argv).
 All master-key bytes flow via Keychain ACL → stdin → in-process
 buffers — never argv, never env, never logs.
 
+### Encrypted vault (AES-256 sparse bundle, master-key-derived)
+
+The canonical at-rest container for Char's session data and our
+transcripts is an `hdiutil` AES-256 sparse bundle whose passphrase is
+**HKDF-SHA256-derived from the master key** (label
+`local_scribe.vault.passphrase.v1`). That means:
+
+- The passphrase is never written to disk and never shown to the
+  operator. It lives in process memory between
+  `key_lifecycle.unlock_master_key()` and the `hdiutil -stdinpass`
+  call.
+- Unlocking the vault is the same operation as unlocking the master:
+  Touch ID **and** a YubiKey tap.
+- Rotating the master key (`./run.sh key rotate`) re-keys the vault
+  envelope automatically via `vault.rotate_password(old, new)`.
+
+`./run.sh bootstrap` creates the vault and relocates Char's data dir
+into it as part of the default-install flow. The vault subcommands:
+
+```bash
+./run.sh vault init                # create the AES-256 sparse bundle (one-time)
+./run.sh vault unlock              # mount + relocate Char's data into the vault
+./run.sh vault unlock --no-relocate  # mount only (don't move Char's data)
+./run.sh vault lock                # detach the mounted volume
+./run.sh vault status              # JSON snapshot (no prompts)
+```
+
+### YubiKey operator surface
+
+The full lifecycle (`init`, `rotate`, `add-yubikey`, etc.) lives under
+`./run.sh key …`. The `./run.sh yubikey` subcommand is the smaller
+convenience surface for tap-test and backup-restore work:
+
+```bash
+./run.sh yubikey status            # JSON: tools, key inserted, enrollment, recipient count
+./run.sh yubikey list              # one line per enrolled age recipient
+./run.sh yubikey enroll            # generate identity on inserted YubiKey
+                                   #   - if no master yet: chains into `key init`
+                                   #   - if master exists: prints recipient + tells you
+                                   #     to run `key add-yubikey <recipient>` (backup key)
+./run.sh yubikey verify            # round-trip tap test: decrypts yk_half.age
+./run.sh yubikey restore <snap>    # re-instate yk_half.age from a key-safety snapshot
+                                   #   (typed RESTORE confirmation required)
+```
+
 ### Future privacy work
 
-See [TODO.md](TODO.md) for planned hardening — wiring `vault.py` into
-`./run.sh start`, an age-based auto-purge, a `./run.sh wipe` command,
-and tightening the loopback bind default.
+See [TODO.md](TODO.md) for planned hardening — vault auto-purge
+policies, a `./run.sh wipe` command for one-shot panic-mode rotation,
+and the planned multi-tenant / org confidential-compute deployments
+backed by AWS Nitro Enclaves + CloudHSM-managed attestation keys.
 
 ## What's in here
 
@@ -519,20 +1225,34 @@ and tightening the loopback bind default.
 | `transcribe_file.py` | CLI for files Char didn't auto-pick up. Streams a structured Markdown summary (TL;DR, Participants, Key points, Decisions, Open questions, Risks, Next steps, Notable quotes), with optional diarization. Caches results by audio sha256. | Manual workflow |
 | `redo_session.py` | Re-runs ASR + diarization on an existing Char session and overwrites its `transcript.json` via `char_persist.py`. Used when the original Generate produced the wrong number of speakers (1:1 came back as one blob, or a long meeting over-clustered). Match by full UUID, UUID prefix, or session-title substring. Invoked via `./run.sh redo-session …`. | Per-session re-do |
 | `transcript_history.py` | Auto-archives `transcript.json` before each overwrite into `<session>/.local_scribe_history/<timestamp>_<sha7>.json`. Each archive is the previous file verbatim plus a `local_scribe` metadata block (ASR model, diarization algorithm, K, audio sha256, timestamps). The inspector exposes list/view/download/delete per archive. | Re-transcription history |
-| `firewall.py` | `/etc/hosts` block-list manager. Marker-delimited region, `0.0.0.0`/`::` sinks, idempotent installer, DNS probe. Catches Char's Sentry / PostHog / auto-updater + every external STT/LLM provider. Driven by `./run.sh firewall …`. Full rationale in [SECURITY.md](SECURITY.md). | Outbound egress control |
+| `firewall.py` | Block catalog + dual-mode firewall manager. Default `process` mode is a no-op at the OS layer — enforcement lives in `egress_proxy.py` + `char_sandbox.py`. Opt-in `system` mode rewrites `/etc/hosts` machine-wide. Exposes `is_blocked()` for cross-module use. Driven by `./run.sh firewall …`. | Outbound egress control (policy) |
+| `egress_proxy.py` | Pure-stdlib asyncio CONNECT proxy on `127.0.0.1:8889`. Refuses CONNECT requests for any host in `firewall.BLOCK_CATALOG` with a `403` + JSON deny body. Ring-buffer audit log. CLI: `python -m egress_proxy {start,status,verify,recent}`. Auto-starts from `./run.sh start`. | Outbound egress control (enforcement, policy half) |
+| `char_sandbox.py` | Renders the SBPL `sandbox-exec` profile that `./run.sh char launch` applies to Char. `(allow default)` + `(deny network-outbound)` + re-allow loopback only. Validates against `sandbox-exec -f profile /usr/bin/true` before launch. Profile lives at `~/.config/local_scribe/char.sb`. | Outbound egress control (enforcement, containment half) |
+| `sip_check.py` | Parses `csrutil status` and refuses to let the project start when System Integrity Protection isn't fully on. Gated from `run.sh` (start, bootstrap, every key command, configure-char, redo-session) and from every FastAPI service lifespan. No operator override. | Mandatory SIP gate |
 | `service_auth.py` | HKDF-SHA256 per-service bearer tokens derived from the master key. Enforced by every gated FastAPI route. | Inter-service authentication |
 | `key_split.py` | Pure XOR construction (`master_key = kc_half XOR yk_half`). Stdlib only. | Split-key crypto primitive |
 | `secret_store.py` | macOS Keychain bridge via the Swift Touch ID helper. Holds the `kc_half` item (and the legacy v1 whole-key item during migration). | Keychain factor |
 | `yubikey_backup.py` | `age`-based wrapping of `yk_half`, including multi-recipient enrollment so a backup YubiKey can decrypt the same file. | YubiKey factor |
 | `disaster_recovery.py` | Passphrase-encrypted age copy of the **whole** master key. Strictly opt-in at `init` time. The recovery path for "lost both factors". | Disaster recovery |
 | `key_lifecycle.py` | Orchestrator: `init / unlock / rotate / add_yubikey / dr_restore / migrate_v1_to_v2 / status`. Plus a `python -m key_lifecycle …` CLI that `./run.sh key` delegates to. | Two-factor key lifecycle |
+| `key_safety.py` | Pre-flight snapshots + physical-presence proof. Every destructive key op (`rotate`, `init --force`, `dr-restore` over live v2, `add-yubikey`, `migrate`, `destroy`) snapshots the about-to-be-replaced material before mutating. Snapshots are never auto-pruned. CLI: `python -m key_safety {list,prune,restore-kc-half}`. | Data-loss safety net |
+| `vault.py` | macOS `hdiutil` wrapper: creates / mounts / unmounts an AES-256 sparse-bundle disk image and relocates Char's data dir into it. The hdiutil passphrase flows in via `stdin` (never argv). | AES-256 vault primitive |
+| `vault_unlock.py` | Glue between `key_lifecycle` and `vault`. Derives the hdiutil passphrase from the master key via HKDF-SHA256 (`local_scribe.vault.passphrase.v1`), so unlocking the vault is the same op as unlocking the master. CLI: `python -m vault_unlock {init,unlock,lock,status}` (delegated to from `./run.sh vault`). | Vault ↔ split-key bridge |
+| `KEY_SAFETY.md` | Enumeration of every data-loss scenario (S1–S18) and the mitigation tied to each one. Recovery flowchart. Pre-install checklist. | Key-mistake catalogue |
+| `CRYPTO.md` | Every cryptographic primitive in use, contrasted with its plausible alternatives, with rationale and residual risk for each. Includes 11 future-improvement items mirrored into `TODO.md`. | Cryptographic-engineering rationale |
 | `char_settings_writer.py` | Stdin-driven JSON patcher for Char's `settings.json`. Used by `./run.sh configure-char` so the ASR bearer token never appears in argv. | Argv-leak hardening |
 | `char_audit.py` | Reads Char's `settings.json` + `store.json` and asserts the four-key contract + firewall coverage. Surfaces drift in `./run.sh doctor` and the inspector's Char Audit tab. | Char-settings enforcement |
 | `bin/touchid_keychain.swift` | Compiled by `./run.sh bootstrap` into `bin/touchid-keychain`. Accepts `--account NAME` so the same binary manages both the legacy whole-key item and the new `kc_half` item. | Touch ID bridge |
 | `run.sh` | Service manager + bootstrap. Single command to install deps, download models, start/stop everything, manage the firewall + keys, and produce health reports. | Operator tool |
 | `ARCHITECTURE.md` | Every major flow rendered as a Mermaid diagram (system overview, bootstrap, encryption design, auth, firewall, audit, transcription paths, diarization, history, inspector, threat model, key lifecycle). Linked from the top of this README. | Diagrammatic reference |
-| `SECURITY.md` | Threat model and per-layer defence rationale. Companion to ARCHITECTURE.md § 14 (threat model diagram). | Security policy |
+| `SECURITY.md` | Threat model and per-layer defense rationale. Companion to ARCHITECTURE.md § 14 (threat model diagram). | Security policy |
 | `CHAR_REVIEW.md` | Char binary audit + network egress evidence. Companion to ARCHITECTURE.md § 6 (firewall diagram). | Char binary audit |
+| `LEGAL.md` | Project-level ethics + legal: the explicit non-endorsement of covert recording, jurisdictional recording-consent pointers (US federal/state wiretap, EU/UK GDPR, etc.), MIT licence rationale, plain-English liability disclaimer, user indemnification, export-control determination, trademark acknowledgements. | Legal & ethics policy |
+| `QUESTIONS.md` | Answers to the questions a security or developer reader is most likely to have after skimming the rest: "why didn't you fork Char?", "if my laptop is compromised what does the YubiKey actually buy me?", "isn't `sandbox-exec` deprecated?", "the Dock-launch bypass undermines the firewall, right?", etc. Includes a "Where the criticism is fair" self-assessment of 10 known weaknesses. | FAQ / skeptical-reader response |
+| `FORK_CONSIDERATIONS.md` | 654-line analysis of the sidecar-vs-fork trade-off: what forking buys, what it costs (Apple Developer enrollment, signing, notarisation, upstream-merge cadence, brand surface), and the recommended path forward. Linked from `QUESTIONS.md` § Q1. | Fork-decision rationale |
+| `tools/seed_demo.py` | Generates 5 synthetic Char sessions (silent MP3 + structured `transcript.json` with diarization metadata + notes + history) under `~/.cache/local_scribe-demo/`. Refuses to write to the real Char data dir. Used by the screenshots in this README and by anyone evaluating the UI without enrolling a YubiKey. | Demo-data seeding |
+| `tools/run_demo.sh` | Starts an isolated inspector instance (default port `8765`) against the seeded demo dir, with `LOCAL_SCRIBE_DISABLE_AUTH=1` + a SIP test-stub for screenshot reproducibility. None of those bypasses are honoured by the production `./run.sh start` path. | Demo inspector launcher |
+| `tools/capture_screenshots.sh` | Headless-Chrome driver that hits the demo inspector and writes the six PNGs under `docs/screenshots/`. Used by `./run.sh demo` and by anyone refreshing the screenshots in this README. | Screenshot reproducibility |
 
 ## How the integration works (a.k.a. "the hack")
 
@@ -739,7 +1459,7 @@ over that branch from our side.
 
 **Workaround: write `transcript.json` straight to Char's session
 directory ourselves.** When a request hits
-`/v1/audio/transcriptions`, [`char_persist.py`](char_persist.py)
+`/v1/audio/transcriptions`, [`char_persist.py`](local_scribe/char/char_persist.py)
 SHA256-hashes the uploaded audio, walks
 `~/Library/Application Support/hyprnote/sessions/<uuid>/audio.mp3`
 looking for a match, and if it finds one, atomically writes
@@ -860,22 +1580,58 @@ cd local_scribe
 
 `./run.sh bootstrap` is a single command that takes a clean machine
 (macOS + Python + Homebrew) all the way to a working pipeline. It runs
-**five idempotent steps** — already-done steps short-circuit with a
+**nine idempotent steps** — already-done steps short-circuit with a
 green checkmark, so re-running on a fully set-up machine prints the
 state and exits without changing anything.
 
 ```text
-(1/5) python venv + pip deps          ─── creates .venv/ if missing,
-                                          installs requirements.txt
-(2/5) parakeet ASR weights            ─── ~1.2 GB MLX bundle from
+(0/10) System Integrity Protection    ─── gate: refuses to continue if
+                                          SIP isn't fully enabled. No
+                                          operator override (see
+                                          SECURITY.md § Defense layer 0)
+(1/10) python venv + pip deps + helper ─── creates venv/, installs
+                                          requirements.txt, compiles
+                                          bin/touchid-keychain via swiftc
+(2/10) key tools (age, age-plugin-yubikey, ykman)
+                                       ─── brew-installs whichever are
+                                          missing. The split-key flow
+                                          CANNOT run without them, so
+                                          bootstrap refuses to proceed
+                                          if Homebrew is unavailable.
+(3/10) master key (Touch ID ⊕ YubiKey) ── Option C split-key init.
+                                          Generates a 256-bit master,
+                                          splits it via XOR, writes
+                                          kc_half to Keychain + yk_half
+                                          age-encrypted to your YubiKey.
+                                          Bootstrap REFUSES to continue
+                                          if you decline (the most-secure
+                                          default install requires it).
+(4/10) encrypted vault (AES-256)      ─── hdiutil sparse bundle keyed
+                                          off the master via HKDF.
+                                          Relocates Char's data dir
+                                          INTO the vault on first unlock.
+(5/10) parakeet ASR weights           ─── ~1.2 GB MLX bundle from
                                           mlx-community/parakeet-tdt-0.6b-v3
-(3/5) sherpa-onnx diarization models  ─── ~45 MB ONNX (pyannote 3.0
+(6/10) sherpa-onnx diarization models ─── ~45 MB ONNX (pyannote 3.0
                                           segmentation + TitaNet embedding)
-(4/5) LM Studio.app + Qwen LLM        ─── see breakdown below
-(5/5) Char.app — install + auto-config
+(7/10) ~/.config/local_scribe/config.json
+                                       ─── seeded with defaults; the
+                                          inspector "Config" tab edits
+                                          the same file.
+(8/10) LM Studio.app + Qwen LLM       ─── see breakdown below
+(9/10) Char.app — install + auto-config
+(10/10) per-Char outbound firewall    ─── renders + validates the
+                                          sandbox-exec profile at
+                                          ~/.config/local_scribe/char.sb.
+                                          NO SUDO. The egress proxy
+                                          starts on the next ./run.sh
+                                          start. Launch Char via
+                                          ./run.sh char launch.
+                                          --mode system (machine-wide
+                                          /etc/hosts block) is opt-in.
 ```
 
-### Step (4/5) — LM Studio.app + Qwen LLM, in detail
+### Step (8/9) — LM Studio.app + Qwen LLM, in detail
 
 This is the step that handles your local LLM host end-to-end. It is
 **fully unattended past two y/N prompts** (one for the brew cask
@@ -922,7 +1678,7 @@ The same orchestrator is exposed standalone as `./run.sh install-llm`,
 so you can repair an LM Studio install or pull a different model later
 without re-running the full bootstrap.
 
-### Step (5/5) — Char.app, in detail
+### Step (9/9) — Char.app, in detail
 
 Same shape as the LM Studio step, with one extra wrinkle (the OpenAI
 transcriber config patch):
@@ -1625,6 +2381,79 @@ A status-pill row in the header pings `/api/asr/health`,
 `/api/llm/health`, and the Char audit every 15 seconds — the easy way
 to spot LM Studio or Char drift without leaving your editor.
 
+### Roadmap: making the inspector the full operator control surface
+
+Today the inspector is a read-only-ish observer plus the
+Char-audit one-click fix. The `./run.sh` CLI is still the
+authoritative place to install, configure, start / stop, manage
+keys + vault + firewall, and re-bless integrity baselines.
+
+The next major piece of work (tracked in
+[`TODO.md`](TODO.md#privacy--security-p0) as "Web UI as the full
+operator control surface") promotes the inspector to the single
+user-facing entry point — install, configure, operate, observe
+the whole pipeline, with the CLI kept as the scriptable / headless
+fallback. The headline pieces, all phased so each lands as an
+independently reviewable slice:
+
+* **Real-time integrity status tile** — pass / fail for every
+  defense layer, pushed over SSE so the tile turns red within 5 s
+  of any drift. Sources:
+  [`script_integrity.verify()`](local_scribe/security/script_integrity.py),
+  [`char_integrity.collect_fingerprint()`](local_scribe/char/char_integrity.py),
+  [`signed_config.status()`](local_scribe/security/signed_config.py),
+  the egress-proxy block log, the service-auth bypass flag.
+* **Service lifecycle from the UI** — start / stop / restart
+  buttons that invoke the same Python entry points `./run.sh`
+  does, with Touch ID re-confirmation on each destructive op
+  (the cookie alone is not enough; a stolen cookie can't
+  `key rotate`).
+* **Key + vault lifecycle** — `init`, `rotate`, `add-yubikey`,
+  `dr-backup`, `dr-restore`, `vault init`, `mount`, `unmount`,
+  `rotate-password` — each gated by a typed-confirm body + fresh
+  Touch ID + (where the underlying CLI op requires it) an
+  "insert your YubiKey now" modal.
+* **Char + firewall + sandbox controls** — install, launch,
+  baseline-update, firewall enable / disable / mode, sandbox
+  profile diff-before-apply. The few `sudo` ops
+  (`firewall enable --mode system` writes `/etc/hosts`) stay in
+  the CLI on purpose — moving privilege escalation through a
+  web UI multiplies the threat surface, and the convenience win
+  isn't worth it.
+* **API docs** — FastAPI's auto-generated `/docs` (Swagger UI)
+  and `/redoc` (Redoc) double as the operator reference. Every
+  endpoint's Pydantic model includes "Touches:", "Idempotent:",
+  "Recovery:" metadata blocks pulled from the docstring so a
+  privacy-conscious operator can read exactly what each button
+  does before clicking.
+* **Dark theme stays default** — the existing CSS variable
+  system already does this; the roadmap adds a user-controlled
+  toggle that overrides the `prefers-color-scheme` media query,
+  persisted in `localStorage`.
+
+Two further items are tracked as P0 follow-ups, both designed
+around the threat model of "operator is away from the laptop":
+
+* **Tamper-alert dispatch (SMS / email / push)** — fires a
+  signed alert to a different device the operator owns when an
+  integrity gate fails or the egress proxy blocks an unexpected
+  request. Trade-off matrix for channel selection
+  (Twilio / SMTP / APNs / Signal / operator-hosted relay) and
+  the credential-safety problem are walked through in
+  [`TODO.md`](TODO.md#privacy--security-p0).
+* **Auto-dismount the vault on screen lock; Touch-ID-gated
+  remount on unlock and on Char restart** — ties vault mount
+  state to screen-unlock state so the data plane cycles down
+  whenever the operator looks away. Four modes (`soft`,
+  `cooperative`, `strict`, `paranoid`) trade off Char-stability
+  against unmount-aggressiveness; full mode table + UX gotchas
+  in [`TODO.md`](TODO.md#privacy--security-p0).
+
+The CLI is not going away. The headless / scripted / CI use
+cases stay first-class; the web UI is a second front-end with the
+same auth model and the same primitives underneath, not a
+replacement.
+
 ### Privacy posture for the Inspector
 
 * Binds to `127.0.0.1` by default. The validator refuses any non-loopback
@@ -1881,8 +2710,41 @@ or `lms server stop`.
 re-downloads the ASR weights. To wipe the transcript cache too:
 `./run.sh transcribe --clear-cache`.
 
-## License
+## License & legal
 
-MIT for the glue code in this repo. The underlying models have their own
-licenses — Parakeet TDT v3 is CC-BY-4.0 (NVIDIA), Whisper is MIT (OpenAI),
-sherpa-onnx ONNX models are Apache 2.0 / MIT, Qwen3 is Apache 2.0.
+**MIT** for the glue code in this repo — full text in [`LICENSE`](LICENSE).
+The underlying models have their own licences: Parakeet TDT v3 is CC-BY-4.0
+(NVIDIA), Whisper is MIT (OpenAI), sherpa-onnx ONNX models are Apache 2.0
+/ MIT, Qwen3 is Apache 2.0.
+
+[`LEGAL.md`](LEGAL.md) is the broader ethics + legal document and is
+**required reading before you record anyone other than yourself**. It
+covers, in order:
+
+1. What this project is (a proof-of-concept reference architecture, not
+   a product or legal advice).
+2. The maintainers' explicit position: **we do not endorse recording any
+   person without their knowledge or consent, under any circumstance**.
+   Two-party-consent laws exist and we understand them; this software
+   exists to make consensual recording *secure*, not to enable
+   non-consensual recording.
+3. A jurisdiction-by-jurisdiction pointer to the recording-consent laws
+   you are responsible for complying with (US federal Wiretap Act + state
+   one-party/two-party-consent statutes, EU/UK GDPR, Canada, Australia,
+   "anywhere else").
+4. The MIT licence choice and rationale (Char compatibility + model-
+   ecosystem compatibility + minimal friction).
+5. A plain-English restatement of the MIT "AS IS" disclaimer:
+   **no warranty, no liability, no representation of fitness for
+   purpose, no claim that the security primitives have been
+   third-party-audited**. Using the software constitutes acceptance.
+6. User indemnification of the maintainers against claims arising from
+   your use.
+7. A good-faith determination on US/EU export-control status of the
+   cryptography used.
+8. Trademark acknowledgements for every third-party name in the docs
+   (Char, Tailscale, AWS, Apple, YubiKey, Signal, etc.).
+9. How to report security, licensing, or legal-misuse concerns.
+
+If you have not read [`LEGAL.md`](LEGAL.md), you should assume you have
+not understood the terms under which this software is offered.

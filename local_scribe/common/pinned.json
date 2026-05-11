@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "_doc": "Operator-pinned distribution constants. These are NOT user-tunable settings (those live in ~/.config/local_scribe/config.json); these are security-critical identity values for the third-party binaries local_scribe drives (Char, LM Studio). They were previously hardcoded in run.sh + char_integrity.py and were collected here so an operator can sign them as a single trust statement via `./run.sh config sign` (Touch ID + YubiKey). See local_scribe/security/signed_config.py for the signing mechanism and docs/SECURITY.md for the threat model. To bump a value: edit this file, audit the diff carefully, then `./run.sh config sign` to re-bless. The server refuses to start with an invalid signature.",
+  "char": {
+    "known_good_version": "1.0.24",
+    "release_tag": "desktop_v1.0.24",
+    "release_base_url": "https://github.com/fastrepl/anarlog/releases/download/desktop_v1.0.24",
+    "dmg_sha256_aarch64": "7f9c06881b9593b2aec17c8eddd65e5eb67d2c1072bfd008501989eb4181da89",
+    "dmg_sha256_x86_64": "e7061d274308b563df724d7da5ede80e0cc68ff7082a3586b41ed8cc2c815503",
+    "pinned_team_id": "6SLY7V277V",
+    "pinned_bundle_id": "com.hyprnote.stable",
+    "default_app_path": "/Applications/Char.app"
+  },
+  "lmstudio": {
+    "known_good_version": "0.4.12",
+    "app_path": "/Applications/LM Studio.app",
+    "default_port": 1234
+  }
+}
