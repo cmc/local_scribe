@@ -596,6 +596,44 @@ def _cli_status(_args: list[str]) -> int:
     return 0
 
 
+def _reattach_stdin_to_tty() -> bool:
+    """Reopen file descriptor 0 (stdin) to ``/dev/tty`` if available.
+
+    The CLI entry points below consume all of stdin (to read a piped
+    passphrase) and THEN call into code paths that spawn an
+    interactive subprocess — most notably ``age-plugin-yubikey``,
+    which prompts for the YubiKey PIV PIN on its own stdin. After
+    ``sys.stdin.read()`` returns, fd 0 is at EOF (or, after the bash
+    pipe writer exits, ``Bad file descriptor (os error 9)``); the
+    plugin can no longer read its prompt and the whole bootstrap
+    halts.
+
+    We re-attach fd 0 to ``/dev/tty`` here so the next
+    ``subprocess.run(..., stdin=None)`` invocation inherits a usable
+    interactive stdin again. The operator can then type the PIN at
+    the plugin's prompt as expected.
+
+    Returns ``True`` on success, ``False`` if no controlling tty is
+    available (e.g., running under ``nohup`` or in CI with no pty).
+    The caller MUST handle the ``False`` case loudly — there's no
+    point spawning an interactive subprocess if there's nowhere for
+    the operator to type.
+
+    See ``tests/security/test_key_lifecycle_stdin.py`` for the
+    regression coverage tied to the 2026-05-11 production bug.
+    """
+    import os
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.dup2(tty_fd, 0)
+    finally:
+        os.close(tty_fd)
+    return True
+
+
 def _cli_init(args: list[str]) -> int:
     """``init [--no-dr] [--force]`` — read the DR passphrase (if any)
     from stdin (single line, no trailing newline expected). Empty
@@ -616,6 +654,19 @@ def _cli_init(args: list[str]) -> int:
         if raw.endswith("\n"):
             raw = raw[:-1]
         passphrase = raw or None
+    # Re-attach fd 0 to /dev/tty before we call into init_master_key
+    # (which spawns ``age-plugin-yubikey`` to enroll the YubiKey;
+    # that plugin reads its PIV PIN from its inherited stdin). The
+    # piped-passphrase read above leaves fd 0 at EOF / closed-pipe
+    # otherwise — see _reattach_stdin_to_tty's docstring for the
+    # full backstory.
+    if enroll and not _reattach_stdin_to_tty():
+        _sys.stderr.write(
+            "error: no controlling tty for the YubiKey PIN prompt; "
+            "either run from an interactive terminal, or pass "
+            "--no-enroll if a YubiKey was pre-enrolled.\n"
+        )
+        return 2
     result = init_master_key(
         dr_passphrase=passphrase,
         enroll_yubikey=enroll,
@@ -730,6 +781,17 @@ def _cli_dr_restore(args: list[str]) -> int:
         raw = raw[:-1]
     if not raw:
         _sys.stderr.write("error: passphrase required on stdin\n")
+        return 2
+    # dr_restore() re-runs YubiKey enrollment (unless --no-reinit),
+    # which spawns age-plugin-yubikey and needs a working interactive
+    # stdin for the PIV PIN. The piped-passphrase read above leaves
+    # fd 0 closed; see _reattach_stdin_to_tty's docstring.
+    if reinit and not _reattach_stdin_to_tty():
+        _sys.stderr.write(
+            "error: no controlling tty for the YubiKey PIN prompt during "
+            "re-enrollment. Run from an interactive terminal, or pass "
+            "--no-reinit to skip the YubiKey re-enrollment step.\n"
+        )
         return 2
     mk = dr_restore(
         raw, re_init_yubikey=reinit, overwrite_existing_v2=overwrite,
