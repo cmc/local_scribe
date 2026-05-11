@@ -1975,10 +1975,10 @@ PY
   #
   # The ASR token is sent on stdin (as up to four newline-separated
   # values: settings_path, port, token, [launch_id]) to ``python -m
-  # char_settings_writer`` so it never appears in argv / a ``ps``
-  # listing. ``printf`` is a bash builtin -- it doesn't fork, so
-  # even ``$asr_token`` as its argument lives only in this shell's
-  # memory.
+  # local_scribe.char.char_settings_writer`` so it never appears in
+  # argv / a ``ps`` listing. ``printf`` is a bash builtin — it doesn't
+  # fork, so even ``$asr_token`` as its argument lives only in this
+  # shell's memory.
   #
   # When called from ``cmd_start`` the launch_id is set via the
   # ``LOCAL_SCRIBE_LAUNCH_ID`` env var (exported by ``cmd_start``).
@@ -1992,13 +1992,13 @@ PY
   if [[ -n "$launch_id_for_writer" ]]; then
     if ! printf '%s\n%s\n%s\n%s\n' \
             "$CHAR_SETTINGS" "$ASR_PORT" "$asr_token" "$launch_id_for_writer" \
-         | "$VENV_PY" -m char_settings_writer; then
+         | "$VENV_PY" -m local_scribe.char.char_settings_writer; then
       say "${c_red}failed to write settings.json — your backup is at $settings_backup${c_reset}"
       return 1
     fi
   else
     if ! printf '%s\n%s\n%s\n' "$CHAR_SETTINGS" "$ASR_PORT" "$asr_token" \
-         | "$VENV_PY" -m char_settings_writer; then
+         | "$VENV_PY" -m local_scribe.char.char_settings_writer; then
       say "${c_red}failed to write settings.json — your backup is at $settings_backup${c_reset}"
       return 1
     fi
@@ -3615,8 +3615,8 @@ EOF
 
 # --- egress_proxy operator surface ------------------------------------------
 #
-# Thin pass-through to ``python -m egress_proxy`` plus the
-# start / stop / restart pid-file lifecycle that runs alongside the
+# Thin pass-through to ``python -m local_scribe.egress.egress_proxy``
+# plus the start / stop / restart pid-file lifecycle that runs alongside the
 # ASR + Inspector services. Lets operators inspect the proxy's audit
 # state without remembering the python invocation.
 

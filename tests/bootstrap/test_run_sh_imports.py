@@ -1,30 +1,37 @@
-"""Static-analysis test: every Python ``import`` line in ``run.sh`` must
-resolve against the actual codebase.
+"""Static-analysis tests: every Python module reference in ``run.sh``
+must resolve against the actual codebase.
 
-Why this exists
----------------
+Why this file exists
+--------------------
 
-``run.sh`` embeds Python via ``$VENV_PY - <<'PY' ... PY`` heredocs (and
-a few ``-c '...'`` blocks). When we reorganised the codebase into
-``local_scribe/`` packages on 2026-05-11 several of these heredocs were
-left with the OLD flat-module imports (e.g. ``from config import ...``).
-``bash -n run.sh`` doesn't catch this — the Python only runs at the
-appropriate bootstrap stage. Users hit the error mid-bootstrap when
-``ensure_config_json`` (or another helper) fired hours into the flow.
+``run.sh`` is the bootstrap entry point and contains TWO classes of
+Python-module references:
 
-This test prevents that class of regression by:
+  (a) ``import`` / ``from ... import`` lines inside ``$VENV_PY - <<'PY'``
+      heredocs (and inline ``-c '...'`` blocks).
+  (b) ``$VENV_PY -m <module>`` invocations as plain bash subprocess calls.
 
-  1. Greping every ``^(from|import) <name>`` line out of run.sh.
-  2. Filtering out stdlib + known third-party imports (huggingface_hub,
-     faster_whisper, etc.).
-  3. For each remaining import (which should all be ``local_scribe.*``
-     subpackages), attempting ``importlib.import_module`` from the
-     venv Python.
-  4. Failing the test loudly if any import doesn't resolve, naming
-     both the line in run.sh and the module that wouldn't import.
+When we reorganised the codebase into ``local_scribe/`` packages on
+2026-05-11 the reorg missed both kinds. Heredoc imports like
+``from config import ...`` produced confusing ``ModuleNotFoundError``s
+during bootstrap stage 7; bash-level ``python -m char_settings_writer``
+invocations exploded at bootstrap stage 9 with ``No module named
+char_settings_writer`` AFTER the operator had already typed Touch ID +
+done a YubiKey tap to mint the bearer token. Both are exactly the same
+regression class but at different parsing layers.
 
-The test runs entirely in-process against this checkout — no subprocess,
-no fakes, no PATH gymnastics. It is fast (< 1 s) and high-signal.
+This module ships two complementary tests:
+
+  RunShPythonImportsResolveTests
+        Heredoc/inline-Python ``import`` statements — pre-existing.
+
+  RunShPythonDashMResolveTests
+        ``$VENV_PY -m <module>`` (and ``python -m <module>``) bash-level
+        invocations — added 2026-05-11 after the char_settings_writer
+        regression.
+
+Both run entirely in-process against this checkout (no subprocess, no
+fakes). Fast and high-signal.
 """
 
 from __future__ import annotations
@@ -137,6 +144,137 @@ class RunShPythonImportsResolveTests(unittest.TestCase):
             local_imports_seen, 5,
             msg="Surprisingly few local_scribe.* imports found in run.sh — "
                 "did the heredoc parsing break?",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bash-level ``python -m <module>`` invocations.
+
+# Catches lines like:
+#   "$VENV_PY" -m local_scribe.char.char_settings_writer
+#   exec "$VENV_PY" -m local_scribe asr start
+#   $("$VENV_PY" -m local_scribe.security.service_auth token asr)
+# Matches the *first* token after ``-m``.
+_DASH_M_RE = re.compile(
+    r"""
+    (?:\$\("\$VENV_PY"|"\$VENV_PY"|\$VENV_PY|python3?)   # python invocation
+    \s+(?:-[A-Za-z0-9]+\s+)*                              # optional flags like -u
+    -m\s+
+    (?P<module>[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)
+    """,
+    re.VERBOSE,
+)
+
+# Submodules of ``local_scribe`` that are intentionally addressed by
+# the ``python -m local_scribe <subcommand>`` entry point rather than
+# being importable on their own as dotted names. The ``local_scribe``
+# package's ``__main__.py`` dispatches to ``asr``, ``inspector``,
+# ``egress-proxy``, ``config show|verify``, ``start``, etc. -- those
+# are CLI verbs, not module paths.
+_LOCAL_SCRIBE_CLI_VERBS = {
+    "asr", "inspector", "egress-proxy", "config", "start", "stop",
+    "status", "doctor",
+}
+
+# Top-level pip-installed modules we use via ``-m`` at the bash level.
+# Currently just ``pip`` (for ``$VENV_PY -m pip install``).
+_DASH_M_THIRD_PARTY_OK = {"pip"}
+
+
+def _extract_dash_m_modules(run_sh: Path) -> Iterable[tuple[int, str, str]]:
+    """Yield ``(line_number, raw_line, module)`` for every
+    ``<python_invocation> -m <module>`` reference in actual code (not
+    inside whole-line bash comments).
+
+    We deliberately do NOT try to parse inline comments — the regex
+    captures only well-formed invocations with a quoted python path
+    or the ``$VENV_PY`` macro, so inline-comment false matches would
+    have to also look like a real invocation, which is unlikely
+    enough to ignore.
+    """
+    for lineno, line in enumerate(run_sh.read_text().splitlines(), start=1):
+        # Skip whole-line bash comments; an operator should be free
+        # to document a now-renamed module path (``# was: python -m
+        # egress_proxy``) without tripping the static check.
+        if line.lstrip().startswith("#"):
+            continue
+        for m in _DASH_M_RE.finditer(line):
+            yield lineno, line.strip(), m.group("module")
+
+
+class RunShPythonDashMResolveTests(unittest.TestCase):
+    """Every ``python -m <module>`` (or ``$VENV_PY -m <module>``)
+    invocation in run.sh must resolve to a real Python module.
+
+    This catches the 2026-05-11 ``char_settings_writer`` regression:
+    the bash-level invocation referenced the pre-reorg flat module
+    name, ``bash -n run.sh`` was happy, the heredoc-import test was
+    happy, and the operator only saw the error at bootstrap stage 9
+    after typing Touch ID for the bearer token.
+    """
+
+    def test_run_sh_has_dash_m_invocations(self) -> None:
+        """Sanity: if we accidentally break the regex and find ZERO
+        ``-m`` invocations, the next test would vacuously pass. Pin
+        the floor."""
+        found = list(_extract_dash_m_modules(_RUN_SH))
+        self.assertGreater(
+            len(found), 10,
+            msg=f"unexpectedly few ``-m`` invocations in run.sh "
+                f"({len(found)} found) — did the regex break?",
+        )
+
+    def test_every_dash_m_module_resolves(self) -> None:
+        """For each ``-m <module>`` invocation: either the first
+        argument is a recognised ``local_scribe <verb>`` CLI form
+        (dispatched via local_scribe/__main__.py), or the module
+        must import cleanly via importlib.
+        """
+        unresolved: list[str] = []
+        for lineno, raw, mod in _extract_dash_m_modules(_RUN_SH):
+            if mod in _DASH_M_THIRD_PARTY_OK:
+                continue
+
+            # ``-m local_scribe`` (alone or followed by a CLI verb) is
+            # the package's CLI entry. We can import the top-level
+            # package; the verb is parsed at the bash layer.
+            if mod == "local_scribe":
+                try:
+                    importlib.import_module("local_scribe")
+                except Exception as e:
+                    unresolved.append(
+                        f"run.sh:{lineno}: {raw}\n"
+                        f"  -> import_module('local_scribe') failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                continue
+
+            # Everything else must be a dotted ``local_scribe.X.Y``
+            # path that imports cleanly. Anything else (e.g. a bare
+            # ``char_settings_writer``) is the regression class we
+            # ship this test to prevent.
+            if not mod.startswith("local_scribe."):
+                unresolved.append(
+                    f"run.sh:{lineno}: {raw}\n"
+                    f"  -> ``-m {mod}``: not allowed at the bash level — "
+                    f"must be ``local_scribe.<subpackage>.<module>`` "
+                    "(the flat-module layout was retired during the "
+                    "2026-05-11 reorg; ``-m char_settings_writer`` was "
+                    "the original regression that motivated this test)."
+                )
+                continue
+            try:
+                importlib.import_module(mod)
+            except Exception as e:
+                unresolved.append(
+                    f"run.sh:{lineno}: {raw}\n"
+                    f"  -> import_module({mod!r}) failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+        self.assertEqual(
+            unresolved,
+            [],
+            msg="\n\n".join(unresolved),
         )
 
 
