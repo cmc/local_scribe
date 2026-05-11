@@ -164,6 +164,18 @@ def init_master_key(
         kwargs = {}
         if yubikey_slot is not None:
             kwargs["slot"] = yubikey_slot
+        # Propagate --force end-to-end: when the operator passes
+        # ``./run.sh key init --force`` they've already confirmed the
+        # destructive "REPLACE" prompt above. enroll(force=True) then
+        # appends ``--force`` to the age-plugin-yubikey --generate call
+        # so the YubiKey PIV slot is actually overwritten rather than
+        # silently taking the --identity recovery path (which would
+        # adopt the OLD slot identity and contradict the operator's
+        # intent). Without this, --force only burned kc_half + yk_half
+        # on disk but kept the slot — a confusing partial-overwrite
+        # state that surfaced in the 2026-05-11 retry cycle.
+        if force:
+            kwargs["force"] = True
         info = yubikey_backup.enroll(**kwargs)
         recipient = info.recipient
         logger.info("YubiKey enrolled for split-key (slot=%s)", info.slot)

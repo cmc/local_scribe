@@ -623,15 +623,67 @@ ensure_touchid_helper() {
 # path is: probe, install whichever is missing, fail loud if Homebrew
 # itself is missing (`brew.sh` is the only macOS-supported answer; we'd
 # rather refuse to bootstrap than silently downgrade security).
+# Minimum age version that supports the plugin recipient system
+# (``age1<plugin_name>1...``). Plugins shipped in age v1.1.0 (Feb 2023);
+# age v1.0.0 — still in some Homebrew caches as recently as 2026 — emits
+# ``malformed recipient ... invalid type "age1yubikey"`` when handed a
+# YubiKey-wrapped recipient. We pin the floor here so bootstrap auto-
+# upgrades stale installs instead of failing opaquely at stage 3.
+#
+# Bumping this constant: any age release that adds plugin protocol or
+# security fixes we depend on can move this floor up. The current floor
+# is the minimum that supports the FiloSottile/age-plugin-yubikey 0.5.x
+# recipient format we ship with.
+AGE_MIN_VERSION="1.1.0"
+
+# Compare two dotted version strings as integer triples.
+# Returns 0 if "$1" is less than "$2", else returns 1.
+# Empty / non-numeric components default to 0 so partial versions like
+# ``1.2`` are compared as ``1.2.0``.
+_version_lt() {
+  local a="$1" b="$2"
+  local IFS=.
+  read -r a1 a2 a3 <<<"$a"
+  read -r b1 b2 b3 <<<"$b"
+  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
+  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
+  if   (( a1 < b1 )); then return 0
+  elif (( a1 > b1 )); then return 1
+  elif (( a2 < b2 )); then return 0
+  elif (( a2 > b2 )); then return 1
+  elif (( a3 < b3 )); then return 0
+  else                     return 1
+  fi
+}
+
+# Print the installed age's version string (e.g. ``1.2.0``) by parsing
+# ``age --version`` output. Returns empty string if age is missing or
+# the output doesn't look like a version we recognise.
+#
+# Real outputs we've observed:
+#   age v1.0.0
+#   v1.0.0
+#   1.2.0
+#   age 1.3.1
+_age_installed_version() {
+  command -v age >/dev/null 2>&1 || { echo ""; return; }
+  local raw
+  raw="$(age --version 2>/dev/null | head -n1)" || { echo ""; return; }
+  # Strip ``age `` prefix and a leading ``v``. ``BASH_REMATCH`` is the
+  # cleanest portable way to extract the first dotted triple.
+  if [[ "$raw" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo ""
+  fi
+}
+
 ensure_age_tools() {
   # Stage-2 of bootstrap. We need ``age``, ``age-plugin-yubikey``, and
-  # ``ykman`` not just on PATH but actually able to RUN. On 2026-05-11 a
-  # /opt/homebrew install of ykman left a zero-byte libexec python behind;
-  # ``command -v ykman`` returned a path but executing the script blew up
-  # with ``exec format error``. Stage 3 (key init) then failed with an
-  # opaque "no YubiKey detected" — because the YubiKey probe shells out
-  # to ykman. We catch the broken-install case HERE instead so the
-  # operator gets a self-healing reinstall at the right stage.
+  # ``ykman`` not just on PATH but actually able to RUN — and ``age``
+  # must be ≥ AGE_MIN_VERSION so it recognises plugin-recipient prefixes
+  # like ``age1yubikey1...`` (production failures: zero-byte ykman libexec
+  # python on 2026-05-11 and a stale age v1.0.0 on the same day).
   local need=()
   _tool_works() {
     # Returns 0 if the binary is on PATH AND executes successfully when
@@ -646,27 +698,75 @@ ensure_age_tools() {
   _tool_works age-plugin-yubikey || need+=("age-plugin-yubikey")
   _tool_works ykman              || need+=("ykman")
   unset -f _tool_works
-  if [[ ${#need[@]} -eq 0 ]]; then
-    say "${c_green}age, age-plugin-yubikey, ykman present + executable${c_reset}"
+
+  # Version-floor check for age. Even when ``age --version`` exits 0,
+  # an installation predating plugin support (v1.0.0, ~2022) is
+  # functionally broken for our use. We model "too-old age" as a
+  # separate state from "missing age" / "broken age": the brew action
+  # is ``upgrade`` (formula installed, just stale), not ``install`` or
+  # ``reinstall``.
+  local age_too_old=0
+  local age_have=""
+  local age_already_in_need=0
+  if [[ ${#need[@]} -gt 0 ]]; then
+    local _n
+    for _n in "${need[@]}"; do
+      [[ "$_n" == "age" ]] && age_already_in_need=1 && break
+    done
+  fi
+  if (( age_already_in_need == 0 )); then
+    age_have="$(_age_installed_version)"
+    if [[ -z "$age_have" ]]; then
+      # ``age --version`` succeeded but we couldn't parse a triple.
+      # Treat as missing so the operator gets a clear path.
+      need+=("age")
+    elif _version_lt "$age_have" "$AGE_MIN_VERSION"; then
+      age_too_old=1
+    fi
+  fi
+
+  if [[ ${#need[@]} -eq 0 && $age_too_old -eq 0 ]]; then
+    say "${c_green}age ($age_have), age-plugin-yubikey, ykman present + executable${c_reset}"
     return 0
   fi
   if ! command -v brew >/dev/null 2>&1; then
-    say "${c_red}Homebrew not installed — needed to install: ${need[*]}${c_reset}"
+    local _missing="${need[*]+${need[*]}}"
+    say "${c_red}Homebrew not installed — needed to install/upgrade: ${_missing}${age_too_old:+ age}${c_reset}"
     say "  install Homebrew (https://brew.sh) and re-run bootstrap"
     return 1
   fi
+
   # If the binary EXISTS on PATH but didn't execute, ``brew install`` is
   # a no-op (Homebrew thinks it's installed). We have to use
   # ``brew reinstall`` to repair the install. Partition into install vs
   # reinstall sets so the operator sees what we're doing and why.
   local to_install=() to_reinstall=()
-  for t in "${need[@]}"; do
-    if command -v "$t" >/dev/null 2>&1; then
-      to_reinstall+=("$t")
-    else
-      to_install+=("$t")
+  if [[ ${#need[@]} -gt 0 ]]; then
+    local t
+    for t in "${need[@]}"; do
+      if command -v "$t" >/dev/null 2>&1; then
+        to_reinstall+=("$t")
+      else
+        to_install+=("$t")
+      fi
+    done
+  fi
+
+  # ``age`` too-old is its own action: ``brew upgrade age``. The bottle
+  # is already installed (so install/reinstall would no-op or rewrite
+  # the same old version); only ``upgrade`` actually advances the
+  # version pin.
+  if [[ $age_too_old -eq 1 ]]; then
+    say "${c_yellow}upgrading age: installed $age_have < required $AGE_MIN_VERSION${c_reset}"
+    say "  age v1.0.0 predates the plugin-recipient system (v1.1.0+);"
+    say "  ``age1yubikey1...`` recipients fail with 'invalid type'"
+    if ! brew upgrade age; then
+      say "${c_red}brew upgrade age failed${c_reset}"
+      say "  try: ${c_bold}brew update && brew upgrade age${c_reset}"
+      return 1
     fi
-  done
+  fi
+
   if [[ ${#to_reinstall[@]} -gt 0 ]]; then
     say "${c_yellow}reinstalling broken key-management tools via Homebrew: ${to_reinstall[*]}${c_reset}"
     say "  (binary is on PATH but ``<tool> --version`` failed — usually a stale or"
@@ -685,9 +785,10 @@ ensure_age_tools() {
       return 1
     fi
   fi
-  # Re-verify after install/reinstall. If something still doesn't run we
-  # must NOT silently continue — the operator will hit a much more
-  # confusing error in stage 3.
+
+  # Re-verify after install/reinstall/upgrade. If something still
+  # doesn't run we must NOT silently continue — the operator will hit a
+  # much more confusing error in stage 3.
   for t in age age-plugin-yubikey ykman; do
     if ! command -v "$t" >/dev/null 2>&1 || ! "$t" --version >/dev/null 2>&1; then
       say "${c_red}$t still not working after install/reinstall${c_reset}"
@@ -695,7 +796,16 @@ ensure_age_tools() {
       return 1
     fi
   done
-  say "${c_green}installed/repaired: ${need[*]}${c_reset}"
+  # Re-verify the age version floor too.
+  age_have="$(_age_installed_version)"
+  if [[ -n "$age_have" ]] && _version_lt "$age_have" "$AGE_MIN_VERSION"; then
+    say "${c_red}age still at $age_have after upgrade (need ≥ $AGE_MIN_VERSION)${c_reset}"
+    say "  check ${c_bold}brew info age${c_reset} — your tap may pin an old version"
+    return 1
+  fi
+  local action_summary="${need[*]+${need[*]}}"
+  [[ $age_too_old -eq 1 ]] && action_summary="${action_summary:+$action_summary, }age (upgraded)"
+  say "${c_green}installed/repaired: $action_summary${c_reset}"
   return 0
 }
 

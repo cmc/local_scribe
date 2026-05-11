@@ -296,6 +296,94 @@ class InitAndUnlockTests(_LifecycleBase):
         # New key after a forced re-init.
         self.assertNotEqual(first, second)
 
+    def test_init_force_propagates_to_yubikey_enroll(self) -> None:
+        """Regression for 2026-05-11: ``./run.sh key init --force``
+        reached ``init_master_key(force=True)`` but the YubiKey
+        enrollment path called ``enroll(**kwargs)`` without putting
+        ``force`` in kwargs. The operator-facing effect was the
+        confusing "Slot 1 is not empty" error message even when they
+        had typed REPLACE at the destructive-overwrite confirmation —
+        because the kc_half got wiped but the YubiKey slot did NOT.
+
+        We monkey-patch ``yubikey_backup.enroll`` to capture the kwargs
+        and assert ``force=True`` is forwarded when (and only when)
+        the caller passed it.
+        """
+        captured: list[dict] = []
+
+        def fake_enroll(**kwargs):
+            captured.append(dict(kwargs))
+            # Return a plausible EnrollmentInfo so init_master_key can
+            # continue. The fake_age helper accepts whatever recipient
+            # we hand it.
+            yb = self.yubikey_backup
+            yb.IDENTITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            yb.IDENTITY_PATH.write_text(
+                "# Serial: 12345678\n"
+                "# Slot: 1\n"
+                f"# Recipient: {self.PRIMARY}\n"
+                "AGE-PLUGIN-YUBIKEY-FAKE\n"
+            )
+            yb.set_recipients([self.PRIMARY])
+            return yb.EnrollmentInfo(
+                recipient=self.PRIMARY,
+                identity_path=yb.IDENTITY_PATH,
+                backup_path=yb.BACKUP_PATH,
+                slot=1,
+                serial="12345678",
+            )
+
+        # Case 1: caller did NOT pass force. enroll() must be called
+        # without ``force`` in kwargs (we don't want to silently burn
+        # a YubiKey slot just because no recipient was on disk yet).
+        with mock.patch.object(
+            self.yubikey_backup, "enroll", side_effect=fake_enroll
+        ):
+            self.key_lifecycle.init_master_key(
+                enroll_yubikey=True,
+                dr_passphrase=None,
+            )
+        self.assertEqual(len(captured), 1)
+        self.assertNotIn(
+            "force", captured[0],
+            "init_master_key without force=True must NOT pass force "
+            "to enroll() (otherwise we'd burn the YubiKey slot on "
+            "every fresh init)",
+        )
+
+        # Wipe + retry with force=True. This is the destructive path
+        # that ``./run.sh key init --force`` ends up driving.
+        self.secret_store.delete_kc_half()
+        self.yubikey_backup.delete_yk_half() \
+            if hasattr(self.yubikey_backup, "delete_yk_half") else None
+        if self.yubikey_backup.BACKUP_PATH.exists():
+            self.yubikey_backup.BACKUP_PATH.unlink()
+        if self.yubikey_backup.IDENTITY_PATH.exists():
+            self.yubikey_backup.IDENTITY_PATH.unlink()
+        # Clear the recipients list too so is_enrolled() returns False
+        # and we hit the enroll() code path on the next init.
+        recipient_path = getattr(self.yubikey_backup, "RECIPIENT_PATH", None) \
+            or getattr(self.yubikey_backup, "RECIPIENTS_PATH", None)
+        if recipient_path is not None and recipient_path.exists():
+            recipient_path.unlink()
+        captured.clear()
+        with mock.patch.object(
+            self.yubikey_backup, "enroll", side_effect=fake_enroll
+        ):
+            self.key_lifecycle.init_master_key(
+                enroll_yubikey=True,
+                dr_passphrase=None,
+                force=True,
+            )
+        self.assertEqual(len(captured), 1, captured)
+        self.assertTrue(
+            captured[0].get("force"),
+            f"init_master_key(force=True) must forward force=True to "
+            f"enroll() — kwargs were {captured[0]!r} (2026-05-11 bug: "
+            f"--force only wiped kc_half on disk but never reached "
+            f"the YubiKey slot via age-plugin-yubikey --generate)",
+        )
+
     def test_init_without_dr_passphrase_skips_dr(self):
         self._preenroll_primary()
         result = self.key_lifecycle.init_master_key(

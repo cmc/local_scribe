@@ -38,6 +38,29 @@ Coverage
   test_no_brew_present_errors_clearly
         Brew not installed AND a tool is missing → return non-zero
         with a clear error pointing at https://brew.sh.
+
+  test_age_too_old_triggers_brew_upgrade
+        2026-05-11 production failure mode: ``age --version`` exits 0
+        and reports ``v1.0.0``, predating plugin-recipient support
+        (added in v1.1.0). bootstrap MUST detect this and call ``brew
+        upgrade age``, NOT silently advance to a stage-3 failure with
+        ``age: error: malformed recipient ... invalid type
+        "age1yubikey"``.
+
+  test_age_modern_does_not_trigger_upgrade
+        Inverse guard: when age reports a version >= AGE_MIN_VERSION,
+        ``ensure_age_tools`` must NOT call ``brew upgrade``.
+
+  test_age_upgrade_reverify_after_brew
+        After ``brew upgrade age`` succeeds, the helper must re-check
+        the installed version. If it's still too old (e.g. the tap
+        pins an old formula), bootstrap fails loud rather than
+        falsely claiming success.
+
+  test_version_lt_helper_handles_edge_cases
+        Direct exercises of the dotted-triple comparator that the
+        version-floor check depends on (boundary, equality, missing
+        components, multi-digit).
 """
 
 from __future__ import annotations
@@ -223,6 +246,170 @@ class EnsureAgeToolsTests(unittest.TestCase):
             "Homebrew not installed", r.stdout,
             msg="error must mention Homebrew so the operator knows what to install",
         )
+
+    # ------- age version-floor regression (2026-05-11) -------------------
+
+    def test_age_too_old_triggers_brew_upgrade(self) -> None:
+        """Models the stale-install regression: ``age --version`` returns
+        ``v1.0.0``, which predates plugin-recipient support added in
+        v1.1.0. ``age1yubikey1...`` recipients then fail at encrypt
+        time with ``malformed recipient ... invalid type "age1yubikey"``.
+        bootstrap must detect this and ``brew upgrade age`` *before*
+        the operator reaches stage 3.
+        """
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ls-age-ver-"))
+        version_file = tmp_dir / "age_version.txt"
+        version_file.write_text("1.0.0\n")
+        brew_trace = tmp_dir / "brew_trace.txt"
+        try:
+            with FakeBinDir(
+                tools=["age", "age-plugin-yubikey", "ykman", "brew"],
+            ) as bins:
+                r = _invoke(
+                    "ensure_age_tools",
+                    path=f"{bins.path}:/usr/bin:/bin",
+                    extra_env={
+                        "LOCAL_SCRIBE_FAKE_AGE_VERSION_FILE": str(version_file),
+                        "LOCAL_SCRIBE_FAKE_BREW_TRACE": str(brew_trace),
+                        "LOCAL_SCRIBE_FAKE_BREW_UPGRADE_FLIP": "1.3.1",
+                    },
+                )
+            self.assertTrue(
+                brew_trace.exists(),
+                msg=f"brew never called; stdout:\n{r.stdout}",
+            )
+            trace_lines = brew_trace.read_text().strip().splitlines()
+            self.assertTrue(
+                any(line.strip() == "upgrade age" for line in trace_lines),
+                msg=f"expected ``brew upgrade age`` in trace:\n"
+                    f"  {trace_lines!r}",
+            )
+            # Sanity: must not be install/reinstall (those wouldn't
+            # advance the version pin for an already-installed formula).
+            self.assertFalse(
+                any(line.strip() == "install age" for line in trace_lines),
+                msg=f"install would no-op for too-old age; trace:\n  {trace_lines!r}",
+            )
+            self.assertFalse(
+                any(line.strip() == "reinstall age" for line in trace_lines),
+                msg=f"reinstall would rewrite the SAME version; trace:\n  {trace_lines!r}",
+            )
+            # The operator-facing message should mention the version
+            # mismatch so they understand why an upgrade just ran.
+            self.assertRegex(
+                r.stdout,
+                r"installed 1\.0\.0 < required",
+                msg=f"upgrade reason must be explicit in stdout:\n{r.stdout}",
+            )
+            self.assertEqual(_exit_code_from(r.stdout), 0, msg=r.stdout)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_age_modern_does_not_trigger_upgrade(self) -> None:
+        """Inverse guard: a modern age must not cause ``brew upgrade``."""
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ls-age-ver-"))
+        version_file = tmp_dir / "age_version.txt"
+        version_file.write_text("1.2.0\n")
+        brew_trace = tmp_dir / "brew_trace.txt"
+        try:
+            with FakeBinDir(
+                tools=["age", "age-plugin-yubikey", "ykman", "brew"],
+            ) as bins:
+                r = _invoke(
+                    "ensure_age_tools",
+                    path=f"{bins.path}:/usr/bin:/bin",
+                    extra_env={
+                        "LOCAL_SCRIBE_FAKE_AGE_VERSION_FILE": str(version_file),
+                        "LOCAL_SCRIBE_FAKE_BREW_TRACE": str(brew_trace),
+                    },
+                )
+            self.assertEqual(_exit_code_from(r.stdout), 0, msg=r.stdout)
+            # brew must not have been called at all.
+            if brew_trace.exists():
+                trace = brew_trace.read_text()
+                self.assertNotIn(
+                    "upgrade", trace,
+                    msg=f"brew upgrade should not run for modern age; trace:\n{trace}",
+                )
+                self.assertNotIn("install", trace)
+                self.assertNotIn("reinstall", trace)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_age_upgrade_reverify_after_brew(self) -> None:
+        """If ``brew upgrade age`` ran but the post-upgrade age is STILL
+        too old (e.g. the tap pins an old formula), ``ensure_age_tools``
+        must fail loud rather than silently advance to stage 3.
+        """
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ls-age-ver-"))
+        version_file = tmp_dir / "age_version.txt"
+        version_file.write_text("1.0.0\n")
+        try:
+            with FakeBinDir(
+                tools=["age", "age-plugin-yubikey", "ykman", "brew"],
+            ) as bins:
+                r = _invoke(
+                    "ensure_age_tools",
+                    path=f"{bins.path}:/usr/bin:/bin",
+                    extra_env={
+                        "LOCAL_SCRIBE_FAKE_AGE_VERSION_FILE": str(version_file),
+                        # No LOCAL_SCRIBE_FAKE_BREW_UPGRADE_FLIP — the
+                        # fake brew "upgrade age" succeeds but the
+                        # version file is unchanged, so the post-upgrade
+                        # re-verify sees 1.0.0 still.
+                    },
+                )
+            self.assertNotEqual(_exit_code_from(r.stdout), 0, msg=r.stdout)
+            self.assertRegex(
+                r.stdout,
+                r"age still at 1\.0\.0 after upgrade",
+                msg=f"failure message must surface the stuck-version case:\n{r.stdout}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_version_lt_helper_handles_edge_cases(self) -> None:
+        """Direct exercises of the ``_version_lt`` helper. We can't
+        return a value from a bash function across the bash/Python
+        boundary trivially, so this test invokes it via a wrapper
+        script and asserts on the exit code."""
+        for a, b, expect_lt in [
+            ("1.0.0", "1.1.0", True),
+            ("1.0.9", "1.1.0", True),
+            ("1.1.0", "1.1.0", False),
+            ("1.1.0", "1.0.0", False),
+            ("1.2.0", "1.1.0", False),
+            ("2.0.0", "1.99.99", False),
+            ("1.10.0", "1.9.0", False),     # multi-digit minor
+            ("1.0", "1.1", True),              # missing patch
+            ("1", "1.0.1", True),              # missing minor + patch
+        ]:
+            script = (
+                f'source "{_RUN_SH}" >/dev/null 2>&1 || true\n'
+                f'if _version_lt "{a}" "{b}"; then echo "__rc=0"; '
+                f'else echo "__rc=$?"; fi\n'
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "HOME": os.environ.get("HOME", str(_REPO)),
+                    "TERM": "dumb",
+                    "LOCAL_SCRIBE_DEV_MODE": "1",
+                },
+                capture_output=True, text=True, timeout=10,
+                cwd=str(_REPO),
+            )
+            rc = _exit_code_from(proc.stdout)
+            got_lt = (rc == 0)
+            self.assertEqual(
+                got_lt, expect_lt,
+                msg=f"_version_lt {a!r} {b!r}: expected lt={expect_lt}, "
+                    f"got lt={got_lt}\nstdout:\n{proc.stdout}",
+            )
 
 
 if __name__ == "__main__":
