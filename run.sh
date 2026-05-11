@@ -624,12 +624,30 @@ ensure_touchid_helper() {
 # itself is missing (`brew.sh` is the only macOS-supported answer; we'd
 # rather refuse to bootstrap than silently downgrade security).
 ensure_age_tools() {
+  # Stage-2 of bootstrap. We need ``age``, ``age-plugin-yubikey``, and
+  # ``ykman`` not just on PATH but actually able to RUN. On 2026-05-11 a
+  # /opt/homebrew install of ykman left a zero-byte libexec python behind;
+  # ``command -v ykman`` returned a path but executing the script blew up
+  # with ``exec format error``. Stage 3 (key init) then failed with an
+  # opaque "no YubiKey detected" — because the YubiKey probe shells out
+  # to ykman. We catch the broken-install case HERE instead so the
+  # operator gets a self-healing reinstall at the right stage.
   local need=()
-  command -v age                >/dev/null 2>&1 || need+=("age")
-  command -v age-plugin-yubikey >/dev/null 2>&1 || need+=("age-plugin-yubikey")
-  command -v ykman              >/dev/null 2>&1 || need+=("ykman")
+  _tool_works() {
+    # Returns 0 if the binary is on PATH AND executes successfully when
+    # asked for its version. Anything else (missing, non-zero exit,
+    # ``exec format error``) → return non-zero so we trigger a
+    # reinstall.
+    local name="$1"
+    command -v "$name" >/dev/null 2>&1 || return 1
+    "$name" --version >/dev/null 2>&1
+  }
+  _tool_works age                || need+=("age")
+  _tool_works age-plugin-yubikey || need+=("age-plugin-yubikey")
+  _tool_works ykman              || need+=("ykman")
+  unset -f _tool_works
   if [[ ${#need[@]} -eq 0 ]]; then
-    say "${c_green}age, age-plugin-yubikey, ykman present${c_reset}"
+    say "${c_green}age, age-plugin-yubikey, ykman present + executable${c_reset}"
     return 0
   fi
   if ! command -v brew >/dev/null 2>&1; then
@@ -637,13 +655,47 @@ ensure_age_tools() {
     say "  install Homebrew (https://brew.sh) and re-run bootstrap"
     return 1
   fi
-  say "installing missing key-management tools via Homebrew: ${need[*]}"
-  if ! brew install "${need[@]}"; then
-    say "${c_red}brew install ${need[*]} failed${c_reset}"
-    say "  fix the brew error (or install the listed formulae manually) and re-run"
-    return 1
+  # If the binary EXISTS on PATH but didn't execute, ``brew install`` is
+  # a no-op (Homebrew thinks it's installed). We have to use
+  # ``brew reinstall`` to repair the install. Partition into install vs
+  # reinstall sets so the operator sees what we're doing and why.
+  local to_install=() to_reinstall=()
+  for t in "${need[@]}"; do
+    if command -v "$t" >/dev/null 2>&1; then
+      to_reinstall+=("$t")
+    else
+      to_install+=("$t")
+    fi
+  done
+  if [[ ${#to_reinstall[@]} -gt 0 ]]; then
+    say "${c_yellow}reinstalling broken key-management tools via Homebrew: ${to_reinstall[*]}${c_reset}"
+    say "  (binary is on PATH but ``<tool> --version`` failed — usually a stale or"
+    say "   architecture-mismatched install)"
+    if ! brew reinstall "${to_reinstall[@]}"; then
+      say "${c_red}brew reinstall ${to_reinstall[*]} failed${c_reset}"
+      say "  inspect manually with: ${c_bold}brew doctor${c_reset}"
+      return 1
+    fi
   fi
-  say "${c_green}installed: ${need[*]}${c_reset}"
+  if [[ ${#to_install[@]} -gt 0 ]]; then
+    say "installing missing key-management tools via Homebrew: ${to_install[*]}"
+    if ! brew install "${to_install[@]}"; then
+      say "${c_red}brew install ${to_install[*]} failed${c_reset}"
+      say "  fix the brew error (or install the listed formulae manually) and re-run"
+      return 1
+    fi
+  fi
+  # Re-verify after install/reinstall. If something still doesn't run we
+  # must NOT silently continue — the operator will hit a much more
+  # confusing error in stage 3.
+  for t in age age-plugin-yubikey ykman; do
+    if ! command -v "$t" >/dev/null 2>&1 || ! "$t" --version >/dev/null 2>&1; then
+      say "${c_red}$t still not working after install/reinstall${c_reset}"
+      say "  diagnose with: ${c_bold}$t --version${c_reset}"
+      return 1
+    fi
+  done
+  say "${c_green}installed/repaired: ${need[*]}${c_reset}"
   return 0
 }
 
@@ -725,7 +777,7 @@ ensure_config_json() {
   fi
   "$VENV_PY" - <<'PY'
 import sys
-from config import DEFAULT_CONFIG_PATH, write_default_config_if_missing
+from local_scribe.common.config import DEFAULT_CONFIG_PATH, write_default_config_if_missing
 created = write_default_config_if_missing()
 if created:
     print(f"\033[32mwrote default config\033[0m  {created}")
@@ -850,7 +902,7 @@ cmd_doctor() {
   if [[ -x "$VENV_PY" ]]; then
     "$VENV_PY" - <<'PY'
 import sys
-from config import DEFAULT_CONFIG_PATH, load_config, validate, to_dict
+from local_scribe.common.config import DEFAULT_CONFIG_PATH, load_config, validate, to_dict
 G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
 exists = DEFAULT_CONFIG_PATH.is_file()
 mark = (G + "\u25cf") if exists else (Y + "\u25cb")
@@ -2533,7 +2585,7 @@ cmd_transcribe() {
     say "usage: ./run.sh transcribe FILE [transcribe_file.py args]"
     return 1
   fi
-  exec "$VENV_PY" -u "$REPO/transcribe_file.py" "$@"
+  exec "$VENV_PY" -u -m local_scribe.asr.transcribe_file "$@"
 }
 
 cmd_firewall() {
@@ -3829,47 +3881,55 @@ EOF
   # redo_session.py derives the ASR bearer token in-process, which
   # unlocks the master key. SIP must be on.
   sip_gate || return 1
-  exec "$VENV_PY" -u "$REPO/redo_session.py" "$@"
+  exec "$VENV_PY" -u -m local_scribe.asr.redo_session "$@"
 }
 
-case "${1:-}" in
-  start)      shift; cmd_start "$@" ;;
-  stop)       cmd_stop ;;
-  restart)    shift; cmd_stop; cmd_start "$@" ;;
-  status)     cmd_status ;;
-  logs)       cmd_logs ;;
-  health)     cmd_health ;;
-  doctor)     cmd_doctor ;;
-  setup)      cmd_setup ;;
-  bootstrap)  cmd_bootstrap ;;
-  configure-char|configure_char|configure)
-              cmd_configure_char ;;
-  install-char|install_char)
-              cmd_install_char ;;
-  install-llm|install_llm|install-lmstudio|install_lmstudio)
-              cmd_install_llm ;;
-  inspector|web|ui)
-              shift; cmd_inspector "$@" ;;
-  proxy|egress-proxy|egress_proxy)
-              shift; cmd_egress_proxy "$@" ;;
-  transcribe) cmd_transcribe "$@" ;;
-  redo-session|redo_session|redo) cmd_redo_session "$@" ;;
-  firewall|fw) cmd_firewall "$@" ;;
-  key|keys)   cmd_key "$@" ;;
-  vault)      cmd_vault "$@" ;;
-  yubikey|yk) cmd_yubikey "$@" ;;
-  config)     shift; cmd_config "$@" ;;
-  char)        shift; cmd_char "$@" ;;
-  ""|-h|--help|help)
-    awk 'NR==1{next}
-         /^#/{sub(/^# ?/,""); print; next}
-         /^[[:space:]]*$/{print; next}
-         {exit}' "$0"
-    exit 0
-  ;;
-  *)
-    say "unknown command: $1"
-    say "run \`./run.sh\` with no args for help"
-    exit 1
-  ;;
-esac
+# Dispatcher. The ``BASH_SOURCE`` guard is the bash equivalent of
+# Python's ``if __name__ == "__main__"`` — only run the dispatcher
+# when this file is executed directly, not when something else
+# ``source``s it. That makes the file safe to source from test
+# harnesses (tests/bootstrap/*) and shell-completion scripts without
+# kicking off the help text + ``exit 0`` path.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+    start)      shift; cmd_start "$@" ;;
+    stop)       cmd_stop ;;
+    restart)    shift; cmd_stop; cmd_start "$@" ;;
+    status)     cmd_status ;;
+    logs)       cmd_logs ;;
+    health)     cmd_health ;;
+    doctor)     cmd_doctor ;;
+    setup)      cmd_setup ;;
+    bootstrap)  cmd_bootstrap ;;
+    configure-char|configure_char|configure)
+                cmd_configure_char ;;
+    install-char|install_char)
+                cmd_install_char ;;
+    install-llm|install_llm|install-lmstudio|install_lmstudio)
+                cmd_install_llm ;;
+    inspector|web|ui)
+                shift; cmd_inspector "$@" ;;
+    proxy|egress-proxy|egress_proxy)
+                shift; cmd_egress_proxy "$@" ;;
+    transcribe) cmd_transcribe "$@" ;;
+    redo-session|redo_session|redo) cmd_redo_session "$@" ;;
+    firewall|fw) cmd_firewall "$@" ;;
+    key|keys)   cmd_key "$@" ;;
+    vault)      cmd_vault "$@" ;;
+    yubikey|yk) cmd_yubikey "$@" ;;
+    config)     shift; cmd_config "$@" ;;
+    char)        shift; cmd_char "$@" ;;
+    ""|-h|--help|help)
+      awk 'NR==1{next}
+           /^#/{sub(/^# ?/,""); print; next}
+           /^[[:space:]]*$/{print; next}
+           {exit}' "$0"
+      exit 0
+    ;;
+    *)
+      say "unknown command: $1"
+      say "run \`./run.sh\` with no args for help"
+      exit 1
+    ;;
+  esac
+fi

@@ -265,9 +265,14 @@ def enroll(*, slot: int = DEFAULT_SLOT,
     except OSError:
         pass
 
-    # The plugin writes the identity stub to stdout when --identity-output
-    # is "-", and the recipient is printed to stderr. We always pin the
-    # output to our config path so the file lives where we expect.
+    # age-plugin-yubikey 0.5.x has no ``--identity-output`` flag — earlier
+    # docs that mentioned one have been wrong since at least 0.4.x. ``--generate``
+    # prints the identity stub (a comment header block followed by the
+    # ``AGE-PLUGIN-YUBIKEY-1...`` payload, with a ``# Recipient: age1yubikey1...``
+    # line embedded) directly to stdout. We capture stdout and write it to
+    # our pinned config path ourselves. The identity stub itself is *not*
+    # a secret (see module docstring), so the brief window before the
+    # chmod-tighten below is acceptable.
     cmd = [
         "age-plugin-yubikey",
         "--generate",
@@ -275,22 +280,51 @@ def enroll(*, slot: int = DEFAULT_SLOT,
         "--pin-policy", pin_policy,
         "--touch-policy", touch_policy,
         "--name", name,
-        "--identity-output", str(IDENTITY_PATH),
     ]
     logger.info("enrolling YubiKey: slot=%d touch=%s pin=%s name=%s",
                 slot, touch_policy, pin_policy, name)
+    # CRITICAL: the plugin reads the YubiKey PIV PIN from stdin and writes
+    # status/prompts to stderr. We MUST inherit both from the parent process
+    # so:
+    #   - the user sees the "Enter PIN:" / "🎲 Generating key..." prompts
+    #     in their actual terminal,
+    #   - the user can type a PIN on the TTY.
+    # If we pipe stdin (the default of capture_output=True), the plugin
+    # exits with rc=1 and ``Error: Failed to get input from user: IO error:
+    # not a terminal``. See tests/security/test_yubikey_backup_enroll.py
+    # for the regression coverage.
+    #
+    # We DO capture stdout, because that's where the identity stub
+    # (header comment block + AGE-PLUGIN-YUBIKEY-1... payload) lives and
+    # we need to persist it to ``IDENTITY_PATH``.
     proc = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=120,
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        stdin=None,
+        text=True,
+        timeout=120,
     )
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
         raise YubiKeyError(
-            "age-plugin-yubikey --generate failed "
-            f"(rc={proc.returncode}): {stderr or '<no stderr>'}"
+            f"age-plugin-yubikey --generate failed (rc={proc.returncode}); "
+            "see the plugin's output above this message for details"
         )
+    # Write the identity stub atomically with restrictive perms so it is
+    # never world-readable, even briefly. O_EXCL would be nicer but we
+    # support --force re-enrollment that overwrites an existing slot.
+    fd = os.open(
+        str(IDENTITY_PATH),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        os.write(fd, proc.stdout.encode("utf-8"))
+    finally:
+        os.close(fd)
     # The plugin emits the recipient on its own line beginning with
     # ``age1yubikey1...``. It also writes a parallel ``# Recipient: ...``
-    # comment in the identity file -- parse both as defense in depth.
+    # comment in the identity stub -- parse both as defense in depth.
     recipient = _extract_recipient(proc.stdout, proc.stderr) \
         or _read_recipient_from_identity(IDENTITY_PATH)
     if not recipient:
@@ -304,7 +338,25 @@ def enroll(*, slot: int = DEFAULT_SLOT,
     except OSError:
         pass
     logger.info("YubiKey enrolled; recipient written to %s", RECIPIENT_PATH)
-    return enrollment_info()  # type: ignore[return-value]
+    # Build EnrollmentInfo directly from what we just wrote. We can't call
+    # ``enrollment_info()`` here because that helper requires BACKUP_PATH
+    # to exist (it gates on ``is_enrolled()``); BACKUP_PATH is written by
+    # the separate ``backup_key()`` step that the caller chains after
+    # enrollment, so it isn't there yet.
+    serial: Optional[str] = None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("# Serial:"):
+            tail = line.split(":", 1)[1].strip()
+            serial = tail.split(",", 1)[0].strip() or None
+            break
+    return EnrollmentInfo(
+        recipient=recipient.strip(),
+        identity_path=IDENTITY_PATH,
+        backup_path=BACKUP_PATH,
+        slot=slot,
+        serial=serial,
+    )
 
 
 def _extract_recipient(*streams: str) -> Optional[str]:
