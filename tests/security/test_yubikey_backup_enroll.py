@@ -66,12 +66,33 @@ Coverage
   test_force_re_enroll_overwrites_identity
         ``enroll(force=True)`` should overwrite an existing identity
         file (regression-guard for the in-place atomic write).
+
+  test_recipient_extracted_with_variable_whitespace
+        Bug 5 (2026-05-11): the real plugin's stub uses ``#    Recipient:``
+        with VARIABLE internal whitespace for column alignment. Our
+        original prefix-based parser only matched ``# Recipient:`` (one
+        space) and failed on the real format, producing the
+        ``couldn't determine age recipient`` error AFTER the slot had
+        already been written. This test confirms the regex-based
+        extractor handles every whitespace combination.
+
+  test_recovers_existing_slot_when_generate_fails
+        Bug 6 (2026-05-11): when ``--generate`` errors with "Slot N is
+        not empty" (e.g. because a previous Bug 5 enrollment populated
+        the slot before raising), ``enroll()`` must fall back to
+        ``--identity --slot N`` and adopt the existing identity rather
+        than refusing to proceed.
+
+  test_force_overrides_slot_collision
+        With ``force=True``, the plugin DOES overwrite the slot and we
+        do NOT take the recovery path.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -79,6 +100,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional
+
+_RECIPIENT_RE = re.compile(r"age1yubikey1[a-z0-9]+")
 
 
 _FAKE_PLUGIN_SCRIPT = Path(__file__).with_name("_fake_age_plugin_yubikey.py")
@@ -167,7 +190,9 @@ class EnrollIntegrationTests(unittest.TestCase):
         self.assertTrue(self.yk.IDENTITY_PATH.exists())
         self.assertTrue(self.yk.RECIPIENT_PATH.exists())
         identity_text = self.yk.IDENTITY_PATH.read_text()
-        self.assertIn("# Recipient: age1yubikey1", identity_text)
+        # Real 0.5.x emits ``#    Recipient: age1yubikey1...`` with
+        # column-aligned whitespace; don't pin on a specific spacing.
+        self.assertRegex(identity_text, r"Recipient:\s+age1yubikey1")
         self.assertIn("AGE-PLUGIN-YUBIKEY-1", identity_text)
         recipient_text = self.yk.RECIPIENT_PATH.read_text().strip()
         self.assertTrue(
@@ -215,16 +240,18 @@ class EnrollIntegrationTests(unittest.TestCase):
 
     def test_does_not_capture_stdin_or_stderr(self) -> None:
         """Monkey-patch ``subprocess.run`` to record the kwargs enroll()
-        passes. The plugin reads the PIV PIN from stdin and emits prompts
-        on stderr; we MUST inherit both so the operator can answer.
+        passes. The --generate call reads the PIV PIN from stdin and
+        emits prompts on stderr; we MUST inherit both so the operator
+        can answer. The follow-up --identity call is non-interactive
+        and is allowed to pipe.
         """
-        recorded: list[dict] = []
+        recorded: list[tuple[list[str], dict]] = []
         real_run = subprocess.run
 
         def recording_run(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args")
             if isinstance(cmd, list) and cmd and "age-plugin-yubikey" in cmd[0]:
-                recorded.append(dict(kwargs))
+                recorded.append((list(cmd), dict(kwargs)))
             return real_run(*args, **kwargs)
 
         subprocess.run = recording_run  # type: ignore[assignment]
@@ -237,38 +264,39 @@ class EnrollIntegrationTests(unittest.TestCase):
             recorded,
             "no age-plugin-yubikey subprocess invocation captured",
         )
-        gen_calls = [c for c in recorded if c.get("timeout") is not None]
-        self.assertTrue(gen_calls, "expected --generate call with timeout")
-        kwargs = gen_calls[0]
+        gen_calls = [(c, kw) for c, kw in recorded if "--generate" in c]
+        self.assertTrue(gen_calls, "expected at least one --generate call")
+        _, kwargs = gen_calls[0]
 
         self.assertFalse(
             kwargs.get("capture_output", False),
-            "enroll() must NOT use capture_output=True (pipes stdin too) "
+            "--generate must NOT use capture_output=True (pipes stdin too) "
             "— regression of the 2026-05-11 'not a terminal' bug",
         )
         self.assertIsNone(
             kwargs.get("stdin"),
-            "enroll() must inherit stdin (=None), not pipe it",
+            "--generate must inherit stdin (=None), not pipe it",
         )
         self.assertIsNone(
             kwargs.get("stderr"),
-            "enroll() must inherit stderr (=None), not pipe it",
+            "--generate must inherit stderr (=None), not pipe it",
         )
         self.assertEqual(
             kwargs.get("stdout"),
             subprocess.PIPE,
-            "enroll() must capture stdout (where the identity stub lives)",
+            "--generate must capture stdout (where the identity stub lives)",
         )
 
     # ---- failure-mode coverage -------------------------------------------
 
     def test_plugin_failure_propagates(self) -> None:
-        """If the plugin errors (e.g. by being passed an unrecognized
-        flag), ``enroll()`` must surface a ``YubiKeyError`` with the
-        return code so the operator knows where to look."""
+        """If BOTH ``--generate`` and the ``--identity`` recovery probe
+        fail, ``enroll()`` must surface a ``YubiKeyError`` with the
+        return codes so the operator knows where to look."""
         # ``enroll()`` invokes the plugin by the bare name
         # ``age-plugin-yubikey`` so PATH lookup wins. Overwrite the
-        # on-PATH binary directly with a failing version.
+        # on-PATH binary directly with a failing version that
+        # rejects every invocation.
         target = self.bins.plugin
         target.unlink()
         target.write_text(
@@ -280,8 +308,12 @@ class EnrollIntegrationTests(unittest.TestCase):
         with self.assertRaises(self.yk.YubiKeyError) as ctx:
             self.yk.enroll()
         msg = str(ctx.exception)
-        self.assertIn("rc=2", msg)
         self.assertIn("age-plugin-yubikey", msg)
+        # The error must mention both return codes so the operator
+        # can distinguish a --generate-only failure from a total
+        # plugin breakage.
+        self.assertIn("--generate rc=2", msg)
+        self.assertIn("--identity rc=2", msg)
 
     # ---- idempotency / force ---------------------------------------------
 
@@ -301,6 +333,149 @@ class EnrollIntegrationTests(unittest.TestCase):
         second_text = self.yk.IDENTITY_PATH.read_text()
         self.assertNotEqual(first_text, second_text)
         self.assertNotEqual(first.recipient, second.recipient)
+
+    # ---- BUG-5 regression: recipient parser must tolerate whitespace ------
+
+    def test_recipient_extracted_with_variable_whitespace(self) -> None:
+        """The real plugin formats the recipient line as
+        ``#    Recipient: age1yubikey1...`` (column-aligned, variable
+        internal whitespace). Our original parser only matched the
+        exact ``# Recipient:`` (single-space) prefix and failed in
+        production on 2026-05-11.
+
+        This test feeds the parser every whitespace combination we've
+        observed in the wild — failure indicates a regression in the
+        regex-based extractor.
+        """
+        # Exact format captured 2026-05-11 from a real YubiKey via
+        # ``age-plugin-yubikey --identity --slot 1``. Note: bare
+        # ``Recipient:`` summary line at top, then the indented
+        # ``#    Recipient:`` inside the stub.
+        canonical_stub = (
+            "Recipient: age1yubikey1qgvkpum4aujll3usmthge3u940v6aglejcujjewhqjdlskvkgtyujfkvtap\n"
+            "#       Serial: 16366413, Slot: 1\n"
+            "#         Name: local_scribe\n"
+            "#      Created: Mon, 11 May 2026 22:24:55 +0000\n"
+            "#   PIN policy: Never  (A PIN is NOT required to decrypt)\n"
+            "# Touch policy: Always (A physical touch is required for every decryption)\n"
+            "#    Recipient: age1yubikey1qgvkpum4aujll3usmthge3u940v6aglejcujjewhqjdlskvkgtyujfkvtap\n"
+            "AGE-PLUGIN-YUBIKEY-1FKALJQYZVLYJ4JCGWZLHT\n"
+        )
+        extracted = self.yk._extract_recipient(canonical_stub)
+        self.assertEqual(
+            extracted,
+            "age1yubikey1qgvkpum4aujll3usmthge3u940v6aglejcujjewhqjdlskvkgtyujfkvtap",
+            "_extract_recipient must find the token regardless of the "
+            "comment-prefix whitespace alignment (regression of the "
+            "2026-05-11 'couldn't determine age recipient' bug)",
+        )
+
+        # Spot-check pathological whitespace combinations that aren't
+        # in the canonical stub but could appear in a future plugin
+        # revision.
+        for variant in [
+            "#Recipient:age1yubikey1abc123",
+            "#  Recipient: age1yubikey1abc123",
+            "    age1yubikey1abc123\n",
+            "Recipient: age1yubikey1abc123",
+            "noise\n#\tRecipient:\tage1yubikey1abc123\nnoise\n",
+        ]:
+            self.assertIsNotNone(
+                self.yk._extract_recipient(variant),
+                f"failed to extract from variant: {variant!r}",
+            )
+
+        # And the same regex must work when reading from disk.
+        identity_path = self.cfg_dir / "stub.txt"
+        identity_path.write_text(canonical_stub)
+        recipient = self.yk._read_recipient_from_identity(identity_path)
+        self.assertEqual(
+            recipient,
+            "age1yubikey1qgvkpum4aujll3usmthge3u940v6aglejcujjewhqjdlskvkgtyujfkvtap",
+        )
+
+    # ---- BUG-6 regression: recover existing slot via --identity fallback --
+
+    def test_recovers_existing_slot_when_generate_fails(self) -> None:
+        """Simulate the 2026-05-11 partial-enroll state: a previous
+        ``enroll()`` populated slot 1 but then raised because we
+        couldn't parse the recipient. On retry, ``--generate`` errors
+        with "Slot N is not empty" (rc=1), and ``enroll()`` must fall
+        back to ``--identity --slot N`` to adopt the existing identity
+        instead of failing — otherwise the operator is stuck and must
+        manually pass ``--force`` to burn the slot.
+        """
+        # Turn on slot-state tracking in the fake plugin. The first
+        # --generate writes slot 1; subsequent --generate without
+        # --force errors exactly like the real plugin.
+        state_dir = self.cfg_dir / "fake-plugin-state"
+        state_dir.mkdir()
+        os.environ["LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR"] = str(state_dir)
+        recovered_recipient = (
+            "age1yubikey1zrecover9zrecover9zrecover9zrecover9zrecover9zrec"
+        )
+        os.environ["LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT"] = recovered_recipient
+        try:
+            # First enroll: populates slot 1 successfully.
+            first = self.yk.enroll()
+            self.assertEqual(first.recipient, recovered_recipient)
+            # Wipe our local config-dir artifacts so the next enroll()
+            # has nothing to read back — only the YubiKey slot is
+            # populated. This mirrors the production state on
+            # 2026-05-11 where the slot had been written but our
+            # config dir was empty because we raised before persisting.
+            for p in (self.yk.IDENTITY_PATH, self.yk.RECIPIENT_PATH):
+                if p.exists():
+                    p.unlink()
+            # Clear the trace so the next assertions are unambiguous.
+            self.trace_path.write_text("")
+
+            # Second enroll: --generate now errors with slot-not-empty.
+            # We must recover via --identity and re-persist artifacts.
+            second = self.yk.enroll()
+        finally:
+            os.environ.pop("LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR", None)
+            os.environ.pop("LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT", None)
+
+        self.assertEqual(
+            second.recipient,
+            recovered_recipient,
+            "enroll() must recover the existing slot's recipient",
+        )
+        self.assertTrue(self.yk.IDENTITY_PATH.exists())
+        self.assertTrue(self.yk.RECIPIENT_PATH.exists())
+        # Verify the recovery path actually called --identity.
+        trace = self.trace_path.read_text()
+        self.assertIn("--generate", trace)
+        self.assertIn("--identity", trace)
+
+    def test_force_overrides_slot_collision(self) -> None:
+        """``enroll(force=True)`` must overwrite even a populated slot
+        rather than taking the --identity recovery path. The fake
+        plugin's --force flag mirrors the real plugin's behaviour.
+        """
+        state_dir = self.cfg_dir / "fake-plugin-state"
+        state_dir.mkdir()
+        os.environ["LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR"] = str(state_dir)
+        first_recipient = (
+            "age1yubikey1zfirst9zfirst9zfirst9zfirst9zfirst9zfirst9zfirst9z"
+        )
+        second_recipient = (
+            "age1yubikey1zsecnd9zsecnd9zsecnd9zsecnd9zsecnd9zsecnd9zsecnd9z"
+        )
+        try:
+            os.environ["LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT"] = first_recipient
+            first = self.yk.enroll()
+            self.assertEqual(first.recipient, first_recipient)
+
+            os.environ["LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT"] = second_recipient
+            second = self.yk.enroll(force=True)
+        finally:
+            os.environ.pop("LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR", None)
+            os.environ.pop("LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT", None)
+
+        # With --force, the slot is overwritten with the new identity.
+        self.assertEqual(second.recipient, second_recipient)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +507,7 @@ class FakePluginContractTests(unittest.TestCase):
     def test_generate_emits_recipient_and_stub(self) -> None:
         r = self._run("--generate", "--slot", "1", "--name", "test")
         self.assertEqual(r.returncode, 0, msg=r.stderr)
-        self.assertIn("# Recipient: age1yubikey1", r.stdout)
+        self.assertRegex(r.stdout, r"Recipient:\s+age1yubikey1")
         self.assertIn("AGE-PLUGIN-YUBIKEY-1", r.stdout)
         self.assertIn("Generating key", r.stderr)
 

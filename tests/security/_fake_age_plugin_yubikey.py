@@ -26,15 +26,25 @@ Flags REJECTED with rc=2 (regression catchers — these don't exist in
 
   --identity-output PATH
 
-Behaviour on ``--generate`` happy path:
-  * Emits "🎲 Generating key...\\n" to stderr (the real plugin does this).
-  * Emits a 0.5.x-shaped identity stub to stdout:
-        # Created: 2026-05-11 14:00:00 UTC
-        # Serial: <serial>, Slot: <slot>
-        # Access policy: pin policy=<p>, touch policy=<t>
-        # Recipient: age1yubikey1...
-        AGE-PLUGIN-YUBIKEY-1QWERTYUIOPASDFGHJKLZXCVBNM
-  * Exits 0.
+Identity stub format (mirrors real 0.5.x output captured 2026-05-11
+from a live YubiKey, including the variable internal whitespace that
+broke our prefix-based parser):
+
+    Recipient: age1yubikey1...
+    #       Serial: 16366413, Slot: 1
+    #         Name: local_scribe
+    #      Created: Mon, 11 May 2026 22:24:55 +0000
+    #   PIN policy: Never  (A PIN is NOT required to decrypt)
+    # Touch policy: Always (A physical touch is required for every decryption)
+    #    Recipient: age1yubikey1...
+    AGE-PLUGIN-YUBIKEY-1FKALJQYZVLYJ4JCGWZLHT
+
+Slot-state tracking (optional, enables recovery-path tests):
+If ``LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR`` is set, ``--generate``
+writes a ``slot_<N>.json`` file with the enrollment metadata. A
+second ``--generate --slot N`` without ``--force`` then fails with
+the real plugin's "Slot N is not empty" error. ``--identity --slot N``
+reads from the same state to reproduce a populated slot.
 
 Knobs (via env vars, all optional):
   LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT
@@ -46,6 +56,10 @@ Knobs (via env vars, all optional):
         If ``1``, require stdin.isatty() and emit the real-plugin's
         "Error: Failed to get input from user: IO error: not a terminal"
         + exit 1 otherwise. Used by the TTY-inheritance regression test.
+  LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR
+        Directory for persistent slot state. Enables the "Slot N is not
+        empty" rc=1 error on duplicate --generate, and lets --identity
+        return whatever --generate previously wrote.
   LOCAL_SCRIBE_FAKE_AGE_PLUGIN_TRACE
         If set, append the argv (one per line) plus ``[stdin_tty=...]``
         to this file. Lets tests assert on what we invoked the plugin with.
@@ -53,8 +67,10 @@ Knobs (via env vars, all optional):
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from pathlib import Path
 
 _VERSION = "age-plugin-yubikey 0.5.1"
 _DEFAULT_RECIPIENT = (
@@ -84,6 +100,65 @@ def _trace(argv: list[str]) -> None:
         pass
 
 
+def _state_path(slot: str) -> Path | None:
+    base = os.environ.get("LOCAL_SCRIBE_FAKE_AGE_PLUGIN_STATE_DIR")
+    if not base:
+        return None
+    return Path(base) / f"slot_{slot}.json"
+
+
+def _read_slot(slot: str) -> dict | None:
+    path = _state_path(slot)
+    if not path or not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_slot(slot: str, data: dict) -> None:
+    path = _state_path(slot)
+    if not path:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+def _format_stub(slot: str, recipient: str, serial: str,
+                 name: str, pin_policy: str, touch_policy: str) -> str:
+    """Emit a realistic 0.5.x identity stub.
+
+    The whitespace columns are *significant* — they are what tripped
+    up the prefix-based parser on 2026-05-11. The real plugin
+    right-aligns the field labels in a column, producing e.g.
+    ``#    Recipient:`` (four spaces) rather than ``# Recipient:``
+    (one space). Any regression in the upstream alignment would be
+    caught by parsers that look for substring ``Recipient:`` instead
+    of an exact prefix.
+    """
+    pin_human = {
+        "always": "Always (A PIN is required for every decryption)",
+        "once":   "Once   (A PIN is required once per session, if set)",
+        "never":  "Never  (A PIN is NOT required to decrypt)",
+    }.get(pin_policy, pin_policy)
+    touch_human = {
+        "always": "Always (A physical touch is required for every decryption)",
+        "cached": "Cached (A physical touch is cached for 15 seconds)",
+        "never":  "Never  (A physical touch is NOT required)",
+    }.get(touch_policy, touch_policy)
+    return (
+        f"Recipient: {recipient}\n"
+        f"#       Serial: {serial}, Slot: {slot}\n"
+        f"#         Name: {name}\n"
+        f"#      Created: Mon, 11 May 2026 22:24:55 +0000\n"
+        f"#   PIN policy: {pin_human}\n"
+        f"# Touch policy: {touch_human}\n"
+        f"#    Recipient: {recipient}\n"
+        f"AGE-PLUGIN-YUBIKEY-1QWERTYUIOPASDFGHJKLZXCVBNM\n"
+    )
+
+
 def _print_help() -> None:
     sys.stdout.write(
         "Usage: age-plugin-yubikey [OPTIONS]\n\n"
@@ -101,6 +176,41 @@ def _print_help() -> None:
         "  --slot SLOT                 Specify which slot to use.\n"
         "  --touch-policy POLICY       One of [always, cached, never].\n"
     )
+
+
+def _parse_args(argv: list[str]) -> dict:
+    out = {
+        "slot": "1",
+        "pin_policy": "once",
+        "touch_policy": "always",
+        "name": "age identity",
+        "force": False,
+    }
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--slot" and i + 1 < len(argv):
+            out["slot"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--pin-policy" and i + 1 < len(argv):
+            out["pin_policy"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--touch-policy" and i + 1 < len(argv):
+            out["touch_policy"] = argv[i + 1]
+            i += 2
+            continue
+        if a == "--name" and i + 1 < len(argv):
+            out["name"] = argv[i + 1]
+            i += 2
+            continue
+        if a in ("--force", "-f"):
+            out["force"] = True
+            i += 1
+            continue
+        i += 1
+    return out
 
 
 def main(argv: list[str]) -> int:
@@ -124,48 +234,52 @@ def main(argv: list[str]) -> int:
         _print_help()
         return 0
 
+    args = _parse_args(argv)
+    default_recipient = os.environ.get(
+        "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT", _DEFAULT_RECIPIENT
+    )
+    default_serial = os.environ.get(
+        "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_SERIAL", _DEFAULT_SERIAL
+    )
+
     if "--identity" in argv or "-i" in argv:
-        recipient = os.environ.get(
-            "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT", _DEFAULT_RECIPIENT
+        existing = _read_slot(args["slot"])
+        if existing is None:
+            # If state tracking is off, fall through to a default
+            # identity stub. If state tracking is on and the slot
+            # is empty, mimic the real plugin's empty-output exit.
+            if _state_path(args["slot"]) is not None:
+                return 0
+            sys.stdout.write(
+                _format_stub(
+                    slot=args["slot"],
+                    recipient=default_recipient,
+                    serial=default_serial,
+                    name="age identity",
+                    pin_policy="never",
+                    touch_policy="always",
+                )
+            )
+            return 0
+        sys.stdout.write(
+            _format_stub(
+                slot=existing["slot"],
+                recipient=existing["recipient"],
+                serial=existing["serial"],
+                name=existing.get("name", "age identity"),
+                pin_policy=existing.get("pin_policy", "never"),
+                touch_policy=existing.get("touch_policy", "always"),
+            )
         )
-        serial = os.environ.get(
-            "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_SERIAL", _DEFAULT_SERIAL
-        )
-        sys.stdout.write(f"# Serial: {serial}, Slot: 1\n")
-        sys.stdout.write(f"# Recipient: {recipient}\n")
-        sys.stdout.write("AGE-PLUGIN-YUBIKEY-1QWERTYUIOPASDFGHJKLZXCVBNM\n")
         return 0
 
     if "--list" in argv or "-l" in argv or "--list-all" in argv:
-        recipient = os.environ.get(
-            "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT", _DEFAULT_RECIPIENT
-        )
+        existing = _read_slot(args["slot"])
+        recipient = existing["recipient"] if existing else default_recipient
         sys.stdout.write(recipient + "\n")
         return 0
 
     if "--generate" in argv or "-g" in argv:
-        # Find the slot / policies (default to plugin's defaults if not
-        # specified — the real CLI is permissive about ordering).
-        slot = "1"
-        pin_policy = "once"
-        touch_policy = "always"
-        i = 0
-        while i < len(argv):
-            a = argv[i]
-            if a == "--slot" and i + 1 < len(argv):
-                slot = argv[i + 1]
-                i += 2
-                continue
-            if a == "--pin-policy" and i + 1 < len(argv):
-                pin_policy = argv[i + 1]
-                i += 2
-                continue
-            if a == "--touch-policy" and i + 1 < len(argv):
-                touch_policy = argv[i + 1]
-                i += 2
-                continue
-            i += 1
-
         sys.stderr.write("🎲 Generating key...\n")
 
         if os.environ.get("LOCAL_SCRIBE_FAKE_AGE_PLUGIN_REQUIRE_TTY") == "1":
@@ -178,20 +292,36 @@ def main(argv: list[str]) -> int:
                 )
                 return 1
 
-        recipient = os.environ.get(
-            "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_RECIPIENT", _DEFAULT_RECIPIENT
-        )
-        serial = os.environ.get(
-            "LOCAL_SCRIBE_FAKE_AGE_PLUGIN_SERIAL", _DEFAULT_SERIAL
-        )
+        # Slot-state collision: replicate the real plugin's
+        # "Slot N is not empty. Use --force to overwrite the slot." rc=1
+        # so the recovery path in yubikey_backup.enroll() gets exercised.
+        existing = _read_slot(args["slot"])
+        if existing is not None and not args["force"]:
+            sys.stderr.write(
+                f"Error: Slot {args['slot']} is not empty. "
+                "Use --force to overwrite the slot.\n"
+            )
+            return 1
 
-        sys.stdout.write("# Created: 2026-05-11 14:00:00 UTC\n")
-        sys.stdout.write(f"# Serial: {serial}, Slot: {slot}\n")
-        sys.stdout.write(
-            f"# Access policy: pin policy={pin_policy}, touch policy={touch_policy}\n"
+        recipient = default_recipient
+        serial = default_serial
+        stub = _format_stub(
+            slot=args["slot"],
+            recipient=recipient,
+            serial=serial,
+            name=args["name"],
+            pin_policy=args["pin_policy"],
+            touch_policy=args["touch_policy"],
         )
-        sys.stdout.write(f"# Recipient: {recipient}\n")
-        sys.stdout.write("AGE-PLUGIN-YUBIKEY-1QWERTYUIOPASDFGHJKLZXCVBNM\n")
+        _write_slot(args["slot"], {
+            "slot": args["slot"],
+            "recipient": recipient,
+            "serial": serial,
+            "name": args["name"],
+            "pin_policy": args["pin_policy"],
+            "touch_policy": args["touch_policy"],
+        })
+        sys.stdout.write(stub)
         return 0
 
     _print_help()

@@ -54,11 +54,27 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+# age-plugin-yubikey 0.5.x emits the recipient token in two places:
+#
+#   1. Sometimes as a bare-summary line:    ``Recipient: age1yubikey1abc...``
+#   2. Always as a comment in the stub:     ``#    Recipient: age1yubikey1abc...``
+#      (variable internal whitespace for column alignment).
+#
+# Different invocation modes (--generate vs --identity, TTY vs pipe)
+# choose different subsets. Rather than enumerate every prefix, just
+# find the token anywhere on any line — Bech32 alphabet means false
+# positives are negligible. The token alphabet (lowercase Bech32 minus
+# ``b``, ``i``, ``o``, ``1``) is documented in age-plugin-yubikey, but
+# we accept the full lower-alnum range for forward compatibility.
+_RECIPIENT_TOKEN_RE = re.compile(r"(age1yubikey1[a-z0-9]+)")
 
 
 logger = logging.getLogger("local_scribe.yubikey_backup")
@@ -266,13 +282,13 @@ def enroll(*, slot: int = DEFAULT_SLOT,
         pass
 
     # age-plugin-yubikey 0.5.x has no ``--identity-output`` flag — earlier
-    # docs that mentioned one have been wrong since at least 0.4.x. ``--generate``
-    # prints the identity stub (a comment header block followed by the
-    # ``AGE-PLUGIN-YUBIKEY-1...`` payload, with a ``# Recipient: age1yubikey1...``
-    # line embedded) directly to stdout. We capture stdout and write it to
-    # our pinned config path ourselves. The identity stub itself is *not*
-    # a secret (see module docstring), so the brief window before the
-    # chmod-tighten below is acceptable.
+    # docs that mentioned one have been wrong since at least 0.4.x.
+    # ``--generate`` prints the identity stub (a comment header block
+    # followed by the ``AGE-PLUGIN-YUBIKEY-1...`` payload) directly to
+    # stdout, with a ``#    Recipient: age1yubikey1...`` line embedded
+    # in the comment block. The variable internal whitespace between
+    # ``#`` and ``Recipient:`` is significant — see _RECIPIENT_TOKEN_RE
+    # at the bottom of this module.
     cmd = [
         "age-plugin-yubikey",
         "--generate",
@@ -281,23 +297,29 @@ def enroll(*, slot: int = DEFAULT_SLOT,
         "--touch-policy", touch_policy,
         "--name", name,
     ]
+    if force:
+        # End-to-end overwrite: --force makes age-plugin-yubikey
+        # overwrite the slot even if it's already populated. Without
+        # this, ``force=True`` would skip our local is_enrolled()
+        # short-circuit but still hit "Slot N is not empty" from the
+        # plugin and silently take the --identity recovery path,
+        # producing a re-enrolled SecretInfo object that secretly
+        # still points at the OLD slot identity. Operators expect
+        # ``force`` to mean what it says.
+        cmd.append("--force")
     logger.info("enrolling YubiKey: slot=%d touch=%s pin=%s name=%s",
                 slot, touch_policy, pin_policy, name)
-    # CRITICAL: the plugin reads the YubiKey PIV PIN from stdin and writes
-    # status/prompts to stderr. We MUST inherit both from the parent process
-    # so:
-    #   - the user sees the "Enter PIN:" / "🎲 Generating key..." prompts
-    #     in their actual terminal,
-    #   - the user can type a PIN on the TTY.
-    # If we pipe stdin (the default of capture_output=True), the plugin
-    # exits with rc=1 and ``Error: Failed to get input from user: IO error:
-    # not a terminal``. See tests/security/test_yubikey_backup_enroll.py
-    # for the regression coverage.
+    # CRITICAL: the plugin reads the YubiKey PIV PIN from stdin and
+    # writes status/prompts to stderr. We MUST inherit both from the
+    # parent process so the operator sees the prompts and can type the
+    # PIN on the TTY. Piping stdin (e.g. capture_output=True) reproduces
+    # the 2026-05-11 "IO error: not a terminal" / "Bad file descriptor"
+    # failures — see tests/security/test_yubikey_backup_enroll.py for
+    # the regression coverage.
     #
     # We DO capture stdout, because that's where the identity stub
-    # (header comment block + AGE-PLUGIN-YUBIKEY-1... payload) lives and
-    # we need to persist it to ``IDENTITY_PATH``.
-    proc = subprocess.run(
+    # lives and we want to persist it to ``IDENTITY_PATH``.
+    gen_proc = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=None,
@@ -305,49 +327,100 @@ def enroll(*, slot: int = DEFAULT_SLOT,
         text=True,
         timeout=120,
     )
-    if proc.returncode != 0:
+    # Whether or not --generate succeeded, ``--identity --slot N``
+    # tells us what's CURRENTLY in the slot. This collapses three
+    # cases into one happy path:
+    #
+    #   1. --generate succeeded → --identity returns the new identity
+    #      we just minted.
+    #   2. --generate failed with "Slot N is not empty" (a previous
+    #      partial-enroll left the slot populated; we couldn't parse
+    #      its output, raised, and exited — but the YubiKey kept the
+    #      identity). --identity returns the existing identity, and
+    #      we adopt it. This recovers the 2026-05-11 partial-enroll
+    #      state without forcing the operator to ``key init --force``.
+    #   3. --generate succeeded but stdout didn't contain a parseable
+    #      recipient (variable plugin output format across versions /
+    #      TTY vs pipe detection). --identity gives us the canonical
+    #      stub format every time.
+    #
+    # --identity reads the public part of the slot only — no PIN, no
+    # touch prompt — so this is cheap.
+    id_proc = subprocess.run(
+        ["age-plugin-yubikey", "--identity", "--slot", str(slot)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        timeout=30,
+    )
+
+    # Choose the canonical stub: prefer --identity output (always the
+    # current slot state), fall back to --generate's stdout if
+    # --identity failed for any reason.
+    if id_proc.returncode == 0 and id_proc.stdout.strip():
+        stub = id_proc.stdout
+        stub_source = "identity"
+    elif gen_proc.returncode == 0 and gen_proc.stdout.strip():
+        stub = gen_proc.stdout
+        stub_source = "generate"
+    else:
         raise YubiKeyError(
-            f"age-plugin-yubikey --generate failed (rc={proc.returncode}); "
+            f"age-plugin-yubikey could not produce an identity stub "
+            f"(--generate rc={gen_proc.returncode}, "
+            f"--identity rc={id_proc.returncode}); "
             "see the plugin's output above this message for details"
         )
-    # Write the identity stub atomically with restrictive perms so it is
-    # never world-readable, even briefly. O_EXCL would be nicer but we
-    # support --force re-enrollment that overwrites an existing slot.
+
+    recipient = _extract_recipient(stub)
+    if not recipient:
+        raise YubiKeyError(
+            "couldn't determine age recipient from age-plugin-yubikey output. "
+            "Output was:\n" + stub.strip()
+        )
+
+    # Write the canonical identity stub atomically with restrictive
+    # perms so it is never world-readable, even briefly. O_EXCL would
+    # be nicer but we support --force re-enrollment that overwrites
+    # an existing slot. The identity stub itself is *not* a secret
+    # (see module docstring) but tighter is better.
     fd = os.open(
         str(IDENTITY_PATH),
         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
         0o600,
     )
     try:
-        os.write(fd, proc.stdout.encode("utf-8"))
+        os.write(fd, stub.encode("utf-8"))
     finally:
         os.close(fd)
-    # The plugin emits the recipient on its own line beginning with
-    # ``age1yubikey1...``. It also writes a parallel ``# Recipient: ...``
-    # comment in the identity stub -- parse both as defense in depth.
-    recipient = _extract_recipient(proc.stdout, proc.stderr) \
-        or _read_recipient_from_identity(IDENTITY_PATH)
-    if not recipient:
-        raise YubiKeyError(
-            "couldn't determine age recipient from age-plugin-yubikey output"
-        )
+
     RECIPIENT_PATH.write_text(recipient.strip() + "\n")
     try:
         os.chmod(RECIPIENT_PATH, 0o600)
         os.chmod(IDENTITY_PATH, 0o600)
     except OSError:
         pass
-    logger.info("YubiKey enrolled; recipient written to %s", RECIPIENT_PATH)
-    # Build EnrollmentInfo directly from what we just wrote. We can't call
-    # ``enrollment_info()`` here because that helper requires BACKUP_PATH
-    # to exist (it gates on ``is_enrolled()``); BACKUP_PATH is written by
-    # the separate ``backup_key()`` step that the caller chains after
-    # enrollment, so it isn't there yet.
+
+    if gen_proc.returncode != 0:
+        logger.warning(
+            "age-plugin-yubikey --generate failed (rc=%d) but slot %d "
+            "contains a valid age identity (recipient: %s); adopting it. "
+            "If you intended to overwrite the slot, re-run with --force.",
+            gen_proc.returncode, slot, recipient,
+        )
+    logger.info(
+        "YubiKey enrolled (stub source: %s); recipient written to %s",
+        stub_source, RECIPIENT_PATH,
+    )
+
+    # Build EnrollmentInfo directly from what we just wrote. We can't
+    # call ``enrollment_info()`` because it requires BACKUP_PATH (a
+    # separate later step) to exist.
     serial: Optional[str] = None
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("# Serial:"):
-            tail = line.split(":", 1)[1].strip()
+    for line in stub.splitlines():
+        ln = line.strip().lstrip("#").strip()
+        if ln.lower().startswith("serial:"):
+            tail = ln.split(":", 1)[1].strip()
             serial = tail.split(",", 1)[0].strip() or None
             break
     return EnrollmentInfo(
@@ -365,12 +438,9 @@ def _extract_recipient(*streams: str) -> Optional[str]:
     for s in streams:
         if not s:
             continue
-        for line in s.splitlines():
-            line = line.strip()
-            if line.startswith("age1yubikey1"):
-                return line
-            if line.startswith("Recipient: age1yubikey1"):
-                return line.split("Recipient:", 1)[1].strip()
+        m = _RECIPIENT_TOKEN_RE.search(s)
+        if m:
+            return m.group(1)
     return None
 
 
@@ -379,11 +449,8 @@ def _read_recipient_from_identity(path: Path) -> Optional[str]:
         text = path.read_text()
     except OSError:
         return None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("# Recipient:"):
-            return line.split(":", 1)[1].strip()
-    return None
+    m = _RECIPIENT_TOKEN_RE.search(text)
+    return m.group(1) if m else None
 
 
 # ---------------------------------------------------------------------------
