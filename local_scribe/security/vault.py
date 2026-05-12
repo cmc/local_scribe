@@ -3,10 +3,6 @@
 Design summary
 --------------
 
-Forward-looking design (this module is implemented + unit-tested but
-the ``./run.sh start`` wiring that mounts the vault on demand is still
-pending — see TODO.md → "Encrypt audio at rest"):
-
 1.  The 256-bit master key is the Option C split-key reconstituted via
     ``key_lifecycle.unlock_master_key()`` -- ``kc_half`` from Keychain
     (Touch ID) XOR ``yk_half`` from an age-encrypted file (YubiKey tap).
@@ -24,6 +20,31 @@ pending — see TODO.md → "Encrypt audio at rest"):
     attach -stdinpass``. The password is piped in via stdin so it
     never appears on argv -- mirroring the same defense as
     ``char_settings_writer``.
+
+Enforcement wiring (added 2026-05-11)
+-------------------------------------
+
+The "encryption-at-rest" guarantee only holds if Char's data dir
+actually lives inside the mount, not just that the vault EXISTS on
+disk.  Two wires in ``run.sh`` make that the default:
+
+* ``vault_relocation_gate`` (called from ``cmd_start`` between
+  ``pinned_config_gate`` and ``char_integrity_gate``) refuses to
+  start the pipeline if ``char_data_relocated()`` is False.  Loud
+  red banner naming the recovery command.  Override:
+  ``LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA=1`` (loud-but-explicit,
+  matching the rest of the bypass-env convention).
+
+* Bootstrap stage 4 now does TWO things instead of one: create the
+  sparse bundle, AND mount + relocate Char's data into it.  Earlier
+  bootstrap stopped after step 1 — the result was a working vault
+  that nothing wrote to while Char accumulated plaintext sessions
+  next to it (2026-05-11 audit found 6 such sessions).
+
+* ``cmd_status`` surfaces the relocation state under the
+  "Encryption at rest" header so an operator who runs
+  ``./run.sh status`` between bootstraps notices the missing
+  relocation BEFORE plaintext data accumulates.
 
 Why a sparse bundle rather than per-file encryption:
     A FUSE/userspace overlay would be far more invasive and require code

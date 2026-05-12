@@ -459,6 +459,101 @@ pinned_config_gate() {
   return 1
 }
 
+# Layer A¾ — vault-relocation gate. The encrypted sparse-bundle
+# vault is created by bootstrap stage 4, and ``vault.relocate_char_data()``
+# moves ``~/Library/Application Support/hyprnote`` INTO the mounted
+# vault and replaces the original location with a symlink. The whole
+# encryption-at-rest story falls apart if the operator skips that
+# relocation: Char keeps writing plaintext (session audio.mp3,
+# transcript.json, app.db, search_index/) straight to the home
+# filesystem, where Time Machine / backup software / forensic
+# tooling can pick it up. The 2026-05-11 audit found 6 unencrypted
+# sessions sitting at ``~/Library/Application Support/hyprnote/sessions``
+# despite a working vault + master key — this gate is the fix.
+#
+# Failure mode: refuse to start with a loud banner pointing the
+# operator at ``./run.sh vault unlock`` (which mounts + relocates
+# atomically; Char.app must be quit first).
+#
+# Sits AFTER ``master_key_gate`` (we need the key to query vault
+# state), AFTER ``pinned_config_gate`` (no point trusting unsigned
+# vault state), and BEFORE ``char_integrity_gate`` (because we don't
+# want to verify the Char binary against a baseline if we'd refuse
+# to launch anyway). Skipped if ``LOCAL_SCRIBE_SKIP_INTEGRITY=1``
+# (test seam) or the venv hasn't been built yet (bootstrap path).
+#
+# Override: ``LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA=1``. Loud-but-
+# explicit, mirroring ``LOCAL_SCRIBE_ALLOW_DIRTY``. Use this only if
+# you're knowingly running on a tmpfs / scratch system where the
+# encrypted-at-rest guarantee doesn't matter (CI, throwaway VM).
+vault_relocation_gate() {
+  if [[ "${LOCAL_SCRIBE_SKIP_INTEGRITY:-0}" != "0" ]]; then
+    return 0
+  fi
+  if [[ ! -x "$VENV_PY" ]]; then
+    return 0   # bootstrap path, venv not built yet
+  fi
+  # ``char_data_relocated()`` returns True iff the canonical Char
+  # data dir is a symlink resolving INTO the vault mount. It does
+  # NOT require the vault to be mounted (the symlink existence
+  # check is enough to verify the relocation happened). If the
+  # vault isn't mounted at start time, the next stage (asr_start /
+  # inspector_start) would fail when it tries to follow the symlink
+  # — that's also a documented failure mode, surfaced separately.
+  if "$VENV_PY" -c '
+import sys
+from local_scribe.security import vault
+sys.exit(0 if vault.char_data_relocated() else 1)
+' 2>/dev/null; then
+    return 0
+  fi
+  if [[ "${LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA:-0}" != "0" ]]; then
+    printf "%s⚠  Char data dir is NOT relocated into the vault; continuing anyway because LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA=1.%s\n" \
+           "$c_yellow" "$c_reset" >&2
+    printf "%s    Session audio + transcripts will be written PLAINTEXT to ~/Library/Application Support/hyprnote.%s\n" \
+           "$c_yellow" "$c_reset" >&2
+    return 0
+  fi
+  printf '\n'
+  printf "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n" \
+         "$c_red" "$c_reset"
+  printf "%s%sREFUSING TO START: Char data is PLAINTEXT on disk.%s\n" \
+         "$c_red" "$c_bold" "$c_reset"
+  printf '\n'
+  printf "  Char's data dir lives at:\n"
+  printf "    %s~/Library/Application Support/hyprnote%s\n" "$c_dim" "$c_reset"
+  printf "  That dir contains:\n"
+  printf "    %s•%s every session's audio.mp3 + transcript.json\n" "$c_dim" "$c_reset"
+  printf "    %s•%s app.db (SQLite — speakers, calendars, notes, chats)\n" "$c_dim" "$c_reset"
+  printf "    %s•%s search_index/ (Tantivy full-text index of transcripts)\n" "$c_dim" "$c_reset"
+  printf "  The encrypted vault you created at bootstrap is empty + unused;\n"
+  printf "  this gate exists so we don't quietly normalise the broken state.\n"
+  printf '\n'
+  printf "  %sFix (one-shot per machine — Touch ID + YubiKey tap):%s\n" \
+         "$c_bold" "$c_reset"
+  printf "    1.  %sQuit Char.app%s (Cmd-Q — closing the window is not enough;\n" \
+         "$c_bold" "$c_reset"
+  printf "        its SQLite handle MUST be released or we'll corrupt the DB).\n"
+  printf "    2.  %s./run.sh stop%s   (no-op if the pipeline isn't already up).\n" \
+         "$c_bold" "$c_reset"
+  printf "    3.  %s./run.sh vault unlock%s   (Touch ID + YubiKey tap; mounts\n" \
+         "$c_bold" "$c_reset"
+  printf "        the vault, moves ~/Library/Application Support/hyprnote\n"
+  printf "        INTO it, then replaces the original with a symlink so\n"
+  printf "        Char continues to work without any reconfiguration).\n"
+  printf "    4.  %s./run.sh start%s    (this gate will then pass).\n" \
+         "$c_bold" "$c_reset"
+  printf '\n'
+  printf "  Override (DANGEROUS — disables encryption-at-rest entirely):\n"
+  printf "    %sLOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA=1 ./run.sh start%s\n" \
+         "$c_bold" "$c_reset"
+  printf '\n'
+  printf "  See SECURITY.md § 'Defense layer 4 — encrypted vault'.\n"
+  printf "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n" \
+         "$c_red" "$c_reset"
+  return 1
+}
+
 # Layer B — Char-binary verification gate. Verifies codesign +
 # Gatekeeper + linked-Mach-O hashes against the recorded baseline.
 # Honours ``LOCAL_SCRIBE_ALLOW_DIRTY_CHAR=1`` as an override.
@@ -1491,14 +1586,21 @@ sys.exit(0 if (secret_store.has_kc_half() or secret_store.has_master_key()) else
   # and our transcripts. The hdiutil passphrase is HKDF-derived from
   # the master key (see vault_unlock.py), so unlocking the vault
   # requires Touch ID + YubiKey tap. Idempotent.
+  #
+  # Two-step: CREATE the sparse bundle if it doesn't exist, then
+  # MOUNT + RELOCATE Char's data dir into it. The second step is
+  # what actually buys encryption-at-rest — without it the bundle
+  # sits empty and Char keeps writing plaintext to ~/Library/...
+  # The 2026-05-11 audit found 6 unencrypted sessions in that exact
+  # state because earlier bootstrap only did step 1.
+  local _vault_exists=0
   if "$VENV_PY" -c '
 import sys
 from local_scribe.security import vault
 sys.exit(0 if vault.exists() else 1)
 ' 2>/dev/null; then
+    _vault_exists=1
     printf "  %s● encrypted vault already present%s — skipping create\n" "$c_green" "$c_reset"
-    printf "    unlock:  %s./run.sh vault unlock%s\n" "$c_bold" "$c_reset"
-    printf "    status:  %s./run.sh vault status%s\n" "$c_bold" "$c_reset"
   else
     printf "  Creating ~/Library/Application Support/local_scribe-vault.sparsebundle\n"
     printf "  (AES-256 sparse — starts at ~4 MB, grows on demand up to 100 GB).\n"
@@ -1506,13 +1608,68 @@ sys.exit(0 if vault.exists() else 1)
     printf "  hdiutil passphrase.\n\n"
     if ask_yn "  Initialise the encrypted vault now? (strongly recommended)" y; then
       printf "\n"
-      if ! "$VENV_PY" -m local_scribe.security.vault_unlock init; then
-        say "${c_yellow}vault init failed — pipeline can still start, but on-disk\n  data WILL be unencrypted until you fix this${c_reset}"
+      if "$VENV_PY" -m local_scribe.security.vault_unlock init; then
+        _vault_exists=1
+      else
+        say "${c_yellow}vault init failed — pipeline can still start, but on-disk data WILL be unencrypted until you fix this${c_reset}"
         say "  Re-run with: ${c_bold}./run.sh vault init${c_reset}"
       fi
     else
       say "${c_yellow}skipped — on-disk transcripts and Char data will be in plaintext${c_reset}"
       say "  Run ${c_bold}./run.sh vault init${c_reset} any time to enable encryption."
+    fi
+  fi
+
+  # Step 2 of stage 4: mount + relocate. Idempotent at both layers
+  # (vault.mount no-ops when already mounted; vault.relocate_char_data
+  # no-ops when the symlink is already in place). Skipped iff the
+  # bundle isn't on disk (operator declined to create one). The
+  # operator's data has to be QUIESCED for this step — Char must not
+  # be running, or its open SQLite WAL handle on app.db will corrupt
+  # when we mv the file out from under it. We don't have a reliable
+  # way to detect Char-is-open here (Char doesn't take a flock), so
+  # we ask outright if hyprnote/ already has content, then defer to
+  # the operator. First-time bootstraps where hyprnote/ doesn't exist
+  # yet sail through without prompting.
+  if (( _vault_exists == 1 )); then
+    local _char_data="$HOME/Library/Application Support/hyprnote"
+    if "$VENV_PY" -c '
+import sys
+from local_scribe.security import vault
+sys.exit(0 if vault.char_data_relocated() else 1)
+' 2>/dev/null; then
+      printf "  %s● Char data already lives inside the vault%s\n" "$c_green" "$c_reset"
+    else
+      if [[ -d "$_char_data" && ! -L "$_char_data" ]]; then
+        # Existing plaintext data dir. Warn loudly + require explicit ack.
+        printf "\n"
+        printf "  %s⚠  Char data dir exists at %s%s\n" \
+               "$c_yellow" "$_char_data" "$c_reset"
+        printf "      and is NOT yet relocated into the vault — current sessions are PLAINTEXT.\n"
+        printf "      We can move it in now (the move is atomic + reversible:\n"
+        printf "      original is renamed to .pre_vault_backup.<timestamp> until you delete it).\n"
+        printf "      %sQuit Char.app first (Cmd-Q) — open SQLite handles would corrupt.%s\n" \
+               "$c_red" "$c_reset"
+        if ask_yn "  Relocate Char data into the vault now? (Touch ID + YubiKey tap required)" y; then
+          if "$VENV_PY" -m local_scribe.security.vault_unlock unlock; then
+            printf "  %s● Char data relocated; original backed up next to it%s\n" "$c_green" "$c_reset"
+          else
+            say "${c_yellow}vault unlock/relocate failed; rerun \`./run.sh vault unlock\` after quitting Char${c_reset}"
+          fi
+        else
+          say "${c_yellow}skipped — \`./run.sh start\` will refuse until you run \`./run.sh vault unlock\`${c_reset}"
+        fi
+      else
+        # First-time setup: no data on disk yet. Mount + pre-create the
+        # symlink so Char starts writing INTO the vault from day 1.
+        printf "  No Char data on disk yet — mounting vault + pre-symlinking destination\n"
+        if "$VENV_PY" -m local_scribe.security.vault_unlock unlock; then
+          printf "  %s● vault mounted; %s -> vault%s\n" \
+                 "$c_green" "$_char_data" "$c_reset"
+        else
+          say "${c_yellow}vault unlock failed; rerun \`./run.sh vault unlock\` before \`./run.sh start\`${c_reset}"
+        fi
+      fi
     fi
   fi
 
@@ -2526,6 +2683,11 @@ cmd_start() {
   master_key_gate || return 1
   script_integrity_gate || return 1
   pinned_config_gate || return 1
+  # Vault-relocation gate sits BEFORE char_integrity_gate so we don't
+  # fingerprint a Char.app that's about to be told it can't run.
+  # If the Char data dir is still plaintext on disk, we refuse here
+  # with explicit recovery steps (see vault_relocation_gate above).
+  vault_relocation_gate || return 1
   char_integrity_gate || return 1
   preflight || {
     say "${c_red}preflight failed${c_reset}"
@@ -2701,6 +2863,41 @@ cmd_status() {
       printf "    Inspector auth URL       : %s\n" "$inspector_url"
       printf "    (⌘-click the URL once in the browser to set the inspector cookie.)\n"
     fi
+  fi
+
+  # Encryption-at-rest summary. Whether the vault is mounted +
+  # whether Char's data dir actually lives inside it is the same
+  # question ``vault_relocation_gate`` asks at start time; surfacing
+  # it here means an operator who runs ``./run.sh status`` between
+  # bootstraps notices the missing relocation BEFORE they accumulate
+  # plaintext sessions. The 2026-05-11 audit found 6 sessions
+  # plaintext on disk because nothing forced the operator's eye to
+  # this row.
+  printf "\n  %sEncryption at rest%s (Char data + transcripts)\n" "$c_bold" "$c_reset"
+  if [[ -x "$VENV_PY" ]]; then
+    "$VENV_PY" - <<'PY'
+import sys
+G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stderr.isatty() else ("","","","")
+try:
+    from local_scribe.security import vault
+except Exception as exc:  # noqa: BLE001
+    print(f"    {R}\u25cb{Z} vault module unimportable: {exc}")
+    sys.exit(0)
+s = vault.status()
+if not s["exists"]:
+    print(f"    {R}\u25cb{Z} no vault on disk — run `./run.sh vault init`")
+    sys.exit(0)
+if s["char_data_relocated"]:
+    print(f"    {G}\u25cf{Z} Char data lives INSIDE the vault (encrypted at rest)")
+else:
+    print(f"    {R}\u25cb{Z} Char data is PLAINTEXT at "
+          f"{s['char_data_path']}")
+    print(f"        run `./run.sh vault unlock` (quit Char first)")
+if s["mounted"]:
+    print(f"    {G}\u25cf{Z} vault mounted at {s['mount_path']}")
+else:
+    print(f"    {Y}\u25cb{Z} vault not mounted — `./run.sh vault unlock`")
+PY
   fi
 }
 

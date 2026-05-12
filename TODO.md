@@ -705,15 +705,23 @@ sweep whenever `CHAR_KNOWN_GOOD_VERSION` is bumped.
       [`KEY_SAFETY.md`](docs/KEY_SAFETY.md) for the full S1–S18
       enumeration.
 - [x] **Encrypt audio at rest.** ✅ Landed: `vault.py` (AES-256
-      sparse bundle) is now wired into bootstrap step (4/9) via
-      `vault_unlock.py`, which derives the hdiutil passphrase from
-      the Option C master key via HKDF-SHA256. Char's data dir is
-      relocated INTO the mounted vault on first unlock and replaced
-      with a symlink so Char follows it transparently. Operator
-      surface: `./run.sh vault {init,unlock,lock,status}`. The
-      passphrase is never written to disk and never shown to the
-      operator. Rotating the master via `./run.sh key rotate` will
-      rotate the vault envelope (see remaining work below).
+      sparse bundle) is wired end-to-end via `vault_unlock.py`,
+      which derives the hdiutil passphrase from the Option C master
+      key via HKDF-SHA256. Char's data dir is relocated INTO the
+      mounted vault and replaced with a symlink so Char follows it
+      transparently. Operator surface:
+      `./run.sh vault {init,unlock,lock,status}`. The passphrase
+      is never written to disk and never shown to the operator.
+      **Enforcement (added 2026-05-11)**: `vault_relocation_gate`
+      runs from `cmd_start` and refuses to launch the pipeline if
+      Char's data dir is still plaintext on disk; bootstrap stage 4
+      now does BOTH create-bundle AND mount+relocate so first-time
+      operators end up with encrypted-at-rest by default;
+      `./run.sh status` surfaces the relocation state under an
+      explicit "Encryption at rest" header. Override:
+      `LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA=1` (loud-but-explicit).
+      Rotating the master via `./run.sh key rotate` will rotate the
+      vault envelope (see remaining work below).
 - [x] **Encrypt transcripts and summaries at rest.** ✅ Falls out of
       the vault-mount work above: once Char's session dir is symlinked
       into the mounted ciphertext volume, every file Char writes
@@ -726,12 +734,16 @@ sweep whenever `CHAR_KNOWN_GOOD_VERSION` is bumped.
       `vault.rotate_password(old, new)`. The helper exists; the wiring
       is a five-line glue change in `key_lifecycle.rotate_master_key`
       that unmounts → rotates → leaves the vault locked.
-- [ ] **Auto-mount the vault from `./run.sh start`.** Bootstrap now
-      creates the vault, but `./run.sh start` doesn't currently mount
-      it. Today the operator runs `./run.sh vault unlock` once after
-      bootstrap; ideally `start` calls `vault.mount` lazily on first
-      transcribe so the unlock prompt fires only when the operator
-      actually has audio to process.
+- [ ] **Auto-mount the vault from `./run.sh start`.** Bootstrap
+      now mounts the vault as part of stage 4, but `./run.sh start`
+      requires the vault to be already mounted (via reboot/relock,
+      the symlink dangles). Today the operator runs
+      `./run.sh vault unlock` once after reboot;
+      `vault_relocation_gate` refuses to start until they do. A
+      future enhancement would have `start` lazily call
+      `vault.mount` itself — gated on a "this isn't a hostile
+      keyboard at the console" check — so the operator doesn't
+      need the separate `vault unlock` step post-reboot.
 - [ ] **Encrypt the local-scribe transcript cache** at
       `~/.cache/local_scribe/transcripts/`. Currently keyed by audio
       sha256 with the cached output stored as plain JSON. Either
