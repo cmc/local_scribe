@@ -1645,6 +1645,45 @@ sys.exit(0 if vault.exists() else 1)
     fi
   fi
 
+  # Auto-sign the pinned config + char baseline so the start-time
+  # signature gate (pinned_config_gate) is immediately satisfied. Without
+  # this, ``./run.sh start`` refuses with:
+  #
+  #   FAIL [pinned] no signature; run `./run.sh config sign`
+  #   FAIL [char_baseline] no signature; run `./run.sh config sign`
+  #
+  # We do this AFTER stage 10 (so pinned.json + char_baseline.json are
+  # both on disk) and BEFORE the completion banner (so the operator's
+  # next-step hint doesn't immediately fail on first invocation). The
+  # operator already did Touch ID + YubiKey for stage 3 (key init) and
+  # stage 9 (configure-char); one more tap here is the price of admission
+  # for a runnable pipeline. Failures here are non-fatal: bootstrap
+  # itself still succeeded, the operator just has to manually run
+  # ``./run.sh config sign`` before ``./run.sh start``.
+  #
+  # Skipped if:
+  #   - venv python isn't on disk (we couldn't possibly have run the
+  #     prior stages anyway — defensive only)
+  #   - master key gate refuses (key_lifecycle has its own loud banner)
+  #   - signatures are ALREADY valid (idempotent re-bootstrap path —
+  #     don't ask for a redundant tap)
+  printf "\n%ssigning pinned config + char baseline (Touch ID + YubiKey)…%s\n" \
+         "$c_dim" "$c_reset"
+  local sign_skip=0
+  if [[ ! -x "$VENV_PY" ]]; then
+    sign_skip=1
+  elif "$VENV_PY" -m local_scribe config verify >/dev/null 2>&1; then
+    printf "  %s● signatures already valid — skipping%s\n" "$c_green" "$c_reset"
+    sign_skip=1
+  fi
+  if (( sign_skip == 0 )); then
+    if "$VENV_PY" -m local_scribe config sign; then
+      printf "  %s● pinned + baseline signed%s\n" "$c_green" "$c_reset"
+    else
+      say "${c_yellow}config sign failed; ./run.sh start will refuse until you run \`./run.sh config sign\` manually${c_reset}"
+    fi
+  fi
+
   printf "\n%s════════ bootstrap complete ════════%s\n\n" "$c_green" "$c_reset"
 
   # Anything we couldn't fully automate gets flagged here. Bootstrap covers:
@@ -1652,6 +1691,7 @@ sys.exit(0 if vault.exists() else 1)
   #   - Parakeet ASR weights + sherpa-onnx diarization models
   #   - LM Studio.app (homebrew cask) + lms CLI + Qwen download + load
   #   - Char.app (pinned DMG) + auto-config of Char's settings.json
+  #   - Pinned config + Char baseline signature (Touch ID + YubiKey)
   # The only thing that's reliably *not* automated is wiring Char's
   # Intelligence (LLM) provider in the Char UI — that one tab needs a click.
   printf "%sFinal touch — wire Char's LLM tab (one click):%s\n" "$c_bold" "$c_reset"
