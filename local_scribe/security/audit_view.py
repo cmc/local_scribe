@@ -370,12 +370,23 @@ def check_char_settings() -> Check:
 def check_firewall() -> Check:
     """Defense layer 1 — per-Char outbound firewall.
 
-    Our shipping firewall design is the per-process wrapper
-    (sandbox-exec + HTTPS_PROXY) applied at ``./run.sh char launch``
-    time -- the system-wide ``/etc/hosts`` mode is an optional
+    Our shipping firewall is the loopback egress proxy that
+    ``./run.sh char launch`` wires Char into via the ``HTTPS_PROXY``
+    env var. The system-wide ``/etc/hosts`` mode is an optional
     operator opt-in. So "NOT INSTALLED" on the hosts-file mode is
     NOT a failure on its own; what we actually need to know is
-    whether the per-process bits are in place.
+    whether the proxy is running -- that's the only ACTIVE
+    enforcement layer.
+
+    History (2026-05-12): an earlier version of this check also
+    required the SBPL char-sandbox profile to be on disk because the
+    launch path applied it via ``sandbox-exec``. That was dropped
+    when ``cmd_char_launch`` switched to ``/usr/bin/open -a --env``
+    to fix a TCC attribution bug where the sandbox-exec layer caused
+    macOS to attribute Char's system-audio-capture requests to the
+    launching terminal (silently denied). The profile is still
+    rendered but is now informational only; we surface its presence
+    as a detail field but no longer fail or warn on its absence.
     """
     from local_scribe.egress import firewall, char_sandbox
     # ``firewall.status()`` returns a dataclass; flatten to a plain
@@ -393,29 +404,32 @@ def check_firewall() -> Check:
         }
     except Exception as exc:
         hosts_state = {"installed": False, "error": str(exc)}
-    sandbox_ok = False
+    # Informational only: surface whether the SBPL profile is on
+    # disk so operators auditing the security stack can confirm the
+    # documented trade-off (kernel layer dropped, proxy layer
+    # active) at a glance.
+    sandbox_present = False
     try:
         path = char_sandbox.profile_path()
-        sandbox_ok = Path(path).is_file()
+        sandbox_present = Path(path).is_file()
     except Exception:
         pass
     detail = {
         "hosts_file_mode": hosts_state,
-        "sandbox_profile_present": sandbox_ok,
+        # `sandbox_profile_present` is INFORMATIONAL: it indicates
+        # the file is on disk for manual operator use, NOT that it's
+        # being applied at launch (it isn't, since 2026-05-12).
+        "sandbox_profile_present": sandbox_present,
+        "sandbox_profile_applied_at_launch": False,
     }
-    if sandbox_ok:
-        msg = ("Per-Char sandbox profile is on disk. ``./run.sh char "
-               "launch`` will route Char through the loopback egress "
-               "proxy on port 8889. (System-wide /etc/hosts mode is "
-               "optional — opt in with `./run.sh firewall enable "
-               "--mode system`.)")
-        return Check("firewall", "Egress firewall (per-Char)", OK,
-                     msg, detail)
-    return Check("firewall", "Egress firewall (per-Char)", WARN,
-                 "Per-Char sandbox profile is not on disk. Run "
-                 "`./run.sh char sandbox write`. Without this, "
-                 "launching Char via `./run.sh char launch` will fall "
-                 "back to no-firewall mode.", detail)
+    msg = ("Per-Char egress proxy is the active firewall layer. "
+           "``./run.sh char launch`` routes Char through the loopback "
+           "proxy on port 8889 via HTTPS_PROXY. (System-wide /etc/hosts "
+           "mode is optional — opt in with `./run.sh firewall enable "
+           "--mode system`.) The kernel-level sandbox-exec layer was "
+           "dropped on 2026-05-12 to restore macOS TCC system-audio-"
+           "capture attribution — see CHAR_REVIEW.md.")
+    return Check("firewall", "Egress firewall (per-Char)", OK, msg, detail)
 
 
 def check_pre_commit_hook() -> Check:

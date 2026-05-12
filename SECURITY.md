@@ -423,20 +423,34 @@ the actual landscape:
 | **macOS Application Firewall** (`socketfilterfw`) | per-app, **inbound only** | Apple's docs are explicit: ALF doesn't filter outbound. |
 | **`pf`** (BSD packet filter) | **no, per-user only** | Apple's pf port stripped FreeBSD's per-PID / per-binary keywords. The only per-process knob remaining is `user <uid>` / `group <gid>`. To use it we'd have to run Char as a dedicated unprivileged user, which fights GUI launch, TCC microphone permissions, Keychain ACLs, and Char's data dir. Not impossible; not a one-line change. |
 | **Network Extension** (`NEContentFilterProvider`) | **yes — this is the native answer** | Requires an Apple-granted entitlement (`com.apple.developer.networking.networkextension`) gated behind Developer ID + Apple application review. It's what Little Snitch and LuLu use. **Infeasible for an open-source project to ship from a repo.** |
-| **`sandbox-exec`** (kext-backed Apple Sandbox) | per-launched-process tree | Hostname rules are resolved once at profile load, so DNS rotation defeats them — useless on its own. But its IP-level rules are unbreakable: this is the **containment** half of our solution. |
-| **HTTPS_PROXY env var** | per-process | Apple's own CI uses this for offline testing. Tauri/reqwest (Char's HTTP stack), the Sentry Rust SDK, PostHog Rust SDK, and the Tauri auto-updater all honour it. This is the **policy** half. |
+| **`sandbox-exec`** (kext-backed Apple Sandbox) | per-launched-process tree | Hostname rules are resolved once at profile load, so DNS rotation defeats them — useless on its own. Its IP-level rules are unbreakable: this was the **containment** half of our solution, but it was **dropped from the default launch path on 2026-05-12** because it broke macOS TCC's system-audio-capture attribution. The SBPL profile is still rendered + validated for manual operator use; see [docs/CHAR_REVIEW.md § Layered firewall trade-offs](docs/CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop). |
+| **HTTPS_PROXY env var** | per-process | Apple's own CI uses this for offline testing. Tauri/reqwest (Char's HTTP stack), the Sentry Rust SDK, PostHog Rust SDK, and the Tauri auto-updater all honour it. This is the **policy** half — and as of 2026-05-12 it is the *active* enforcement layer. |
 
-So we **compose the two primitives Apple actually gives us**: a
-`sandbox-exec` policy that allows everything except network egress
-to anywhere except loopback, plus an `HTTPS_PROXY` env var that
-points Char at a local CONNECT proxy. The proxy applies the
-hostname-level policy.
+So we use the per-process primitive Apple actually gives us: an
+`HTTPS_PROXY` env var pointing Char at a local CONNECT proxy that
+applies the hostname-level allow / block policy. The proxy is what
+turns "Char might call provider hosts" into "Char's calls to
+provider hosts return 403 in our log."
 
-The two layers reinforce each other: even a hypothetical Char build
-that ignored `HTTPS_PROXY` couldn't bypass the proxy because its
-only network path is loopback. Other apps on the same Mac are
-completely unaffected — they don't inherit either the sandbox or
-the env var.
+The pre-2026-05 design also wrapped Char in an SBPL `sandbox-exec`
+profile so that even a hypothetical Char build ignoring
+`HTTPS_PROXY` couldn't reach the network outside loopback. That
+defense-in-depth layer was dropped from the default launch path on
+2026-05-12 because the way `sandbox-exec` rewrote the
+process-launch chain caused macOS's Transparency, Consent, and
+Control (TCC) system to attribute Char's permission requests to
+the launching terminal (`com.googlecode.iterm2`, `com.apple.Terminal`,
+…), which has no `kTCCServiceAudioCapture` consent — and TCC
+*silently denies* on a missing-permission responsible bundle. The
+visible symptom was operator-only transcripts: own voice OK, other
+speakers silently absent. See [docs/CHAR_REVIEW.md § Layered
+firewall trade-offs](docs/CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop)
+for the full attribution-chain breakdown and the trade-off table.
+The profile is still rendered + validated by `./run.sh char
+sandbox` so an operator who explicitly wants the kernel layer
+(accepting the loss of System Audio Capture) can apply it
+manually. Other apps on the same Mac are unaffected — they don't
+inherit the env var.
 
 ### The control
 
@@ -448,16 +462,23 @@ Two modes ship, selected by `./run.sh firewall enable --mode {process|system}`:
   passes through `firewall.is_blocked(hostname)`; blocked hosts get
   a `403` with a JSON deny body, allowed hosts are bridged
   transparently. No TLS interception — the proxy never sees plaintext.
+- [`./run.sh char launch`](run.sh): launches Char.app via
+  `/usr/bin/open -a Char.app --env HTTPS_PROXY=http://127.0.0.1:8889`.
+  This is the **only** supported way to start Char if you want the
+  firewall to apply. Dock / Spotlight launches inherit no env vars
+  and bypass it; `./run.sh char firewall-status` flags Char
+  processes that aren't going through us.
+- [`char_tcc_probe.py`](local_scribe/egress/char_tcc_probe.py): reads
+  recent `tccd` logs to verify the running Char's TCC attribution
+  resolves to `com.hyprnote.stable`, not to a terminal emulator
+  (the May 2026 regression signature). Surfaced in
+  `./run.sh char firewall-status` and pinned by
+  `tests/egress/test_char_tcc_probe.py`.
 - [`char_sandbox.py`](local_scribe/egress/char_sandbox.py): renders an SBPL profile to
   `~/.config/local_scribe/char.sb`. `(allow default)` + `(deny
-  network-outbound)` + re-allow loopback is the full extent of the
-  containment.
-- [`./run.sh char launch`](run.sh): wraps Char in `sandbox-exec`
-  with `HTTPS_PROXY=http://127.0.0.1:8889` injected. This is the
-  **only** supported way to start Char if you want the firewall to
-  apply. Dock / Spotlight launches inherit neither the env vars nor
-  the sandbox; `./run.sh char firewall-status` flags Char processes
-  that aren't going through us.
+  network-outbound)` + re-allow loopback. **Not applied at launch
+  any more**; kept for manual operator use (accepting the System
+  Audio Capture loss).
 - No sudo. Only affects Char. Survives Char binary updates.
 
 **Mode `system`** (opt-in)
@@ -482,8 +503,8 @@ Both modes consume the same `firewall.BLOCK_CATALOG`:
 ```bash
 # Default per-Char path (mode = process)
 ./run.sh start                    # also starts the egress proxy
-./run.sh char launch              # launches Char under sandbox-exec + HTTPS_PROXY
-./run.sh char firewall-status     # is the proxy up? is the running Char going through us?
+./run.sh char launch              # opens Char.app with HTTPS_PROXY injected
+./run.sh char firewall-status     # is the proxy up? is the running Char going through us? does TCC attribute to Char.app?
 ./run.sh proxy verify             # send CONNECT api.openai.com:443; assert 403
 ./run.sh proxy recent             # last 20 DENY/ALLOW/ERROR decisions
 
@@ -498,20 +519,29 @@ Both modes consume the same `firewall.BLOCK_CATALOG`:
 ```
 
 `./run.sh bootstrap` step (10/10) writes + validates the SBPL profile
-and tells the operator how to launch Char. It does **not** ask for
-sudo — the system-hosts mode is left as an explicit opt-in. The
-egress proxy starts automatically alongside the ASR + Inspector
-services on every `./run.sh start`. `./run.sh doctor` reports both:
-whether the proxy is running and whether the sandbox profile is
-valid, plus the system-hosts state if it's also installed.
+(retained for manual operator use; not applied at launch) and tells
+the operator how to launch Char. It does **not** ask for sudo — the
+system-hosts mode is left as an explicit opt-in. The egress proxy
+starts automatically alongside the ASR + Inspector services on every
+`./run.sh start`. `./run.sh doctor` reports whether the proxy is
+running, whether the SBPL profile is on disk (informational only),
+and the system-hosts state if it's also installed.
 
 ### What the firewall does **not** do
 
-- Stop a Dock / Spotlight launch of Char. Those launches inherit
-  neither the sandbox nor the HTTPS_PROXY env var, so Char talks
-  directly to the network. `./run.sh char firewall-status` and
-  `./run.sh doctor` both flag this; the only mitigation is to kill
-  the bypassed Char process and relaunch via `./run.sh char launch`.
+- Stop a Dock / Spotlight launch of Char. Those launches inherit no
+  HTTPS_PROXY env var, so Char talks directly to the network.
+  `./run.sh char firewall-status` and `./run.sh doctor` both flag
+  this; the only mitigation is to quit the bypassed Char (Cmd-Q)
+  and relaunch via `./run.sh char launch`.
+- Contain a hypothetical Char build that ignores HTTPS_PROXY and
+  calls raw sockets / `connectx(2)` directly. Pre-2026-05 we had
+  this covered with the `sandbox-exec` kernel layer, but it was
+  dropped because of the TCC attribution interaction described
+  above. Current Char (the version pinned in `char_version.json`)
+  honours HTTPS_PROXY for every outbound HTTP/HTTPS connection, so
+  this is a theoretical gap — but it IS a gap, and we surface it
+  rather than hide it.
   (Future-work in [`TODO.md`](TODO.md): a Network Extension build
   signed with our own Developer ID would close this gap for users
   who install the signed bundle.)

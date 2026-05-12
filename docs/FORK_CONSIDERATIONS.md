@@ -460,9 +460,17 @@ fork but with none of the binary-removal benefits.
 under a custom seatbelt profile would let us forbid network
 access to anything except loopback at the kernel level, no
 matter what the binary tries. Like NetworkExtension, this is a
-real defense — but `sandbox-exec` is undocumented, deprecated
-by Apple, and breaks Char's calendar / audio entitlements in
-ways we'd have to debug.
+real defense — but `sandbox-exec` is undocumented and deprecated
+by Apple. We actually *did* ship this in the default
+`./run.sh char launch` path until 2026-05-12; we removed it
+because the wrapper put a terminal at the head of the macOS TCC
+attribution chain and silently broke Char's
+`kTCCServiceAudioCapture` permission (other-speaker audio
+disappeared from every transcript). The SBPL profile is still
+rendered for manual operator use, and the kext is still what
+enforces every App Store app's entitlements, but it's no longer
+applied at launch. See [`CHAR_REVIEW.md` § Layered firewall
+trade-offs](CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop).
 
 ---
 

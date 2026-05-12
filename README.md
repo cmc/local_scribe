@@ -235,16 +235,21 @@ are true:
   OpenAI / Anthropic / Azure / Bedrock endpoints in the audio
   path.** This is provable, not aspirational — see the next
   bullet.
-- **An outbound firewall that enforces it.** Char runs inside a
-  `sandbox-exec` profile with `HTTPS_PROXY` pointed at our
-  local [`egress_proxy.py`](local_scribe/egress_proxy.py). Every
-  outbound connection Char attempts goes through the proxy,
-  which enforces a per-host allowlist defaulting to the loopback
-  ASR endpoint. Any non-allowlisted host returns 403 with a log
-  line surfaced in the inspector. So "everything stays local"
-  isn't a promise; it's a property the kernel + the proxy
-  enforce on every request, and any deviation shows up in the
-  log immediately. See [SECURITY.md § Defense layer 1](SECURITY.md#defense-layer-1--per-char-outbound-firewall).
+- **An outbound firewall that enforces it.** Char is launched via
+  `/usr/bin/open -a Char.app --env HTTPS_PROXY=...` pointed at our
+  local [`egress_proxy.py`](local_scribe/egress/egress_proxy.py). Every
+  outbound HTTP / HTTPS connection Char attempts goes through the
+  proxy, which enforces a per-host allowlist defaulting to the
+  loopback ASR endpoint. Any non-allowlisted host returns 403 with
+  a log line surfaced in the inspector. So "everything stays
+  local" isn't a promise; it's a property the proxy enforces on
+  every CONNECT, and any deviation shows up in the log
+  immediately. (We *also* ship an SBPL `sandbox-exec` profile for
+  kernel-level loopback-only containment, but it's no longer
+  applied at launch because it broke macOS TCC's system-audio-
+  capture attribution — see [CHAR_REVIEW.md § Layered firewall
+  trade-offs](docs/CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop).)
+  See [SECURITY.md § Defense layer 1](SECURITY.md#defense-layer-1--per-char-outbound-firewall).
 - **Operator-controlled keys.** The master key is reconstituted
   from a Touch ID-gated Keychain item (`kc_half`) combined with
   a YubiKey-PIV-wrapped age secret (`yk_half`). Per-service
@@ -472,9 +477,12 @@ A few of the questions it addresses:
   operation physical-presence proof, *not* post-unlock memory
   isolation, which is why SIP is mandatory.)
 - **"`sandbox-exec` is Apple-deprecated; you're building on sand."**
-  (Q10; tl;dr: yes, acknowledged, the Network Extension is the
-  long-term answer, and the system-mode `/etc/hosts` fallback is
-  the defense-in-depth.)
+  (Q10; tl;dr: acknowledged, AND we stopped applying it at launch
+  on 2026-05-12 anyway because it broke macOS TCC's system-audio-
+  capture attribution. The hostname-level proxy via `HTTPS_PROXY`
+  is the active firewall layer; the Network Extension is the
+  long-term answer. See [`docs/CHAR_REVIEW.md` § Layered firewall
+  trade-offs](docs/CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop).)
 - **"Char launched from the Dock bypasses your firewall."**
   (Q11; tl;dr: documented, prominent, and the same Network
   Extension answer as Q10.)
@@ -512,7 +520,7 @@ separate user action.
 |---|---|:---:|:---:|---|
 | **Critical** — audio reaches a third-party STT API | STT endpoint forced to loopback `127.0.0.1` | ⚠️ user-selectable per provider; default is OpenAI cloud unless changed | ✅ enforced + audited every doctor pass + every inspector load | [`char_audit.py`](local_scribe/char/char_audit.py), [`asr_server.py`](local_scribe/asr/asr_server.py) |
 | **Critical** — recordings exfiltrated via crash / analytics SDK | No Sentry / PostHog / analytics SDK bundled in the binary | ❌ Tauri plugins for Sentry, PostHog, and an auto-updater ship enabled by default | ⚠️ we cannot *remove* the SDKs without forking (see [`FORK_CONSIDERATIONS.md`](docs/FORK_CONSIDERATIONS.md)); we *can* and do unreachable-by-default their destinations + flip the `analytics.Disabled` toggle | [`firewall.py`](local_scribe/egress/firewall.py), [`char_settings_writer.py`](local_scribe/char/char_settings_writer.py) |
-| **Critical** — Char dials out to external AI / telemetry hosts | Per-app outbound egress filter | ❌ no per-app egress control | ✅ `sandbox-exec` containment + local CONNECT proxy with blocklist; Dock/Spotlight bypass documented as known trade-off | [`egress_proxy.py`](local_scribe/egress/egress_proxy.py), [`char_sandbox.py`](local_scribe/egress/char_sandbox.py) |
+| **Critical** — Char dials out to external AI / telemetry hosts | Per-app outbound egress filter | ❌ no per-app egress control | ✅ local CONNECT proxy with hostname-level blocklist, wired up via `HTTPS_PROXY` at `./run.sh char launch`; TCC-attribution probe surfaces "responsible bundle is a terminal" regressions; Dock/Spotlight bypass documented as known trade-off | [`egress_proxy.py`](local_scribe/egress/egress_proxy.py), [`char_tcc_probe.py`](local_scribe/egress/char_tcc_probe.py) |
 | **Critical** — auto-updater fetches + runs unexpected code | Updater channel blocked | ❌ updater plugin enabled by default | ✅ updater hostnames blackholed by firewall + Char version pinned by SHA256 in `run.sh` | [`firewall.py`](local_scribe/egress/firewall.py), [`CHAR_REVIEW.md`](docs/CHAR_REVIEW.md) |
 | **High** — stolen / imaged disk yields plaintext recordings | At-rest encryption of audio + transcripts | ⚠️ relies entirely on the user having FileVault on; transcripts and audio live as plaintext files in `~/Library/Application Support/hyprnote` | ✅ AES-256 sparse-bundle vault mounted only while running; ciphertext bands on unmount | [`vault.py`](local_scribe/security/vault.py), [`SECURITY.md` Defense layer 3](SECURITY.md#defense-layer-3--at-rest-encryption) |
 | **High** — encryption key auto-unlocks on login (no MFA) | Key material hardware-anchored | ⚠️ FileVault auto-unlock if the user enabled it that way | ✅ YubiKey PIV with `touch-policy=always` + Touch ID-gated Keychain half; XOR split-key construction | [`yubikey_backup.py`](local_scribe/security/yubikey_backup.py), [`secret_store.py`](local_scribe/security/secret_store.py), [`key_split.py`](local_scribe/security/key_split.py) |
@@ -547,10 +555,11 @@ separate user action.
   constrain it instead" — see
   [`docs/FORK_CONSIDERATIONS.md`](docs/FORK_CONSIDERATIONS.md).
 - **The honest weaknesses we already know about** (Dock-launch
-  bypass on the firewall row, `sandbox-exec` deprecation risk,
-  the lack of a third-party audit, why the two integrity rows
-  are software stand-ins for hardware attestation we'd love to
-  have, why we layer our own checks on top of Gatekeeper +
+  bypass on the firewall row, the May 2026 `sandbox-exec`-to-
+  `open -a` switch and the kernel-level containment we gave up
+  for it, the lack of a third-party audit, why the two integrity
+  rows are software stand-ins for hardware attestation we'd love
+  to have, why we layer our own checks on top of Gatekeeper +
   XProtect + notarization) are all written down — see
   [`SECURITY.md`](SECURITY.md), [`docs/QUESTIONS.md § Self-critical
   list`](docs/QUESTIONS.md), and [`docs/HARDWARE.md`](docs/HARDWARE.md)

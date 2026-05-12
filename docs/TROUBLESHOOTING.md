@@ -87,6 +87,55 @@ If you'd rather have *some* diarization on long audio:
   full pipeline (ASR + diarization + LLM speaker-name inference) without
   any UI timeout pressure
 
+**Char transcripts only contain my own voice — the other speakers are missing.**
+Your microphone audio is being captured but the system-audio (other-speaker)
+side is silently denied at the macOS Transparency-Consent-Control (TCC)
+layer. Diagnosis:
+
+```bash
+./run.sh char firewall-status
+#  → look for: "TCC attribution responsible=com.googlecode.iterm2
+#               — this is a terminal, NOT Char"
+```
+
+If the responsible bundle is a terminal (`com.googlecode.iterm2`,
+`com.apple.Terminal`, …) and not `com.hyprnote.stable`, you've hit the
+pre-2026-05 `sandbox-exec` launch bug or its regression. macOS attributes
+Char's permission requests to the launching terminal; terminals don't have
+`kTCCServiceAudioCapture` consent, so the system audio path is blackholed
+even though Char.app itself is granted that permission.
+
+Fix: quit Char (`Cmd-Q`) and relaunch via the wrapper:
+
+```bash
+osascript -e 'quit app "Char"'
+./run.sh char launch
+```
+
+This uses `/usr/bin/open -a Char.app --env HTTPS_PROXY=…` so Char.app is
+its own TCC-responsible bundle. Re-run `./run.sh char firewall-status` —
+the TCC line should now read
+`responsible=com.hyprnote.stable (system audio capture available)`. If it
+still doesn't, see [`docs/CHAR_REVIEW.md` § Layered firewall trade-offs](CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop)
+for the full attribution-chain debugging recipe (`log show --predicate
+'process == "tccd"' --last 5m | rg AttributionChain`).
+
+**`./run.sh char launch` refuses with "Char is already running".**
+`open -a` would just send an activation Apple Event to the existing Char
+process without applying our `HTTPS_PROXY` env, leaving the running Char
+unfiltered. Quit Char first:
+
+```bash
+osascript -e 'quit app "Char"'    # graceful
+# or, if Char is unresponsive:
+pkill -f 'Char.app/Contents/MacOS'
+./run.sh char launch
+```
+
+If you launched Char from the Dock first by mistake,
+`./run.sh char firewall-status` will also flag the running process as
+"NOT through our wrapper — egress is NOT filtered".
+
 **Char's note body looks fabricated / corporate-flavored on a short call.**
 That's not the transcription pipeline — Char runs a *separate* LLM call to
 fill the active note template (1:1 Meeting, Legal meeting, etc.) and small

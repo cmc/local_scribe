@@ -383,24 +383,42 @@ macOS doesn't ship a CLI-installable per-app outbound firewall.
   Snitch / LuLu use) is the right answer, but it requires an
   Apple-granted entitlement that an open-source repo can't ship.
 - **`sandbox-exec`** can deny network egress but only by IP, not
-  hostname (DNS rotation defeats hostname pins).
+  hostname (DNS rotation defeats hostname pins). We used to layer
+  this on top of HTTPS_PROXY for kernel-level containment, but
+  dropped it on 2026-05-12 — see "Layered firewall trade-offs"
+  below.
 
-So we compose the two primitives Apple **does** give us into a
-per-Char egress filter:
-
-1. **Containment** — `sandbox-exec` restricts Char's network reach to
-   loopback only.
-2. **Policy** — Char's `HTTPS_PROXY` env var points at a local
-   asyncio CONNECT proxy that consults `firewall.BLOCK_CATALOG` and
-   refuses blocked hostnames with `403`.
-
-Together, Char's only network path is the local proxy, and the
-proxy enforces our hostname-level allow/deny rules. **Other apps on
-the same Mac are completely unaffected.**
+So we use the per-process primitive Apple actually gives us:
+Char's `HTTPS_PROXY` env var points at a local asyncio CONNECT
+proxy that consults `firewall.BLOCK_CATALOG` and refuses blocked
+hostnames with `403`. The proxy enforces our hostname-level allow/
+deny rules on every CONNECT. **Other apps on the same Mac are
+completely unaffected.**
 
 This is the **default**. The legacy machine-wide `/etc/hosts` mode
 is still available as `--mode system` for operators who explicitly
 want it.
+
+#### Layered firewall trade-offs (the May 2026 sandbox-exec drop)
+
+The pre-2026-05 design also wrapped Char in `sandbox-exec -f char.sb`
+to give a kernel-level "Char's only network path is loopback"
+guarantee. That layer was dropped from the default launch path
+because putting `sandbox-exec` at the head of the launch chain
+caused macOS Transparency-Consent-Control (TCC) to attribute Char's
+permission requests to the launching terminal (`com.googlecode.iterm2`,
+`com.apple.Terminal`, …) instead of to Char.app itself. Terminals
+don't have `kTCCServiceAudioCapture` consent, and TCC silently
+denies on a missing-permission responsible bundle, so other-speaker
+audio was blackholed every Generate. (The microphone path still
+worked because terminals usually have that consent.)
+
+The current launch path uses `/usr/bin/open -a Char.app --env
+HTTPS_PROXY=...` so Char.app is its own TCC-responsible bundle.
+The SBPL profile is still rendered + validated for operators who
+want to apply it manually (accepting the loss of System Audio
+Capture). Full breakdown + attribution-chain example in
+[`CHAR_REVIEW.md` § Layered firewall trade-offs](CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop).
 
 ### Block catalog
 
@@ -415,8 +433,8 @@ want it.
 ```bash
 # Default per-Char mode (no sudo)
 ./run.sh start                    # also starts the egress proxy on :8889
-./run.sh char launch              # launches Char under sandbox-exec + HTTPS_PROXY
-./run.sh char firewall-status     # is the proxy up? is Char going through us?
+./run.sh char launch              # opens Char.app with HTTPS_PROXY injected
+./run.sh char firewall-status     # is the proxy up? is Char going through us? does TCC attribute to Char.app?
 ./run.sh proxy verify             # send CONNECT api.openai.com:443; assert 403
 ./run.sh proxy recent             # last 20 DENY/ALLOW/ERROR decisions
 
@@ -431,22 +449,23 @@ want it.
 ```
 
 `./run.sh bootstrap` (step 10/10) writes + validates the SBPL profile
-and prints how to launch Char. It does **not** ask for sudo — the
+(informational only; not applied at launch since 2026-05-12) and
+prints how to launch Char. It does **not** ask for sudo — the
 system-hosts mode is left as an explicit opt-in. The egress proxy
 auto-starts alongside the ASR + Inspector services on every
-`./run.sh start`. `./run.sh doctor` reports both layers (proxy
-running? sandbox profile valid?) plus the system-hosts state if it
-is also installed.
+`./run.sh start`. `./run.sh doctor` reports the proxy state, the
+SBPL profile presence (informational), and the system-hosts state
+if it is also installed.
 
 ### Caveat: Dock / Spotlight launches bypass the firewall
 
 This is the trade-off of the wrapper-based approach. A Char
-launched from the Dock inherits neither `sandbox-exec` nor the
-`HTTPS_PROXY` env, so its traffic is **not** filtered.
-`./run.sh char firewall-status` and `./run.sh doctor` both detect
-and flag this; the only mitigation is to kill the bypassed process
-and relaunch via `./run.sh char launch`. A future Network Extension
-build signed under our own Developer ID would close this gap (see
+launched from the Dock inherits no `HTTPS_PROXY` env, so its
+traffic is **not** filtered. `./run.sh char firewall-status` and
+`./run.sh doctor` both detect and flag this; the only mitigation
+is to quit the bypassed Char (Cmd-Q) and relaunch via
+`./run.sh char launch`. A future Network Extension build signed
+under our own Developer ID would close this gap (see
 [TODO.md](../TODO.md)).
 
 ### Removal

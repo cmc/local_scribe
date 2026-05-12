@@ -651,8 +651,8 @@ Char's traffic, not the entire machine.
 
 ```bash
 ./run.sh start                    # also starts the egress proxy on :8889
-./run.sh char launch              # wraps Char in sandbox-exec + HTTPS_PROXY
-./run.sh char firewall-status     # is Char going through us?
+./run.sh char launch              # opens Char.app with HTTPS_PROXY injected
+./run.sh char firewall-status     # is Char going through us? is TCC correct?
 ./run.sh proxy verify             # send CONNECT api.openai.com:443 → 403
 ```
 
@@ -662,14 +662,19 @@ Architecture:
   `127.0.0.1:8889`. Every CONNECT request goes through
   `firewall.is_blocked(hostname)`; blocked hosts get `403 + JSON`.
   Pure stdlib, no MITM (we never see TLS plaintext).
+- [`./run.sh char launch`](run.sh) — uses `/usr/bin/open -a Char.app
+  --env HTTPS_PROXY=...` to start Char as its own TCC-responsible
+  bundle while still injecting the proxy environment. Every HTTPS
+  request Char makes goes through `127.0.0.1:8889`.
+- [`char_tcc_probe.py`](../local_scribe/egress/char_tcc_probe.py) — reads recent `tccd`
+  logs to verify the launch actually attributed Char's permission
+  requests to `com.hyprnote.stable` (not to the launching terminal).
+  Surfaced in `./run.sh char firewall-status`.
 - [`char_sandbox.py`](../local_scribe/egress/char_sandbox.py) — renders an SBPL profile
-  at `~/.config/local_scribe/char.sb`. The profile lets Char keep
-  all of its other capabilities but restricts network egress to
-  loopback only. Combined with the proxy on `127.0.0.1:8889`,
-  Char's only network path is our proxy.
-- [`./run.sh char launch`](run.sh) — composes the two by wrapping
-  Char in `sandbox-exec -f char.sb` with
-  `HTTPS_PROXY=http://127.0.0.1:8889` injected.
+  at `~/.config/local_scribe/char.sb`. **No longer applied at
+  launch** (see trade-off below); kept for operators who want to
+  apply it manually. The profile, if applied, restricts Char's
+  network reach to loopback only — defense-in-depth atop the proxy.
 
 The catalog source of truth is [`firewall.py`](../local_scribe/egress/firewall.py) →
 `BLOCK_CATALOG`. The full rationale + per-host catalog + design
@@ -677,15 +682,80 @@ trade-offs (including why we can't use `pf` or the macOS
 Application Firewall here) are in
 [SECURITY.md § Defense layer 1](../SECURITY.md#defense-layer-1--network-egress-firewall).
 
+#### Layered firewall trade-offs (the May 2026 sandbox-exec drop)
+
+Earlier versions of `./run.sh char launch` wrapped Char in
+`sandbox-exec -f char.sb` to enforce a kernel-level "Char's only
+network path is loopback" guarantee on top of the proxy. That layer
+was **removed** on 2026-05-12 because of how it interacted with
+macOS's Transparency, Consent, and Control (TCC):
+
+- TCC walks the process-launch chain to decide which app bundle is
+  *responsible* for each permission request. Permissions are checked
+  against the responsible bundle, not necessarily the one issuing
+  the syscall.
+- When Char was started via `exec /usr/bin/sandbox-exec ... hyprnote`
+  from a terminal, the terminal (`com.googlecode.iterm2`,
+  `com.apple.Terminal`, …) ended up as the responsible bundle. The
+  attribution chain in `tccd` looked like:
+
+  ```
+  AttributionChain={
+    [identifier=com.hyprnote.stable, reason=requesting]
+    [identifier=com.hyprnote.stable, reason=instigating]
+    [identifier=com.googlecode.iterm2, reason=responsible]
+  }
+  ```
+- Terminals do not have `kTCCServiceAudioCapture` consent. TCC
+  *silently denies* (does not downgrade or prompt) what the
+  responsible bundle lacks, so Char's other-speaker capture was
+  blackholed every Generate. Char's microphone still worked because
+  the terminal happens to have microphone consent, which is what
+  made the bug subtle — operators saw their own voice transcribed
+  but not their interlocutors'.
+
+Trade-off explicitly accepted:
+
+| Property | Pre-2026-05 (sandbox-exec) | Post-2026-05 (`open -a`) |
+|---|:---:|:---:|
+| Hostname-level egress filter (HTTPS_PROXY → proxy CONNECT allowlist) | ✅ | ✅ |
+| TCC system-audio-capture attribution to Char.app | ❌ (broken; attrib. to terminal) | ✅ |
+| Kernel-level "Char's only network path is loopback" | ✅ | ❌ |
+| Char ignoring HTTPS_PROXY would still be contained | ✅ | ❌ |
+
+The kernel layer is **dormant, not deleted**. The SBPL profile is
+still rendered + validated by `./run.sh char sandbox {render,write,
+validate,status}`; an operator who wants the kernel-level guarantee
+back can re-enable it manually with:
+
+```bash
+/usr/bin/sandbox-exec -f ~/.config/local_scribe/char.sb \
+  /Applications/Char.app/Contents/MacOS/hyprnote
+```
+
+…and accept that System Audio Capture will be silently denied on
+the resulting Char process. The right long-term fix is a Network
+Extension System Extension signed under a Developer ID — the same
+fix needed for Dock-launch bypass (next subsection). See
+[TODO.md](../TODO.md) for the road there.
+
+[`char_tcc_probe.py`](../local_scribe/egress/char_tcc_probe.py) is the
+regression net: if a future change re-introduces a launch path that
+puts a terminal at the head of the attribution chain, the probe
+fires, `./run.sh char firewall-status` reports
+`TCC attribution responsible=com.googlecode.iterm2 — this is a
+terminal, NOT Char`, and the `tests/egress/test_char_tcc_probe.py`
+unit suite holds the parser + classifier contract.
+
 #### Trade-off: Dock / Spotlight launches bypass the firewall
 
-A Char launched from the Dock inherits neither the sandbox nor
-`HTTPS_PROXY`, so it talks to the network directly.
-`./run.sh char firewall-status` and `./run.sh doctor` both detect
-and flag this; the only mitigation is to kill the bypassed
-process and relaunch via `./run.sh char launch`. The full fix is a
-Network Extension System Extension signed under a Developer ID —
-see [TODO.md](../TODO.md) for the road there.
+A Char launched from the Dock inherits no env vars, so it talks to
+the network directly. `./run.sh char firewall-status` and
+`./run.sh doctor` both detect and flag this; the only mitigation
+is to quit the bypassed Char (`Cmd-Q`) and relaunch via
+`./run.sh char launch`. The full fix is a Network Extension System
+Extension signed under a Developer ID — see [TODO.md](../TODO.md)
+for the road there.
 
 #### Opt-in: system-wide /etc/hosts block
 

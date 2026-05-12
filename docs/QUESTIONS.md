@@ -307,31 +307,57 @@ intentional ones.
 
 ### Q10. `sandbox-exec` is Apple-deprecated. You're building on a sand foundation
 
-Documented and acknowledged.
-[CHAR_REVIEW.md § "What you should also block at the network layer"](CHAR_REVIEW.md)
-and [SECURITY.md § "Defense layer 1"](../SECURITY.md#defense-layer-1--network-egress-firewall)
-both note this explicitly. `sandbox-exec`'s SBPL is the legacy
-interface to Apple's sandbox engine (the one that actually
-enforces every App Store app's entitlements at runtime). It
-isn't *removed*, it's *unsupported* for third-party use. Apple
-have shipped no public successor with equivalent capabilities;
-the official path forward is "use the Endpoint Security
-Framework + Network Extension + System Extension", which
-requires Apple Developer enrollment, kernel-extension
-entitlements, user approval of system extensions, and a much
-heavier engineering footprint.
+Documented and acknowledged — and as of 2026-05-12 we stopped
+applying it at launch anyway. The longer story is more interesting
+than the deprecation question alone:
 
-Our position: **we accept the deprecation risk as a transitional
-choice for the per-process firewall layer**. The kernel mechanism
-still works (verified end-to-end in `test_char_sandbox.py`); the
-SBPL syntax has been stable since 10.5. If Apple ever removes
-the binary, the in-flight Network Extension path becomes
-mandatory rather than optional. [`TODO.md`](../TODO.md) tracks the
-NetworkExtension migration as the long-term answer.
+The original design wrapped Char in `sandbox-exec -f char.sb` so
+that even if Char ignored `HTTPS_PROXY` it couldn't reach the
+network outside loopback. That was the kernel-level *containment*
+half of the firewall, complementing the proxy-level *policy* half.
 
-The opt-in `system` mode (`/etc/hosts`-based) is a defense in
-depth: if `sandbox-exec` disappears tomorrow, system mode still
-gives you machine-wide blackholing of the same hostnames.
+In May 2026 we discovered that putting `sandbox-exec` at the head
+of the launch chain broke macOS's TCC (Transparency, Consent, and
+Control) attribution. TCC walks the launch chain to pick a
+"responsible" bundle; with `exec /usr/bin/sandbox-exec ... hyprnote`
+from a terminal, the responsible bundle ended up being the
+terminal (iTerm2 / Terminal). Terminals don't have
+`kTCCServiceAudioCapture` consent, and TCC *silently denies* on a
+missing-permission responsible bundle — so other-speaker capture
+was blackholed every Generate. Char's own microphone permission
+still worked (terminals have that consent), which is why the bug
+was subtle: operators saw their own voice transcribed but their
+interlocutors silently absent. Full breakdown +
+attribution-chain dumps in
+[`CHAR_REVIEW.md` § "Layered firewall trade-offs"](CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop).
+
+So the launch path is now `/usr/bin/open -a Char.app --env
+HTTPS_PROXY=...`. This makes Char.app its own TCC-responsible
+bundle (system audio works) and preserves the hostname-level proxy
+firewall. The trade-off explicitly accepted is the kernel-level
+"Char's only network path is loopback" guarantee — a current Char
+build does honour HTTPS_PROXY for every outbound connection, so
+the loss is theoretical for the binary we pin, but it IS a real
+loss we surface honestly.
+
+On the Apple-deprecation question itself: `sandbox-exec` isn't
+*removed*, it's *unsupported* for third-party use. Apple have
+shipped no public successor with equivalent capabilities; the
+official path forward is "use the Endpoint Security Framework +
+Network Extension + System Extension", which requires Apple
+Developer enrollment, kernel-extension entitlements, user approval
+of system extensions, and a much heavier engineering footprint.
+The SBPL profile is still rendered + validated by `./run.sh char
+sandbox` so an operator who wants the kernel layer back — and is
+willing to give up System Audio Capture for it — can apply it
+manually with `sandbox-exec -f ~/.config/local_scribe/char.sb …`.
+The Network Extension path is the long-term answer for *both*
+this trade-off and the Dock-launch bypass; see
+[`TODO.md`](../TODO.md).
+
+The opt-in `system` mode (`/etc/hosts`-based) is still a defense
+in depth: it gives you machine-wide blackholing of the same
+hostnames independent of any per-process attribution.
 
 ### Q11. Char launched from the Dock or Spotlight bypasses your firewall completely
 
@@ -754,10 +780,15 @@ were trying to hide them.
 4. **The Python services run as the logged-in user, not in a
    privilege-separated subprocess.** A privileged-keyholder /
    unprivileged-frontend split would be safer.
-5. **`sandbox-exec` is Apple-deprecated.** It works today, it
-   will continue to work as long as Apple keeps shipping the
-   binary, and we don't know when (or whether) Apple will
-   remove it.
+5. **`sandbox-exec` is Apple-deprecated AND no longer applied at
+   launch since 2026-05-12.** It still works (the kext is what
+   actually enforces every App Store app's entitlements), and the
+   SBPL profile is still rendered + validated for manual operator
+   use, but the default `./run.sh char launch` path uses
+   `/usr/bin/open -a` instead because the `sandbox-exec` wrapper
+   broke macOS TCC's system-audio-capture attribution. See Q10 and
+   [`CHAR_REVIEW.md` § Layered firewall trade-offs](CHAR_REVIEW.md#layered-firewall-trade-offs-the-may-2026-sandbox-exec-drop)
+   for the trade-off table.
 6. **`hdiutil`-backed sparse-bundle vaults are slower than
    APFS-native encrypted volumes.** APFS-encrypted volume
    support is a planned migration.

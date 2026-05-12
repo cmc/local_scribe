@@ -1481,10 +1481,12 @@ PY
                             "$c_bold" "$c_reset" "$c_bold" "$c_reset"
   fi
 
-  printf "\n%soutbound firewall (per-Char proxy + sandbox):%s\n" "$c_bold" "$c_reset"
+  printf "\n%soutbound firewall (per-Char proxy):%s\n" "$c_bold" "$c_reset"
   # Show:
-  #   1. Egress proxy state (process-mode enforcement)
-  #   2. Sandbox profile state (process-mode containment)
+  #   1. Egress proxy state (the ACTIVE enforcement layer)
+  #   2. Sandbox profile presence (INFORMATIONAL only -- not applied
+  #      at launch since 2026-05-12; see CHAR_REVIEW.md § Layered
+  #      firewall trade-offs)
   #   3. System-hosts coverage if it's also installed (opt-in mode)
   if egress_proxy_pid >/dev/null; then
     printf "  "; ok; printf "egress proxy running on :%s (pid %s)\n" \
@@ -1496,23 +1498,19 @@ PY
   fi
   if [[ -x "$VENV_PY" ]]; then
     "$VENV_PY" - <<'PY'
-import sys, json
+import sys
 from local_scribe.egress import char_sandbox
 from local_scribe.egress import firewall
 G,Y,R,Z = ("\033[32m","\033[33m","\033[31m","\033[0m") if sys.stdout.isatty() else ("","","","")
-# --- sandbox profile ---
+# --- sandbox profile (informational; not applied at launch) ---
 p = char_sandbox.profile_path()
-if not char_sandbox.is_available():
-    print(f"  {Y}\u25cb{Z} sandbox-exec not available — Char's containment layer is OFF")
-elif not p.is_file():
-    print(f"  {Y}\u25cb{Z} sandbox profile not yet written at {p}")
-    print(f"      first ./run.sh char launch will create it")
+if p.is_file():
+    print(f"  {Y}\u25cb{Z} sandbox profile present at {p}")
+    print(f"      not applied by `./run.sh char launch` (TCC trade-off; "
+          f"see CHAR_REVIEW.md)")
 else:
-    ok, msg = char_sandbox.validate_profile(p)
-    if ok:
-        print(f"  {G}\u25cf{Z} sandbox profile valid ({p})")
-    else:
-        print(f"  {R}\u25cb{Z} sandbox profile present but invalid: {msg}")
+    print(f"  {Y}\u25cb{Z} sandbox profile not yet rendered "
+          f"(informational only; not required)")
 # --- system-hosts mode (opt-in) ---
 try:
     s = firewall.status()
@@ -1909,21 +1907,34 @@ sys.exit(0 if vault.char_data_relocated() else 1)
     fi
   fi
 
-  printf "\n%s(10/10) per-Char outbound firewall — sandbox + egress proxy%s\n" \
+  printf "\n%s(10/10) per-Char outbound firewall — egress proxy%s\n" \
          "$c_bold" "$c_reset"
   # This step is intentionally NON-INTERACTIVE and runs without sudo.
-  # We just render the sandbox profile and confirm the proxy module
-  # is importable. The proxy itself starts on the next ./run.sh
-  # start (alongside the ASR + Inspector services).
+  # We just render the sandbox profile (informational; see below)
+  # and confirm the proxy module is importable. The proxy itself
+  # starts on the next ./run.sh start (alongside the ASR + Inspector
+  # services).
   #
   # The legacy /etc/hosts mode (./run.sh firewall enable --mode system)
   # is still available for operators who want the machine-wide block,
   # but it's no longer the default -- it would break OTHER apps on
   # this machine that legitimately use the same providers.
-  printf "  Composing macOS's two available per-process primitives:\n"
-  printf "    %s•%s sandbox-exec  → restricts Char's network reach to loopback\n" "$c_dim" "$c_reset"
+  #
+  # NOTE 2026-05-12: the kernel-level sandbox-exec containment layer
+  # was DROPPED from the default `./run.sh char launch` path because
+  # of how it interacted with macOS TCC: putting sandbox-exec at the
+  # head of the launch chain caused TCC to attribute Char's
+  # permission requests to the launching terminal (iTerm2 / Terminal),
+  # which doesn't have System Audio Capture consent, so other-speaker
+  # capture was silently denied. The hostname-level egress proxy is
+  # the remaining enforcement layer and is what this step prepares.
+  # See CHAR_REVIEW.md § "Layered firewall trade-offs" for the
+  # full breakdown.
+  printf "  Process-level egress filtering:\n"
   printf "    %s•%s HTTPS_PROXY   → routes Char's HTTP(S) through 127.0.0.1:%s\n" \
          "$c_dim" "$c_reset" "$EGRESS_PROXY_PORT"
+  printf "    %s•%s open -a Char.app → TCC attributes audio capture to Char (system audio works)\n" \
+         "$c_dim" "$c_reset"
   printf "  Block list catalog: %s./run.sh firewall list%s\n" \
          "$c_bold" "$c_reset"
   printf "  Full rationale + threat model: %sSECURITY.md%s\n\n" "$c_bold" "$c_reset"
@@ -3085,7 +3096,7 @@ print(json.loads(sys.argv[1]).get("inspector", ""))
   fi
   printf "  log file                     : %s\n" "$ASR_LOG_FILE"
   printf "\n"
-  printf "  launch Char:  %s./run.sh char launch%s   ${c_dim}(routes Char through the egress proxy + sandbox)${c_reset}\n" \
+  printf "  launch Char:  %s./run.sh char launch%s   ${c_dim}(routes Char through the egress proxy)${c_reset}\n" \
          "$c_bold" "$c_reset"
   printf "  on-demand:    %s./run.sh transcribe ~/Desktop/call.m4a%s\n" "$c_bold" "$c_reset"
   printf "  status:       %s./run.sh status%s\n" "$c_bold" "$c_reset"
@@ -3325,8 +3336,8 @@ Subcommands:
   verify         DNS-probe the catalog and report what's actually blocked
 
 The default per-Char mode does NOT touch /etc/hosts -- it relies on the
-sandbox + egress proxy that ./run.sh char launch wires up. See SECURITY.md
-for the full threat model.
+egress proxy that ./run.sh char launch wires up via HTTPS_PROXY. See
+SECURITY.md for the full threat model.
 EOF
       ;;
     *)
@@ -4235,9 +4246,15 @@ cmd_egress_proxy() {
 usage: ./run.sh proxy {start|stop|restart|status|verify|recent|log}
 
 The egress proxy is the per-Char outbound firewall. Char is wired to
-it via the HTTPS_PROXY env var injected by ./run.sh char launch, AND
-contained by char_sandbox so its only network path is loopback. The
-proxy refuses CONNECT requests for any host in firewall.BLOCK_CATALOG.
+it via the HTTPS_PROXY env var injected by ./run.sh char launch (via
+/usr/bin/open --env). The proxy refuses CONNECT requests for any host
+in firewall.BLOCK_CATALOG.
+
+Note: the pre-2026-05 char_sandbox kernel-level containment (which
+restricted Char's network reach to loopback only) was dropped from
+the default launch path because it broke macOS TCC's system-audio-
+capture attribution -- see CHAR_REVIEW.md § "Layered firewall
+trade-offs".
 
 Subcommands:
   start     Start the proxy on :$EGRESS_PROXY_PORT (no-op if already up).
@@ -4302,11 +4319,13 @@ cmd_char() {
       ;;
 
     launch)
-      # Per-Char outbound firewall: launch Char wrapped in
-      # sandbox-exec (loopback-only network) with HTTPS_PROXY
-      # pointing at our local egress proxy. This is the ONLY
-      # supported way to start Char if you want the firewall to
-      # apply -- Dock / Spotlight launches bypass both layers.
+      # Per-Char outbound firewall: launch Char.app via `open -a`
+      # with HTTPS_PROXY pointing at our local egress proxy. This
+      # is the ONLY supported way to start Char if you want the
+      # firewall to apply -- Dock / Spotlight launches inherit no
+      # env vars and bypass it. Replaces the pre-2026-05 sandbox-
+      # exec launch path, which broke macOS TCC system-audio-
+      # capture attribution (see CHAR_REVIEW.md).
       cmd_char_launch "$@"
       ;;
     sandbox)
@@ -4325,9 +4344,15 @@ cmd_char() {
 usage: ./run.sh char {launch|status|fingerprint|sandbox|firewall-status|...}
 
 Char launch (per-Char outbound firewall):
-  launch [...]        Start Char under sandbox-exec + HTTPS_PROXY so its only
-                      outbound path is the local egress proxy. Trailing args
-                      are forwarded to the Char binary verbatim.
+  launch [...]        Start Char.app via /usr/bin/open with HTTPS_PROXY pointed
+                      at the local egress proxy. Char's hostname-level egress
+                      goes through us; macOS TCC attributes Char's permission
+                      requests (microphone, system audio capture, etc.) to
+                      Char.app directly. Trailing args are forwarded to the
+                      Char binary verbatim. NB: the kernel-level sandbox-exec
+                      containment was DROPPED on 2026-05-12 because it broke
+                      TCC's system-audio-capture attribution; see
+                      CHAR_REVIEW.md § "Layered firewall trade-offs".
 
 Binary verification (Layer B):
   status              Verify the installed Char.app against the recorded baseline
@@ -4343,8 +4368,14 @@ Binary verification (Layer B):
   baseline-clear      Forget the recorded baseline (you'll be re-prompted to
                       set one on the next ./run.sh start).
 
-Sandbox profile management:
-  sandbox render      Print the SBPL profile that 'char launch' applies.
+Sandbox profile management (informational; not applied at launch):
+  sandbox render      Print the SBPL profile that pre-2026-05-12 'char launch'
+                      used to apply. Operators who want the kernel layer back
+                      can apply it manually via:
+                        /usr/bin/sandbox-exec -f ~/.config/local_scribe/char.sb \\
+                          /Applications/Char.app/Contents/MacOS/hyprnote
+                      ...but expect macOS TCC to silently deny System Audio
+                      Capture on the resulting Char process.
   sandbox write       Persist the SBPL profile to ~/.config/local_scribe/char.sb.
   sandbox validate    Smoke-test the profile against /usr/bin/true.
   sandbox status      Show profile path, presence, and parse status.
@@ -4367,16 +4398,59 @@ EOF
 
 # --- char launch wrapper ----------------------------------------------------
 #
-# Composes the two macOS primitives we have ('sandbox-exec' kernel
-# policy + 'HTTPS_PROXY' env var) into a per-Char outbound firewall.
-# The two layers reinforce each other:
-#   * The proxy enforces hostname-level blocks (firewall.BLOCK_CATALOG).
-#   * The sandbox restricts Char's network reach to loopback, so even
-#     a Char build that ignored HTTPS_PROXY can't bypass the proxy --
-#     its only network path IS the loopback proxy.
-# This function is the ONLY supported launch path if you want the
-# firewall to apply. Dock / Spotlight launches inherit neither the env
-# vars nor the sandbox.
+# Launches Char.app with a per-process outbound firewall via HTTPS_PROXY
+# pointed at our loopback egress proxy. The proxy enforces the
+# hostname-level allow / block policy in firewall.BLOCK_CATALOG.
+#
+# History (2026-05-12): an earlier version of this function additionally
+# wrapped Char in 'sandbox-exec -f char.sb' for kernel-level
+# loopback-only containment. That layer was DROPPED because of how it
+# interacts with macOS's TCC (Transparency, Consent, and Control)
+# attribution model:
+#
+#   * TCC walks the process-launch chain to decide which app-bundle is
+#     "responsible" for a permission request. The launching binary at
+#     the top of the chain wins.
+#   * When Char was launched by ``exec /usr/bin/sandbox-exec ... hyprnote``
+#     from inside a terminal, TCC saw the terminal (iTerm2 / Terminal.app)
+#     as the responsible bundle for every permission Char asked for.
+#   * iTerm2 does NOT have "System Audio Capture" TCC, and TCC silently
+#     denies (not just downgrades) what the responsible bundle lacks --
+#     so kTCCServiceAudioCapture for Char.app was denied every Generate.
+#     Char's own microphone permission still worked (because TCC was
+#     attributing the request to iTerm2, and iTerm2 happens to have
+#     microphone consent), but other-speaker capture was silently
+#     dropped. Net effect: transcripts had only the operator's voice.
+#
+# Using ``/usr/bin/open -a Char.app --env ...`` instead makes launchd
+# the launcher, which means Char.app is its own responsible bundle for
+# TCC purposes. System Audio Capture works again, granted directly to
+# Char.app's signed bundle identifier (com.hyprnote.stable).
+#
+# Trade-off explicitly accepted:
+#   GAINED  TCC works -> system audio capture works -> Generate
+#           actually transcribes the other speakers.
+#   KEPT    Hostname-level egress filtering via HTTPS_PROXY (the proxy
+#           is still the only allow-listed network destination Char
+#           can reach in practice, because every CONNECT goes through
+#           it).
+#   LOST    Kernel-level "Char's only network path is loopback" guarantee.
+#           If a future Char build IGNORED HTTPS_PROXY and called raw
+#           sockets / connectx, it could now reach the network directly.
+#           Current Char (commit pinned in char_version.json) honours
+#           HTTPS_PROXY for every outbound HTTP / HTTPS connection.
+#           Operators who want the kernel layer back can apply
+#           ~/.config/local_scribe/char.sb manually with sandbox-exec,
+#           accepting that they'll lose the audio path.
+#
+# The SBPL profile ITSELF is still rendered + validated by
+# ``./run.sh char sandbox`` because (a) the proxy verifier still
+# parses it and (b) operators who run a less-strict TCC policy can
+# still apply it manually. It just isn't in the cmd_char_launch path.
+#
+# This function is still the ONLY supported launch path if you want
+# the firewall to apply -- Dock / Spotlight launches inherit no env
+# vars and therefore bypass HTTPS_PROXY.
 
 cmd_char_launch() {
   if [[ ! -d "$CHAR_APP" ]]; then
@@ -4384,24 +4458,30 @@ cmd_char_launch() {
     say "  run ${c_bold}./run.sh install-char${c_reset} first."
     return 1
   fi
-  local char_bin="$CHAR_APP/Contents/MacOS/hyprnote"
-  if [[ ! -x "$char_bin" ]]; then
-    # Some versions ship as ``Char`` rather than ``hyprnote``;
-    # fall back to whatever Contents/MacOS contains.
-    char_bin="$(/bin/ls "$CHAR_APP/Contents/MacOS/" 2>/dev/null | head -n1 | sed "s|^|$CHAR_APP/Contents/MacOS/|")"
-    if [[ ! -x "$char_bin" ]]; then
-      say "${c_red}can't find the Char binary under $CHAR_APP/Contents/MacOS${c_reset}"
-      return 1
-    fi
-  fi
-  if ! command -v /usr/bin/sandbox-exec >/dev/null 2>&1; then
-    say "${c_red}/usr/bin/sandbox-exec is missing — can't enforce the firewall${c_reset}"
-    say "  This macOS is unusual; you can launch Char unsandboxed from the Dock,"
-    say "  but its outbound traffic will NOT be filtered."
+
+  # ``open -a`` reuses any already-running instance of the target app
+  # and applies the new --env values ONLY on fresh process launch. If
+  # Char is already up (e.g. via the Dock), the env vars are dropped
+  # silently, the new instance is just an activation Apple Event, and
+  # the running Char keeps its old (empty-proxy) environment. We
+  # refuse rather than silently leak.
+  local running_pids
+  running_pids="$(/usr/bin/pgrep -f 'Char.app/Contents/MacOS' 2>/dev/null || true)"
+  if [[ -n "$running_pids" ]]; then
+    say "${c_red}Char is already running (pid(s): ${running_pids//$'\n'/ }).${c_reset}"
+    say "  ${c_dim}\`open -a\` would reuse that instance and the new HTTPS_PROXY env"
+    say "   would NOT be applied -- so the running Char would bypass the firewall.${c_reset}"
+    say ""
+    say "  Quit Char (${c_bold}Cmd-Q${c_reset} or ${c_bold}osascript -e 'quit app \"Char\"'${c_reset}) and"
+    say "  re-run ${c_bold}./run.sh char launch${c_reset}."
     return 1
   fi
 
-  # Make sure the proxy + the SBPL profile are both in place.
+  # Make sure the proxy is in place. The SBPL profile is no longer
+  # applied at launch time (see history block above), but we still
+  # render + validate it so 'firewall-status' / 'doctor' have
+  # something meaningful to report and operators who want to apply
+  # it manually can.
   if ! egress_proxy_pid >/dev/null; then
     say "egress proxy is not running; starting it now ..."
     egress_proxy_start || {
@@ -4410,39 +4490,28 @@ cmd_char_launch() {
       return 1
     }
   fi
-  "$VENV_PY" -m local_scribe.egress.char_sandbox write >/dev/null
-  local profile; profile="$(
-    "$VENV_PY" -c 'from local_scribe.egress import char_sandbox; print(char_sandbox.profile_path())'
-  )"
-  if [[ ! -f "$profile" ]]; then
-    say "${c_red}sandbox profile missing at $profile after write${c_reset}"
-    return 1
-  fi
-  # validate_profile runs `sandbox-exec -f profile /usr/bin/true`. If
-  # that succeeds, we know the kernel accepts the policy -- so the
-  # imminent launch won't half-apply it.
-  local validate_json
-  validate_json="$("$VENV_PY" -m local_scribe.egress.char_sandbox validate 2>&1)" || {
-    say "${c_red}sandbox profile failed to validate:${c_reset}"
-    say "  $validate_json"
-    return 1
-  }
+  # Idempotent: write_profile is a no-op when the on-disk contents
+  # already match. Failure here is non-fatal -- it only means
+  # ./run.sh char sandbox apply (manual operator use) won't have a
+  # profile file ready, but the launch itself doesn't depend on it.
+  "$VENV_PY" -m local_scribe.egress.char_sandbox write >/dev/null 2>&1 || true
 
-  say "${c_green}launching Char under sandbox-exec + HTTPS_PROXY=...:$EGRESS_PROXY_PORT${c_reset}"
-  say "  binary  : $char_bin"
-  say "  profile : $profile"
+  say "${c_green}launching Char with HTTPS_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT${c_reset}"
+  say "  app     : $CHAR_APP"
   say "  proxy   : http://127.0.0.1:$EGRESS_PROXY_PORT"
-  say "  ${c_dim}detach with Ctrl+C; the sandbox + proxy stay active for the running Char${c_reset}"
+  say "  ${c_dim}TCC responsibility: Char.app (system audio capture works).${c_reset}"
+  say "  ${c_dim}kernel sandbox: not applied -- see CHAR_REVIEW.md § Layered firewall trade-offs.${c_reset}"
   # NO_PROXY keeps our own loopback services reachable without
   # tunnelling through the proxy (which we'd also allow, but it
-  # would needlessly add a hop).
-  exec /usr/bin/sandbox-exec -f "$profile" \
-       /usr/bin/env \
-         "HTTPS_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT" \
-         "HTTP_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT" \
-         "NO_PROXY=127.0.0.1,localhost,::1" \
-         "ALL_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT" \
-         "$char_bin" "$@"
+  # would needlessly add a hop). --args is the open(1) separator
+  # between options and verbatim app argv; everything after it is
+  # forwarded to Char unchanged.
+  exec /usr/bin/open -a "$CHAR_APP" \
+       --env "HTTPS_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT" \
+       --env "HTTP_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT" \
+       --env "NO_PROXY=127.0.0.1,localhost,::1" \
+       --env "ALL_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT" \
+       --args "$@"
 }
 
 # --- char firewall-status ---------------------------------------------------
@@ -4450,7 +4519,11 @@ cmd_char_launch() {
 cmd_char_firewall_status() {
   printf "%s──── per-Char outbound firewall ────%s\n" "$c_bold" "$c_reset"
 
-  # 1. Proxy.
+  # 1. Proxy. This is the only ACTIVE firewall layer in the current
+  # launch model -- the SBPL profile is rendered but no longer
+  # applied at ./run.sh char launch (see CHAR_REVIEW.md §
+  # "Layered firewall trade-offs"). If the proxy isn't up, Char's
+  # egress is unfiltered.
   if egress_proxy_pid >/dev/null; then
     printf "  "; ok; printf "egress proxy    pid=%-7s listening on :%s\n" \
                            "$(egress_proxy_pid)" "$EGRESS_PROXY_PORT"
@@ -4458,30 +4531,30 @@ cmd_char_firewall_status() {
     printf "  "; bad; printf "egress proxy    NOT RUNNING (Char traffic not filtered)\n"
   fi
 
-  # 2. Sandbox profile.
+  # 2. Sandbox profile. INFORMATIONAL ONLY: cmd_char_launch stopped
+  # applying this on 2026-05-12 because sandbox-exec rewrote the
+  # process-launch chain in a way that broke macOS TCC's system-
+  # audio-capture attribution for Char.app (it ended up attributed
+  # to the launching terminal, which lacks the entitlement, and
+  # other-speaker capture was silently denied). We still render the
+  # profile for operators who want to apply it manually, but the
+  # default launch path uses `/usr/bin/open -a` instead.
   local sb_status
   sb_status="$("$VENV_PY" -m local_scribe.egress.char_sandbox status 2>/dev/null || echo '{}')"
-  local sb_present sb_valid
+  local sb_present
   sb_present="$("$VENV_PY" -c "
-import json, sys
+import json
 try:
   d=json.loads('''$sb_status''')
   print('1' if d.get('profile_present') else '0')
 except Exception: print('0')
 " 2>/dev/null)"
-  sb_valid="$("$VENV_PY" -c "
-import json, sys
-try:
-  d=json.loads('''$sb_status''')
-  print('1' if d.get('profile_valid') else '0')
-except Exception: print('0')
-" 2>/dev/null)"
-  if [[ "$sb_present" == "1" && "$sb_valid" == "1" ]]; then
-    printf "  "; ok; printf "sandbox profile valid and ready\n"
-  elif [[ "$sb_present" == "1" ]]; then
-    printf "  "; warn; printf "sandbox profile present but FAILED to parse\n"
+  if [[ "$sb_present" == "1" ]]; then
+    printf "  "; printf "%s•%s sandbox profile present (informational; not applied at launch)\n" \
+                       "$c_dim" "$c_reset"
   else
-    printf "  "; warn; printf "sandbox profile not yet written (run ./run.sh char launch)\n"
+    printf "  "; printf "%s•%s sandbox profile not yet rendered (informational; not required)\n" \
+                       "$c_dim" "$c_reset"
   fi
 
   # 3. Is Char running? If so, was it launched through us?
@@ -4498,7 +4571,10 @@ except Exception: print('0')
       # have to look at the *parent* lineage. The cheapest signal
       # is "does HTTPS_PROXY=127.0.0.1:8889 appear in /proc-like
       # env?". macOS doesn't expose env via /proc, but we can use
-      # ``ps eww`` to capture the env of the process.
+      # ``ps eww`` to capture the env of the process. ``open -a
+      # --env`` still injects these vars into the launched bundle,
+      # so this check works for both the old sandbox-exec path and
+      # the new ``open -a`` path.
       local env_dump
       env_dump="$(ps eww -p "$pid" 2>/dev/null | tail -n +2 || true)"
       if [[ "$env_dump" == *"HTTPS_PROXY=http://127.0.0.1:$EGRESS_PROXY_PORT"* ]]; then
@@ -4511,7 +4587,56 @@ except Exception: print('0')
     done <<< "$char_pids"
   fi
 
-  # 4. Recent proxy decisions. The audit ring lives in the proxy
+  # 4. TCC attribution sanity check. The May 2026 audio-silent-fail
+  # bug manifested as a 'responsible' field in tccd's AttributionChain
+  # pointing at the launching terminal (com.googlecode.iterm2,
+  # com.apple.Terminal, ...) instead of at Char.app
+  # (com.hyprnote.stable). The new launch path makes Char its own
+  # responsible bundle; if we ever regress, this probe surfaces it.
+  if [[ -x "$VENV_PY" ]]; then
+    local tcc_check
+    tcc_check="$("$VENV_PY" -m local_scribe.egress.char_tcc_probe 2>/dev/null || echo '{}')"
+    local tcc_state tcc_responsible
+    tcc_state="$("$VENV_PY" -c "
+import json
+try:
+  d=json.loads('''$tcc_check''')
+  print(d.get('state', 'unknown'))
+except Exception: print('unknown')
+" 2>/dev/null)"
+    tcc_responsible="$("$VENV_PY" -c "
+import json
+try:
+  d=json.loads('''$tcc_check''')
+  print(d.get('responsible', '-'))
+except Exception: print('-')
+" 2>/dev/null)"
+    case "$tcc_state" in
+      ok)
+        printf "  "; ok; printf "TCC attribution responsible=%s (system audio capture available)\n" \
+                                "$tcc_responsible"
+        ;;
+      terminal)
+        printf "  "; bad; printf "TCC attribution responsible=%s — this is a terminal, NOT Char\n" \
+                                 "$tcc_responsible"
+        printf "         %sthis breaks system audio capture (other speakers won't be transcribed)%s\n" \
+               "$c_dim" "$c_reset"
+        printf "         %squit Char and relaunch via %s./run.sh char launch%s%s\n" \
+               "$c_dim" "$c_bold" "$c_reset" "$c_dim$c_reset"
+        ;;
+      no_logs|no_events)
+        printf "  "; printf "%s•%s TCC attribution unknown (no recent tccd events for Char.app)\n" \
+                           "$c_dim" "$c_reset"
+        ;;
+      *)
+        # 'unknown' / unparseable JSON / log-show absent.
+        printf "  "; printf "%s•%s TCC attribution probe unavailable\n" \
+                           "$c_dim" "$c_reset"
+        ;;
+    esac
+  fi
+
+  # 5. Recent proxy decisions. The audit ring lives in the proxy
   # process's address space, so we can't read it from this shell;
   # tail the structured log file instead. Lines of interest are
   # tagged with "DENY" / "ALLOW" / "ERROR" at INFO/WARN level.

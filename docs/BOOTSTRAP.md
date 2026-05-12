@@ -49,15 +49,27 @@ state and exits without changing anything.
                                           the same file.
 (8/10) LM Studio.app + Qwen LLM       ─── see breakdown below
 (9/10) Char.app — install + auto-config
-(10/10) per-Char outbound firewall    ─── renders + validates the
-                                          sandbox-exec profile at
-                                          ~/.config/local_scribe/char.sb.
-                                          NO SUDO. The egress proxy
-                                          starts on the next ./run.sh
+(10/10) per-Char outbound firewall    ─── prepares the loopback
+                                          egress proxy that
+                                          ./run.sh char launch
+                                          wires Char into via
+                                          HTTPS_PROXY. The SBPL
+                                          profile at
+                                          ~/.config/local_scribe/char.sb
+                                          is rendered + validated
+                                          for informational use
+                                          (no longer applied at
+                                          launch since 2026-05-12;
+                                          see CHAR_REVIEW.md §
+                                          Layered firewall
+                                          trade-offs). NO SUDO.
+                                          The egress proxy starts
+                                          on the next ./run.sh
                                           start. Launch Char via
                                           ./run.sh char launch.
-                                          --mode system (machine-wide
-                                          /etc/hosts block) is opt-in.
+                                          --mode system (machine-
+                                          wide /etc/hosts block)
+                                          is opt-in.
 ```
 
 ### Step (8/9) — LM Studio.app + Qwen LLM, in detail
