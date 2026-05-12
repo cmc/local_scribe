@@ -17,6 +17,7 @@ import io
 import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -973,7 +974,8 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
 
     def test_stream_emits_heartbeat_deltas_when_asr_is_slow(self):
         # The whole point of the streaming branch: a long ASR run must
-        # produce delta heartbeats so Char's 60-second BATCH_IDLE_TIMEOUT
+        # produce delta heartbeats so Char's progressive idle timer
+        # (≈30s in 2026-05 builds; see _OPENAI_STREAM_HEARTBEAT_SECONDS)
         # doesn't fire. We force ASR to take longer than the heartbeat
         # interval and assert at least one delta arrives before `done`.
         slow_done = asyncio.Event()
@@ -1004,6 +1006,7 @@ class OpenAIEndpointE2ETests(unittest.TestCase):
         self.assertEqual(deltas[0]["delta"], " ")
         self.assertEqual(len(dones), 1)
         self.assertEqual(dones[0]["text"], CANNED_TRANSCRIPT)
+
 
     def test_stream_with_diarization_inlines_speaker_prefixes(self):
         # When diarization runs successfully and finds 2+ speakers, the
@@ -1348,6 +1351,298 @@ class OpenAIEndpointMiscTests(unittest.TestCase):
         self.assertIn("endpoints", body)
         self.assertEqual(body["endpoints"]["openai_batch"],
                          "POST /v1/audio/transcriptions")
+
+
+# ===========================================================================
+# Unit tests for the SSE heartbeat helper + the multi-phase streaming
+# generator. Driven directly against the async generators -- NOT through
+# the FastAPI TestClient -- because the auth-dependency wiring used by the
+# OpenAIEndpointE2ETests above is in a state where it returns 503 in the
+# test process unless the global auth provider has been initialised; the
+# heartbeat fix is orthogonal to that, so we test at the generator layer
+# where the only dependencies are the explicitly-patched ones.
+#
+# The bug these tests pin: prior to May 2026, `_stream_openai_transcription`
+# only wrapped the ASR phase in a heartbeat loop. The diarization and
+# sidecar-write phases ran in complete silence on the SSE channel, so for
+# any audio whose diarization > Char's ~30s progressive idle window, Char
+# dropped the request mid-flight with "Timed out waiting for progressive
+# batch stream response" -- transcripts never landed.
+# ===========================================================================
+
+import tempfile
+
+
+async def _drive_async_gen(gen) -> list:
+    """Iterate an async generator to exhaustion, returning all yielded
+    values as a list. Tiny helper so individual tests can read like a
+    flat sequence assert."""
+    out = []
+    async for v in gen:
+        out.append(v)
+    return out
+
+
+class WaitWithHeartbeatsUnitTests(unittest.TestCase):
+    """The helper that wraps any awaitable task in a periodic-heartbeat
+    SSE generator. This is the single new unit introduced by the
+    multi-phase heartbeat refactor; the tests below pin its contract
+    so future changes can't silently break it for any of its three
+    callers (asr / diar / sidecar)."""
+
+    def test_returns_silently_when_task_finishes_inside_first_interval(self):
+        # A task that completes faster than the heartbeat interval
+        # must produce ZERO heartbeats and return promptly. Otherwise
+        # short-file Generates would spam Char with empty deltas.
+        async def fast(): return 42
+
+        async def go():
+            task = asyncio.create_task(fast())
+            events = await _drive_async_gen(
+                asr_server._wait_with_heartbeats(
+                    task, request_id="t", started=time.time(), phase="asr",
+                )
+            )
+            return events, task.result()
+
+        with mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 1.0):
+            events, result = asyncio.run(go())
+        self.assertEqual(events, [])
+        self.assertEqual(result, 42)
+
+    def test_yields_at_least_one_heartbeat_when_task_outlives_interval(self):
+        # Core invariant. Long-running task → ≥1 heartbeat delta
+        # emitted while the task is in flight. Without this, Char's
+        # progressive idle timer fires and the whole request is
+        # dropped.
+        async def slow():
+            await asyncio.sleep(0.3)
+            return "done"
+
+        async def go():
+            task = asyncio.create_task(slow())
+            return await _drive_async_gen(
+                asr_server._wait_with_heartbeats(
+                    task, request_id="t", started=time.time(), phase="diar",
+                )
+            )
+
+        with mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 0.05):
+            events = asyncio.run(go())
+        self.assertGreaterEqual(len(events), 1,
+            "must emit ≥1 heartbeat while task is in flight")
+
+    def test_heartbeats_are_sse_formatted_delta_events(self):
+        # Char's progressive parser only resets last_activity_tx on
+        # specific event shapes — a `transcript.text.delta` event
+        # with a non-empty `delta` field. Heartbeats must conform or
+        # they'd be silently dropped on Char's side and the timer
+        # would fire anyway.
+        async def slow():
+            await asyncio.sleep(0.2)
+            return None
+
+        async def go():
+            task = asyncio.create_task(slow())
+            return await _drive_async_gen(
+                asr_server._wait_with_heartbeats(
+                    task, request_id="t", started=time.time(), phase="asr",
+                )
+            )
+
+        with mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 0.05):
+            events = asyncio.run(go())
+        self.assertGreaterEqual(len(events), 1)
+        for ev in events:
+            self.assertTrue(ev.startswith("data: "), ev)
+            self.assertTrue(ev.endswith("\n\n"), ev)
+            payload = json.loads(ev[len("data: "):].rstrip())
+            self.assertEqual(payload["type"], "transcript.text.delta")
+            # Non-empty delta is the difference between "Char emits a
+            # Progress event" and "Char silently drops the chunk".
+            self.assertNotEqual(payload["delta"], "")
+            self.assertEqual(payload["logprobs"], [])
+
+    def test_propagates_task_exception(self):
+        # When the wrapped task raises (e.g. ASR backend crashed,
+        # diarization model missing), the exception must propagate
+        # out of the generator so the outer try/except in
+        # `_stream_openai_transcription` can emit a synthetic-error
+        # `done` SSE and clean up.
+        class Boom(RuntimeError): pass
+
+        async def fail():
+            await asyncio.sleep(0.05)
+            raise Boom("kaboom")
+
+        async def go():
+            task = asyncio.create_task(fail())
+            return await _drive_async_gen(
+                asr_server._wait_with_heartbeats(
+                    task, request_id="t", started=time.time(), phase="asr",
+                )
+            )
+
+        with mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 1.0), \
+             self.assertRaises(Boom):
+            asyncio.run(go())
+
+
+class StreamOpenAITranscriptionMultiphaseTests(unittest.TestCase):
+    """Drives `_stream_openai_transcription` end-to-end at the async-
+    generator layer, mocking out each blocking phase independently to
+    verify heartbeats fire during *each* of ASR / diarization /
+    sidecar-write. This is the actual regression net for the May 2026
+    "transcript never lands" Char failure mode."""
+
+    def setUp(self):
+        # The generator's `finally:` deletes `audio_path`. Use a real
+        # temp file so the unlink succeeds; we never actually open it
+        # because `_run_asr_async` is mocked.
+        fd, self.audio_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        self.addCleanup(self._safe_unlink, self.audio_path)
+
+    @staticmethod
+    def _safe_unlink(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _drive(self, *, do_diarize: bool) -> list:
+        async def go():
+            gen = asr_server._stream_openai_transcription(
+                request_id="test-multiphase",
+                audio_path=self.audio_path,
+                started=time.time(),
+                do_diarize=do_diarize,
+            )
+            return await _drive_async_gen(gen)
+        return asyncio.run(go())
+
+    def _parse(self, raw_events: list) -> list:
+        """Convert the generator's raw SSE strings back to event dicts
+        / sentinels, matching what a real HTTP client would see."""
+        out: list = []
+        for ev in raw_events:
+            chunk = ev.strip()
+            if not chunk.startswith("data:"):
+                continue
+            payload = chunk[len("data:"):].strip()
+            if payload == "[DONE]":
+                out.append("[DONE]")
+            else:
+                out.append(json.loads(payload))
+        return out
+
+    def test_heartbeats_fire_during_slow_diarization_phase(self):
+        # REGRESSION: May 2026 silent-failure mode. ASR completed in
+        # <1s, the (then-only) ASR heartbeat loop exited, then
+        # diarization ran ~60s in silence and Char dropped the request
+        # ~30s in with "Timed out waiting for progressive batch stream
+        # response". Fix: the diarization phase is now wrapped in
+        # `_wait_with_heartbeats` too.
+        diar_started = asyncio.Event()
+        diar_done = asyncio.Event()
+
+        def slow_diar_sync(audio_path, words, duration, request_id,
+                           *, num_speakers_override=None,
+                           cluster_threshold_override=None):
+            # `asyncio.to_thread` runs this in a worker; we block the
+            # worker thread with time.sleep, so the event loop is free
+            # to fire heartbeats in the meantime.
+            diar_started.set()
+            time.sleep(0.3)
+            diar_done.set()
+            return (
+                [dict(w, speaker="SPEAKER_00") for w in words],
+                1,
+            )
+
+        with mock.patch.object(asr_server, "_run_asr_async",
+                               side_effect=_fake_run_asr_async), \
+             mock.patch.object(asr_server, "_attach_speakers_to_words",
+                               side_effect=slow_diar_sync), \
+             mock.patch.object(asr_server, "_maybe_write_char_transcript",
+                               return_value=None), \
+             mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 0.05):
+            raw = self._drive(do_diarize=True)
+
+        self.assertTrue(diar_started.is_set(),
+            "the fake diarizer should have been entered")
+        self.assertTrue(diar_done.is_set(),
+            "the fake diarizer should have completed normally")
+
+        events = self._parse(raw)
+        deltas = [e for e in events if isinstance(e, dict)
+                  and e.get("type") == "transcript.text.delta"]
+        dones = [e for e in events if isinstance(e, dict)
+                 and e.get("type") == "transcript.text.done"]
+
+        # ASR is "instant" (the canned fake returns immediately), so
+        # any deltas observed must have come from the diarization
+        # phase. This is the regression assert.
+        self.assertGreaterEqual(
+            len(deltas), 1,
+            "must emit ≥1 heartbeat during the diarization phase. "
+            "Without this, Char drops long-file Generates ≈30s into "
+            "diarization with 'Timed out waiting for progressive "
+            "batch stream response'. See May 2026 regression.",
+        )
+        self.assertEqual(len(dones), 1)
+        self.assertEqual(dones[0]["text"], CANNED_TRANSCRIPT)
+        self.assertEqual(events[-1], "[DONE]")
+
+    def test_heartbeats_fire_during_slow_sidecar_phase(self):
+        # Defense in depth. The third phase (transcript.json sidecar
+        # write into Char's session dir) is usually <1s but the sha256
+        # over a large audio file on a slow disk can spike past Char's
+        # 30s idle window. Same wrapping; pin it so future refactors
+        # can't quietly drop the heartbeats from this branch either.
+        sidecar_done = asyncio.Event()
+
+        def slow_sidecar_sync(audio_path, words, lang, request_id,
+                              *, metadata=None):
+            time.sleep(0.3)
+            sidecar_done.set()
+            return None
+
+        with mock.patch.object(asr_server, "_run_asr_async",
+                               side_effect=_fake_run_asr_async), \
+             mock.patch.object(asr_server, "_maybe_write_char_transcript",
+                               side_effect=slow_sidecar_sync), \
+             mock.patch.object(asr_server, "_OPENAI_STREAM_HEARTBEAT_SECONDS", 0.05):
+            raw = self._drive(do_diarize=False)
+
+        self.assertTrue(sidecar_done.is_set(),
+            "the fake sidecar writer should have completed normally")
+
+        events = self._parse(raw)
+        deltas = [e for e in events if isinstance(e, dict)
+                  and e.get("type") == "transcript.text.delta"]
+        dones = [e for e in events if isinstance(e, dict)
+                 and e.get("type") == "transcript.text.done"]
+        self.assertGreaterEqual(
+            len(deltas), 1,
+            "must emit ≥1 heartbeat during the sidecar-write phase",
+        )
+        self.assertEqual(len(dones), 1)
+
+    def test_terminal_done_is_emitted_exactly_once(self):
+        # Belt-and-braces invariant for the multi-phase refactor:
+        # heartbeats are additive, the terminal done must still be
+        # emitted exactly once and followed by `[DONE]`.
+        with mock.patch.object(asr_server, "_run_asr_async",
+                               side_effect=_fake_run_asr_async), \
+             mock.patch.object(asr_server, "_maybe_write_char_transcript",
+                               return_value=None):
+            raw = self._drive(do_diarize=False)
+        events = self._parse(raw)
+        dones = [e for e in events if isinstance(e, dict)
+                 and e.get("type") == "transcript.text.done"]
+        self.assertEqual(len(dones), 1)
+        self.assertEqual(events[-1], "[DONE]")
 
 
 if __name__ == "__main__":

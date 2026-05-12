@@ -1274,13 +1274,28 @@ def _openai_transcription_response(
     return {"text": transcript}
 
 
-# Char's BATCH_IDLE_TIMEOUT in tauri-plugin-transcription/listener2/ext.rs is
-# hardcoded at 60 seconds. The non-streaming `simple` batch path (used for
-# `gpt-4o-transcribe-diarize`) only emits its single BatchResponse event at
-# the very end, so any audio whose ASR takes >60s aborts on the client side
-# (no toast, no log -- the spawned future is just dropped). The progressive
-# path (used for `gpt-4o-transcribe`) resets that timer on every SSE delta,
-# so we keep it alive with a tiny heartbeat delta every N seconds.
+# Char's idle timeout in tauri-plugin-transcription/listener2/ext.rs differs
+# between batch paths and was tightened in a recent Char release:
+#
+#   * The non-streaming `simple` batch path (used for
+#     `gpt-4o-transcribe-diarize` without `stream=true`) only emits its single
+#     BatchResponse event at the very end, so any audio whose ASR takes >60s
+#     aborts on the client side (no toast, no log -- the spawned future is
+#     just dropped).
+#   * The `openai_progressive_batch` path (used for `gpt-4o-transcribe` +
+#     `stream=true`) has its own per-delta idle window. **It is ~30 seconds
+#     in current Char builds**, NOT 60s as an earlier version of this comment
+#     claimed -- empirically observed on 2026-05-12 when diarization ran ~60s
+#     in silence after a 20s ASR-phase heartbeat and Char aborted exactly
+#     30s after the last delta. Every SSE delta on the progressive path
+#     resets that timer.
+#
+# So we emit a tiny heartbeat delta every N seconds during *each* slow
+# phase (ASR, diarization, transcript.json sidecar write). See
+# :func:`_wait_with_heartbeats` for the helper and
+# :func:`_stream_openai_transcription` for the orchestration -- if any
+# blocking phase runs in silence longer than this interval the request
+# is dropped client-side.
 _OPENAI_STREAM_HEARTBEAT_SECONDS = _CFG.stream_heartbeat_seconds
 
 
@@ -1388,6 +1403,63 @@ def _compose_speaker_prefixed_text(
     return "\n\n".join(lines)
 
 
+async def _wait_with_heartbeats(
+    task: "asyncio.Task[Any]",
+    request_id: str,
+    started: float,
+    phase: str,
+):
+    """Yield SSE ``transcript.text.delta`` heartbeat strings every
+    ``_OPENAI_STREAM_HEARTBEAT_SECONDS`` until ``task`` completes, then
+    return.
+
+    Used inside :func:`_stream_openai_transcription` to keep Char's
+    progressive batch idle timer alive during each of the THREE
+    independently-slow phases of a long-file Generate:
+
+      1. ``asr``     — :func:`_run_asr_async` (Parakeet / Whisper MLX inference)
+      2. ``diar``    — :func:`_attach_speakers_to_words` (sherpa-onnx + eigengap auto-K)
+      3. ``sidecar`` — :func:`_maybe_write_char_transcript` (sha256 + JSON write)
+
+    Each phase can independently run longer than Char's ~30s progressive
+    idle window; without this helper the second and third phases ran in
+    complete silence and Char would drop the request at exactly the
+    diarization step for any audio over a few minutes long.
+
+    The task's return value is **not** yielded from this generator
+    (PEP 525 doesn't expose a clean ``return value`` for ``async for``).
+    Callers read ``task.result()`` after the loop completes:
+
+        task = asyncio.create_task(some_coro())
+        async for hb in _wait_with_heartbeats(task, rid, t0, "asr"):
+            yield hb
+        result = task.result()
+
+    Exceptions raised by the wrapped task propagate out of the
+    generator so the outer ``try/except`` in
+    :func:`_stream_openai_transcription` can emit an error ``done``
+    SSE event and clean up the upload temp file.
+    """
+    while True:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=_OPENAI_STREAM_HEARTBEAT_SECONDS,
+            )
+            return
+        except asyncio.TimeoutError:
+            logger.info(
+                "[openai %s] streaming heartbeat "
+                "(%s in flight, %.1fs elapsed)",
+                request_id, phase, time.time() - started,
+            )
+            yield _sse({
+                "type": "transcript.text.delta",
+                "delta": " ",
+                "logprobs": [],
+            })
+
+
 async def _stream_openai_transcription(
     request_id: str,
     audio_path: str,
@@ -1399,46 +1471,61 @@ async def _stream_openai_transcription(
 ):
     """SSE generator for Char's progressive (gpt-4o-transcribe) batch path.
 
-    Emits a `transcript.text.delta` heartbeat every
-    STREAM_HEARTBEAT_SECONDS while ASR runs, then a `transcript.text.done`
-    with the full transcript (with inlined `Speaker N:` prefixes when
-    diarization actually produced multiple speakers). Char's parser
-    accumulates deltas into `partial_text` but the non-empty `done.text`
-    replaces it, so the heartbeat spaces never reach the user.
+    Emits a ``transcript.text.delta`` heartbeat every
+    ``_OPENAI_STREAM_HEARTBEAT_SECONDS`` while *each* slow phase runs
+    (ASR → diarization → sidecar transcript.json write), then a
+    ``transcript.text.done`` with the full transcript (with inlined
+    ``Speaker N:`` prefixes when diarization actually produced multiple
+    speakers). Char's parser accumulates deltas into ``partial_text``
+    but the non-empty ``done.text`` replaces it, so the heartbeat
+    spaces never reach the user.
+
+    Heartbeats MUST cover every blocking phase. An earlier version of
+    this function only wrapped the ASR phase; for any audio file long
+    enough for diarization to run >30s, that meant Char's progressive
+    idle timer fired during the (un-heartbeated) diarization phase and
+    aborted the request. See the comment on
+    ``_OPENAI_STREAM_HEARTBEAT_SECONDS`` above for the Char-side
+    idle-window numbers.
     """
     try:
+        # Phase 1: ASR. Almost always the fastest of the three phases
+        # on Apple Silicon (parakeet-mlx is ~real-time-or-faster), but
+        # still wrapped because cold-start of the MLX worker on the
+        # first request can take 20-30s.
         asr_task = asyncio.create_task(_run_asr_async(audio_path))
-
-        while True:
-            try:
-                transcript, words, lang, duration = await asyncio.wait_for(
-                    asyncio.shield(asr_task),
-                    timeout=_OPENAI_STREAM_HEARTBEAT_SECONDS,
-                )
-                break
-            except asyncio.TimeoutError:
-                logger.info(
-                    "[openai %s] streaming heartbeat (asr in flight, %.1fs elapsed)",
-                    request_id, time.time() - started,
-                )
-                yield _sse({
-                    "type": "transcript.text.delta",
-                    "delta": " ",
-                    "logprobs": [],
-                })
+        async for hb in _wait_with_heartbeats(
+            asr_task, request_id, started, "asr",
+        ):
+            yield hb
+        transcript, words, lang, duration = asr_task.result()
 
         asr_done = time.time() - started
         num_speakers = 0
         skipped_reason: str | None = None
+
+        # Phase 2: diarization. Often the slowest phase for >10-minute
+        # audio: sherpa-onnx segmentation + TitaNet embeddings + auto-K
+        # eigengap clustering can easily take ~real-time on a long call
+        # (e.g. 60s for ~30 minutes of audio). Wrap in the heartbeat
+        # generator so the SSE channel stays alive.
         if do_diarize and words:
             logger.info(
                 "[openai %s] running diarization (sherpa-onnx) ...", request_id,
             )
-            words, num_speakers = await asyncio.to_thread(
-                _attach_speakers_to_words, audio_path, words, duration, request_id,
-                num_speakers_override=num_speakers_override,
-                cluster_threshold_override=cluster_threshold_override,
+            diar_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _attach_speakers_to_words,
+                    audio_path, words, duration, request_id,
+                    num_speakers_override=num_speakers_override,
+                    cluster_threshold_override=cluster_threshold_override,
+                )
             )
+            async for hb in _wait_with_heartbeats(
+                diar_task, request_id, started, "diar",
+            ):
+                yield hb
+            words, num_speakers = diar_task.result()
             if num_speakers > 1:
                 transcript = _compose_speaker_prefixed_text(words, transcript)
         elif not do_diarize:
@@ -1457,16 +1544,24 @@ async def _stream_openai_transcription(
             speakers=speakers_agg,
         )
 
-        # Sidecar-write transcript.json into Char's session dir BEFORE
-        # we send `done`. Char's progressive parser will drop our words
-        # but the sidecar lands them on disk for the persister to load
-        # on next session-open. Run on a worker thread so the SSE
-        # heartbeat loop doesn't have to wait for SHA256 hashing.
-        await asyncio.to_thread(
-            _maybe_write_char_transcript,
-            audio_path, words, lang, request_id,
-            metadata=diar_meta,
+        # Phase 3: sidecar transcript.json write. Char's progressive
+        # parser drops our words array, so we write the canonical
+        # transcript.json into Char's session dir BEFORE emitting
+        # ``done``; the persister loads it on next session-open.
+        # Usually <1s, but a large MP3 + a slow disk can push the
+        # SHA256 over the heartbeat interval, so wrap this too.
+        sidecar_task = asyncio.create_task(
+            asyncio.to_thread(
+                _maybe_write_char_transcript,
+                audio_path, words, lang, request_id,
+                metadata=diar_meta,
+            )
         )
+        async for hb in _wait_with_heartbeats(
+            sidecar_task, request_id, started, "sidecar",
+        ):
+            yield hb
+        sidecar_task.result()
 
         elapsed = time.time() - started
         logger.info(
