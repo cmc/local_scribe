@@ -67,6 +67,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from local_scribe.common import touch_prompts
 from local_scribe.security import disaster_recovery
 from local_scribe.security import key_safety
 from local_scribe.security import key_split
@@ -237,6 +238,27 @@ def unlock_master_key(
     one outstanding modal at a time — having both fire concurrently
     would confuse anyone who hasn't memorised the flow.
 
+    Operator UX
+    -----------
+    Two terminal banners fire automatically around the blocking
+    steps (see ``local_scribe.common.touch_prompts`` for the threat
+    model + test seam):
+
+    * A yellow "TOUCH ID PROMPT INCOMING" banner immediately before
+      the Keychain read pops a Touch ID modal.
+    * A red "TAP YOUR YUBIKEY NOW" banner immediately before the age
+      subprocess starts decrypting yk_half (the YubiKey LED begins
+      flashing at that moment).
+
+    Callers that already plumb their own ``on_touch_prompt`` (tests,
+    GUIs) keep that callback for the YubiKey banner; only the
+    Touch ID banner is always-on, because every Touch ID consumer
+    is going through this entry point in v2.
+
+    Suppressed by ``LOCAL_SCRIBE_QUIET_TOUCH_PROMPTS=1`` — used by
+    integration tests that drive the unlock primitives against
+    fake Keychain backends and don't want the banner spam.
+
     Migration: if no v2 kc_half is present but a legacy v1 item is,
     we run the migration helper and then retry. This makes the first
     ``unlock`` after a code update Just Work.
@@ -250,6 +272,14 @@ def unlock_master_key(
                 "no master key on this machine — run `./run.sh key init`"
             )
 
+    # If the caller didn't wire their own YubiKey prompt callback,
+    # use the default CLI banner. Tests / GUIs that pass an explicit
+    # callback get their callback used verbatim (see touch_prompts
+    # module docstring for the contract).
+    if on_touch_prompt is None:
+        on_touch_prompt = touch_prompts.cli_yubikey_prompt
+
+    touch_prompts.print_touch_id_imminent(prompt)
     kc_half = secret_store.load_kc_half(prompt=prompt)
     try:
         yk_half = yubikey_backup.restore_yk_half(on_touch_prompt=on_touch_prompt)

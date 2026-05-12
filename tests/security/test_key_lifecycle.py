@@ -398,6 +398,109 @@ class InitAndUnlockTests(_LifecycleBase):
             self.key_lifecycle.unlock_master_key()
 
 
+# ---------- operator-feedback banners --------------------------------
+#
+# These tests pin the contract from
+# ``local_scribe/common/touch_prompts.py``: every routine unlock fires
+# a Touch ID banner (before the Keychain read) AND a YubiKey banner
+# (before the age decrypt). The banners are the only thing telling
+# the operator "your terminal isn't hung — go touch your laptop /
+# YubiKey now". Removing them silently regressed the UX in six
+# self-reported "is it hung?" moments on 2026-05-11; that's the
+# reason these tests exist.
+
+class TouchPromptIntegrationTests(_LifecycleBase):
+    def _capture_unlock_banners(self) -> str:
+        """Drive an unlock under stderr capture and return the
+        captured text. Caller asserts on grep-able substrings."""
+        import io
+        import sys
+        self._preenroll_primary()
+        self.key_lifecycle.init_master_key(enroll_yubikey=False)
+        buf = io.StringIO()
+        saved = sys.stderr
+        sys.stderr = buf
+        try:
+            self.key_lifecycle.unlock_master_key()
+        finally:
+            sys.stderr = saved
+        return buf.getvalue()
+
+    def test_unlock_emits_touch_id_banner(self) -> None:
+        out = self._capture_unlock_banners()
+        self.assertIn(
+            "TOUCH ID PROMPT INCOMING", out,
+            msg="unlock_master_key must print the Touch ID banner "
+                "before reading kc_half from the Keychain; without it "
+                "the operator doesn't know a modal is about to pop.",
+        )
+
+    def test_unlock_emits_yubikey_banner(self) -> None:
+        out = self._capture_unlock_banners()
+        self.assertIn(
+            "TAP YOUR YUBIKEY NOW", out,
+            msg="unlock_master_key's default on_touch_prompt must "
+                "fire the YubiKey banner before the age decrypt "
+                "blocks waiting for the tap.",
+        )
+
+    def test_unlock_banners_appear_in_correct_order(self) -> None:
+        """Touch ID first (Keychain), YubiKey second (age decrypt).
+        Cross-wiring them would be an immediate UX regression."""
+        out = self._capture_unlock_banners()
+        touch_idx = out.find("TOUCH ID PROMPT INCOMING")
+        yk_idx = out.find("TAP YOUR YUBIKEY NOW")
+        self.assertGreaterEqual(touch_idx, 0)
+        self.assertGreaterEqual(yk_idx, 0)
+        self.assertLess(
+            touch_idx, yk_idx,
+            msg="Touch ID banner must precede YubiKey banner "
+                "(matches the unlock primitive's execution order).",
+        )
+
+    def test_quiet_env_suppresses_both_banners(self) -> None:
+        """``LOCAL_SCRIBE_QUIET_TOUCH_PROMPTS=1`` is the test/CI
+        escape hatch; the integration tests that drive the unlock
+        flow under banner-noise capture rely on it staying off by
+        default but silenceable on demand."""
+        os.environ["LOCAL_SCRIBE_QUIET_TOUCH_PROMPTS"] = "1"
+        try:
+            out = self._capture_unlock_banners()
+        finally:
+            os.environ.pop("LOCAL_SCRIBE_QUIET_TOUCH_PROMPTS", None)
+        self.assertNotIn("TOUCH ID PROMPT INCOMING", out)
+        self.assertNotIn("TAP YOUR YUBIKEY NOW", out)
+
+    def test_explicit_callback_overrides_default(self) -> None:
+        """Callers (tests, GUIs) that pass their own on_touch_prompt
+        must NOT also see the default CLI banner — they own the UI."""
+        import io
+        import sys
+        self._preenroll_primary()
+        self.key_lifecycle.init_master_key(enroll_yubikey=False)
+        seen: list[str] = []
+        buf = io.StringIO()
+        saved = sys.stderr
+        sys.stderr = buf
+        try:
+            self.key_lifecycle.unlock_master_key(
+                on_touch_prompt=seen.append,
+            )
+        finally:
+            sys.stderr = saved
+        # The custom callback saw the prompt message.
+        self.assertEqual(len(seen), 1)
+        self.assertIn("YubiKey", seen[0])
+        # The default red banner was NOT emitted (we provided our own).
+        self.assertNotIn("TAP YOUR YUBIKEY NOW", buf.getvalue())
+        # But the Touch ID banner IS always emitted — that's a
+        # process-wide UX guarantee, not per-caller (the modal is a
+        # system-window event, every Touch ID consumer routes through
+        # unlock_master_key in v2, and the banner has no equivalent
+        # callback override).
+        self.assertIn("TOUCH ID PROMPT INCOMING", buf.getvalue())
+
+
 # ---------- rotation -------------------------------------------------
 
 

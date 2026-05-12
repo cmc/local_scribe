@@ -191,6 +191,14 @@ def require_physical_presence(
             f"`./run.sh key dr-restore` to recover via the DR "
             f"passphrase, then re-enroll a new key."
         )
+    # Same default-callback contract as ``key_lifecycle.unlock_master_key``:
+    # if the caller didn't wire their own UI prompt, use the CLI banner.
+    # This is the path used by destructive operations like
+    # ``./run.sh key init --force`` and ``./run.sh key destroy``, so a
+    # loud "TAP YOUR YUBIKEY NOW" banner is exactly what we want here.
+    if on_touch_prompt is None:
+        from local_scribe.common import touch_prompts as _tp
+        on_touch_prompt = _tp.cli_yubikey_prompt
     try:
         # The actual tap. We can't reach in and zero the returned
         # bytes the way unlock_master_key does; we just immediately
