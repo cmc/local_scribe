@@ -566,3 +566,232 @@ def status() -> dict:
             s["mounted"] = False
     s["char_data_relocated"] = char_data_relocated()
     return s
+
+
+# ---------------------------------------------------------------------------
+# Plaintext-leftover scanner
+#
+# The 2026-05-11 audit ("please confirm the only copy of my char data is
+# inside the sparse mount") discovered three plaintext copies on the
+# operator's disk DESPITE a working vault + master key + symlink in
+# place:
+#
+#   1. ``~/Library/Application Support/hyprnote.pre_vault_backup.<ts>``
+#      — written by ``relocate_char_data()`` itself as the safety
+#      rollback target. Whole point of that backup is that the
+#      operator can verify the vault before they delete it; the
+#      footgun is that nothing tells them they SHOULD delete it.
+#
+#   2. ``~/local_scribe_pre_arch_backup_<ts>/hyprnote`` — written by
+#      older bootstrap rev's pre-package-reorg backup. Same
+#      "operator forgot to clean up" failure mode.
+#
+#   3. ``~/.cache/local_scribe-demo/hyprnote`` — synthetic demo
+#      seed from ``tools/seed_demo.py``. Not real recordings, but
+#      it lives plaintext on disk and we should still surface it
+#      so the operator can decide.
+#
+# This scanner enumerates every directory matching the documented
+# leftover patterns, classifies each by sensitivity, and returns a
+# typed list the UI + CLI can render. There's also a companion
+# ``delete_plaintext_copy()`` for guided cleanup (refuses to delete
+# anything that isn't a known-leftover pattern).
+#
+# This scanner is read-only and synchronous (the whole scan completes
+# in ~10ms on the operator's laptop), so it's safe to call on every
+# inspector page load.
+
+class LeftoverKind:
+    """Classifier for ``PlaintextCopyFinding`` so the UI can render
+    severity. The string values are what land in the JSON payload."""
+    PRE_VAULT_BACKUP = "pre_vault_backup"        # our own .pre_vault_backup.<ts>
+    PRE_ARCH_BACKUP = "pre_arch_backup"          # older bootstrap arch-migration
+    DEMO_CACHE = "demo_cache"                    # tools/seed_demo.py
+    SECONDARY_LOCATION = "secondary_location"    # something looks like hyprnote outside vault
+
+
+@dataclass(frozen=True)
+class PlaintextCopyFinding:
+    """One plaintext copy of Char data living outside the vault.
+
+    ``path`` is the absolute filesystem path that contains a copy of
+    Char's data directory (a real directory, NOT a symlink into the
+    vault). ``kind`` is one of ``LeftoverKind``. ``size_bytes`` and
+    ``mtime`` are best-effort metadata; ``session_count`` and
+    ``audio_count`` are heuristics that estimate how much sensitive
+    content is sitting in the leftover.
+    """
+    path: Path
+    kind: str
+    size_bytes: int
+    mtime: float
+    session_count: int
+    audio_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "path": str(self.path),
+            "kind": self.kind,
+            "size_bytes": self.size_bytes,
+            "mtime": self.mtime,
+            "session_count": self.session_count,
+            "audio_count": self.audio_count,
+        }
+
+
+# Patterns we *will* flag. Each entry is a (parent_dir, glob, kind)
+# triple. ``parent_dir`` is resolved via ``Path.expanduser`` so
+# ``~/...`` patterns work. ``glob`` is matched against the parent's
+# immediate children only -- we don't recurse here; the *content* of
+# each match is what gets sized below.
+_LEFTOVER_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    # Backups created by relocate_char_data() itself
+    ("~/Library/Application Support",
+     "hyprnote.pre_vault_backup.*",
+     LeftoverKind.PRE_VAULT_BACKUP),
+    # Manual ``.bak`` style backups some operators make
+    ("~/Library/Application Support",
+     "hyprnote.bak*",
+     LeftoverKind.PRE_VAULT_BACKUP),
+    ("~/Library/Application Support",
+     "hyprnote.old*",
+     LeftoverKind.PRE_VAULT_BACKUP),
+    # Older bootstrap rev's arch-migration backup. The wrapper dir
+    # is ``~/local_scribe_pre_*backup*/`` and Char's payload sits
+    # one level down under ``hyprnote/``.
+    ("~",
+     "local_scribe_pre_*backup*/hyprnote",
+     LeftoverKind.PRE_ARCH_BACKUP),
+    # Manual ``hyprnote.backup`` / ``hyprnote_backup`` style at $HOME root
+    ("~",
+     "hyprnote_backup*",
+     LeftoverKind.PRE_VAULT_BACKUP),
+    ("~",
+     "hyprnote.backup*",
+     LeftoverKind.PRE_VAULT_BACKUP),
+    # Demo seed cache
+    ("~/.cache/local_scribe-demo",
+     "hyprnote",
+     LeftoverKind.DEMO_CACHE),
+)
+
+
+def _size_session_counts(p: Path) -> tuple[int, int, int]:
+    """Walk ``p`` once and return (total_size_bytes, session_count,
+    audio_count). Best-effort; failures on individual files are
+    swallowed so a permission-denied error doesn't tank the scan.
+    """
+    total = 0
+    sess: set[str] = set()
+    audio = 0
+    try:
+        sessions_dir = p / "sessions"
+        if sessions_dir.is_dir():
+            for child in sessions_dir.iterdir():
+                if child.is_dir():
+                    sess.add(child.name)
+        for root, _dirs, files in os.walk(p):
+            for name in files:
+                fp = Path(root) / name
+                try:
+                    total += fp.stat().st_size
+                except OSError:
+                    continue
+                lower = name.lower()
+                if lower.endswith((".mp3", ".wav", ".m4a", ".flac")):
+                    audio += 1
+    except OSError:
+        pass
+    return total, len(sess), audio
+
+
+def _looks_like_char_data(p: Path) -> bool:
+    """Heuristic: does ``p`` actually contain Char data, or is it
+    just an empty dir / unrelated file? We require either a
+    ``sessions/`` child or an ``app.db`` file -- both are unique
+    to Char's data layout and not used by anything else on macOS.
+    """
+    if not p.is_dir():
+        return False
+    if (p / "sessions").is_dir():
+        return True
+    if (p / "app.db").is_file():
+        return True
+    return False
+
+
+def find_plaintext_char_data_copies() -> list[PlaintextCopyFinding]:
+    """Return every plaintext leftover that matches a known pattern
+    AND looks like real Char data on disk.
+
+    Symlinks are excluded -- the canonical
+    ``~/Library/Application Support/hyprnote`` symlink into the
+    vault will not be returned here (that's the live, encrypted-at-
+    rest path). Empty / unrelated directories are excluded by the
+    ``_looks_like_char_data`` heuristic.
+
+    Safe to call from any context (no Touch ID, no YubiKey, no
+    hdiutil); completes in ~10ms even with multi-GB backups on disk
+    because we walk lazily and rely on stat-only size reporting.
+    """
+    findings: list[PlaintextCopyFinding] = []
+    canonical = _paths.char_data.resolve() if _paths.char_data.exists() else None
+    for parent_str, glob, kind in _LEFTOVER_PATTERNS:
+        parent = Path(parent_str).expanduser()
+        if not parent.is_dir():
+            continue
+        try:
+            candidates = list(parent.glob(glob))
+        except OSError:
+            continue
+        for c in candidates:
+            if c.is_symlink():
+                continue
+            try:
+                resolved = c.resolve()
+            except OSError:
+                continue
+            # Skip the canonical symlink target itself (the vault
+            # location) in case a pattern incidentally matched it.
+            if canonical is not None and resolved == canonical:
+                continue
+            if not _looks_like_char_data(c):
+                continue
+            size, sess, audio = _size_session_counts(c)
+            try:
+                mtime = c.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            findings.append(PlaintextCopyFinding(
+                path=c,
+                kind=kind,
+                size_bytes=size,
+                mtime=mtime,
+                session_count=sess,
+                audio_count=audio,
+            ))
+    findings.sort(key=lambda f: (-f.size_bytes, str(f.path)))
+    return findings
+
+
+def delete_plaintext_copy(path: Path) -> None:
+    """Guided cleanup. Refuses to delete anything that isn't a
+    currently-detected leftover, so a misclick can't recursively
+    rm the wrong dir (or, worse, the live vault symlink target).
+
+    The match is by absolute path equality against the output of
+    ``find_plaintext_char_data_copies()`` -- if you've raced a file
+    out from under us between scan and delete, we refuse and the
+    operator has to re-scan.
+    """
+    path = Path(path).expanduser().resolve()
+    findings = find_plaintext_char_data_copies()
+    allowed = {f.path.resolve() for f in findings}
+    if path not in allowed:
+        raise VaultError(
+            f"refusing to delete {path}: not in the current leftover set. "
+            f"Run find_plaintext_char_data_copies() and pass one of its "
+            f"returned paths."
+        )
+    logger.info("deleting plaintext leftover %s", path)
+    shutil.rmtree(path)

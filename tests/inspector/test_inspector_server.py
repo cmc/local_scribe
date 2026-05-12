@@ -1138,6 +1138,109 @@ class AuthTests(unittest.TestCase):
             )
             self.assertEqual(client.get("/").status_code, 200)
 
+    # ---------- Security audit endpoints ----------------------------
+    #
+    # /api/security/audit aggregates every defense layer's cheap
+    # status() into one JSON document. /api/security/plaintext-copies/
+    # delete is the guided cleanup endpoint for leftover plaintext
+    # copies of Char data. Both are bearer-gated (no exemption in the
+    # auth allowlist), and the delete endpoint requires the same
+    # typed-DELETE confirm body as session-audio deletion.
+
+    def test_security_audit_requires_auth(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.get("/api/security/audit")
+            self.assertEqual(r.status_code, 401)
+
+    def test_security_audit_returns_snapshot_shape(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.get(
+                "/api/security/audit",
+                headers={"Authorization": f"Bearer {holder.token}"},
+            )
+            self.assertEqual(r.status_code, 200)
+            payload = r.json()
+            for k in ("schema_version", "summary", "checks"):
+                self.assertIn(k, payload)
+            self.assertIsInstance(payload["checks"], list)
+            self.assertGreater(len(payload["checks"]), 0)
+
+    def test_security_delete_requires_auth(self):
+        # Even with a valid typed-DELETE body, an unauthenticated
+        # caller must be 401 BEFORE the body is inspected. (Auth
+        # middleware runs first.)
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.post(
+                "/api/security/plaintext-copies/delete",
+                json={"confirm": "DELETE", "path": "/tmp/x"},
+            )
+            self.assertEqual(r.status_code, 401)
+
+    def test_security_delete_requires_typed_confirm(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            # Wrong confirm word -> 400, the file (if any) is not
+            # touched.
+            r = client.post(
+                "/api/security/plaintext-copies/delete",
+                headers={"Authorization": f"Bearer {holder.token}"},
+                json={"confirm": "yes", "path": "/tmp/x"},
+            )
+            self.assertEqual(r.status_code, 400)
+            self.assertIn("confirmation", r.text.lower())
+
+    def test_security_delete_refuses_unknown_path(self):
+        """The endpoint must propagate ``vault.delete_plaintext_copy``'s
+        refusal-of-unknown-paths into a 400. Otherwise a stolen-token
+        replay could rm an arbitrary directory."""
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.post(
+                "/api/security/plaintext-copies/delete",
+                headers={"Authorization": f"Bearer {holder.token}"},
+                json={"confirm": "DELETE",
+                      "path": "/Users/none/no-such-dir-anywhere-real"},
+            )
+            self.assertEqual(r.status_code, 400)
+            self.assertIn("leftover", r.text.lower())
+
+    def test_security_delete_requires_path_field(self):
+        holder = self._holder()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _make_cfg(Path(td), auth_token=None)
+            client = TestClient(
+                inspector_server.create_app(cfg, token_holder=holder),
+            )
+            r = client.post(
+                "/api/security/plaintext-copies/delete",
+                headers={"Authorization": f"Bearer {holder.token}"},
+                json={"confirm": "DELETE"},
+            )
+            self.assertEqual(r.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

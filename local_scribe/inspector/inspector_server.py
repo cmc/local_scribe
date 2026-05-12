@@ -56,6 +56,8 @@ from fastapi.responses import (
 )
 
 from local_scribe.char import char_audit
+from local_scribe.security import audit_view as _audit_view
+from local_scribe.security import vault as _vault
 from local_scribe.security import service_auth
 from local_scribe.inspector import transcript_history
 from local_scribe.common.config import (
@@ -921,6 +923,50 @@ def create_app(cfg: Config | None = None, *,
             return JSONResponse(result, status_code=400)
         return result
 
+    # ---------- Security audit view ----------------------------------
+    #
+    # Aggregates every defense layer's cheap status() / verify() call
+    # into one JSON document. Rendered by the "Char audit → Security
+    # verification" panel in the inspector front-end. See
+    # local_scribe/security/audit_view.py for the schema + grading
+    # rules. Read-only; no Touch ID / YubiKey / hdiutil involvement.
+    @app.get("/api/security/audit")
+    async def security_audit_endpoint() -> dict[str, Any]:
+        return _audit_view.snapshot()
+
+    # Guided cleanup of plaintext leftover copies of Char data. The
+    # ONLY allowed paths are those currently returned by
+    # ``vault.find_plaintext_char_data_copies()`` -- the underlying
+    # function refuses unknown paths, so a stolen-bearer-token replay
+    # can't recursively rm an arbitrary directory. Typed-DELETE
+    # confirm body required, mirroring the session-audio delete
+    # contract from SECURITY.md § Defense layer 2.
+    @app.post("/api/security/plaintext-copies/delete")
+    async def security_delete_plaintext_copy(request: Request) -> dict[str, Any]:
+        await _require_typed_delete_confirm(request)
+        try:
+            payload = json.loads((await request.body()).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"invalid JSON body: {exc}",
+            ) from exc
+        path = payload.get("path")
+        if not isinstance(path, str) or not path:
+            raise HTTPException(
+                status_code=400,
+                detail='missing "path" field — pass the absolute '
+                       'path of the leftover copy to delete',
+            )
+        try:
+            _vault.delete_plaintext_copy(Path(path))
+        except _vault.VaultError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"delete failed: {exc}",
+            ) from exc
+        return {"deleted": path}
+
     # ---------- Service health checks --------------------------------
 
     @app.get("/api/asr/health")
@@ -1060,6 +1106,7 @@ th { color: var(--fg-dim); font-weight: 500; font-size: 0.85rem; }
 .badge.warn { color: var(--warn); border-color: var(--warn); }
 .badge.info { color: var(--info); border-color: var(--info); }
 .badge.miss { color: var(--err); border-color: var(--err); }
+.badge.fail { color: var(--err); border-color: var(--err); }
 .transcript .speaker { color: var(--accent); font-weight: 600; }
 .transcript p { margin: 0.4rem 0; }
 /* Per-paragraph speaker-cluster confidence (silhouette-derived, see
@@ -1286,6 +1333,58 @@ code { background: var(--card); padding: 0.05rem 0.3rem; border-radius: 4px; }
   </table>
   <h3>Backups</h3>
   <ul id="char-backups" class="meta"></ul>
+
+  <!-- ─── Security verification panel ──────────────────────────────
+       Reads /api/security/audit (aggregated from
+       local_scribe.security.audit_view.snapshot()) and renders one
+       row per defense layer + a sub-panel for any plaintext copies
+       of Char data we find outside the vault. See
+       docs/SECURITY_AUDIT.md for the full traceability matrix. -->
+  <h2 style="margin-top:2rem">Security verification</h2>
+  <p class="meta">
+    Live read of every defense layer in
+    <a href="https://github.com/cmc/local_scribe/blob/main/SECURITY.md" target="_blank" rel="noopener"><code>SECURITY.md</code></a>.
+    See <a href="https://github.com/cmc/local_scribe/blob/main/docs/SECURITY_AUDIT.md" target="_blank" rel="noopener"><code>docs/SECURITY_AUDIT.md</code></a>
+    for the full claim → code → test traceability matrix. The check
+    here is read-only and does not unlock the master key; for the
+    full HMAC re-verification path run <code>./run.sh config verify</code>.
+  </p>
+  <div class="row" style="margin-bottom:0.6rem">
+    <button class="btn" id="sec-rerun">Re-run security audit</button>
+  </div>
+  <div id="sec-summary" class="meta"></div>
+  <table id="sec-checks">
+    <thead><tr>
+      <th>layer</th><th>status</th><th>summary</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- Plaintext-copies panel: ONLY rendered when the vault check
+       finds leftover plaintext copies of Char data outside the
+       sparse-bundle. The user explicitly asked: "confirm the only
+       copy of my char data is inside the sparse mount". This panel
+       is how that confirmation surfaces, and the per-row delete
+       button is the guided cleanup path. -->
+  <h3 id="sec-leftover-heading" style="display:none">
+    Plaintext copies of Char data outside the vault
+  </h3>
+  <p class="meta" id="sec-leftover-blurb" style="display:none">
+    These directories contain a plaintext copy of Char's data and
+    sit OUTSIDE the encrypted sparse-bundle. Each row shows the
+    path, kind, size, session/audio counts, and modified time.
+    Deleting from here is gated by a typed
+    <code>DELETE</code> confirm (server-side check) so a stolen
+    bearer can't replay a destructive request. The deleter refuses
+    any path not in the current leftover set.
+  </p>
+  <table id="sec-leftovers" style="display:none">
+    <thead><tr>
+      <th>path</th><th>kind</th><th>size</th><th>sessions</th>
+      <th>audio</th><th>modified</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
 </section>
 
 <section id="tab-about">
@@ -1342,7 +1441,7 @@ $$('nav button').forEach(b => b.addEventListener('click', () => {
   $$('section').forEach(s => s.classList.remove('active'));
   $('#tab-' + b.dataset.tab).classList.add('active');
   if (b.dataset.tab === 'config') loadConfig();
-  if (b.dataset.tab === 'char') loadCharAudit();
+  if (b.dataset.tab === 'char') { loadCharAudit(); loadSecurityAudit(); }
 }));
 
 // --- top-bar status pills ---------------------------------------
@@ -1889,6 +1988,106 @@ async function loadCharAudit() {
 }
 
 $('#char-rerun')?.addEventListener('click', loadCharAudit);
+
+// --- Security verification panel ---------------------------------
+// Backed by /api/security/audit -> local_scribe.security.audit_view.
+// Renders one row per defense layer, color-coded by status, plus a
+// sub-panel for any plaintext copies of Char data we find outside
+// the encrypted sparse-bundle. The deleter is gated by the same
+// typed-DELETE confirm as session-audio deletion.
+function fmtBytes(n) {
+  if (n == null) return '';
+  if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + ' GiB';
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MiB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+  return n + ' B';
+}
+function fmtMtime(t) {
+  if (!t) return '';
+  try { return new Date(t * 1000).toLocaleString(); }
+  catch (e) { return '' + t; }
+}
+async function loadSecurityAudit() {
+  const tbody = $('#sec-checks tbody');
+  tbody.innerHTML = '<tr><td colspan="3">loading…</td></tr>';
+  try {
+    const r = await api('/api/security/audit');
+    tbody.innerHTML = '';
+    let vaultDetail = null;
+    r.checks.forEach(c => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><code>${escapeHtml(c.label)}</code></td>
+        <td><span class="badge ${c.status}">${c.status}</span></td>
+        <td class="meta">${escapeHtml(c.summary)}</td>`;
+      tbody.appendChild(tr);
+      if (c.key === 'vault') vaultDetail = c.detail || {};
+    });
+    $('#sec-summary').textContent =
+      `${r.summary.ok} ok · ${r.summary.warn} warn · ${r.summary.fail} fail · ${r.summary.info} info`;
+
+    // Leftovers sub-panel: drive entirely off the vault-check's
+    // detail.plaintext_leftovers list. Hide the heading + table when
+    // empty so the OK case stays uncluttered.
+    const ltbody = $('#sec-leftovers tbody');
+    const heading = $('#sec-leftover-heading');
+    const blurb = $('#sec-leftover-blurb');
+    const table = $('#sec-leftovers');
+    const left = (vaultDetail && vaultDetail.plaintext_leftovers) || [];
+    if (left.length === 0) {
+      heading.style.display = 'none';
+      blurb.style.display = 'none';
+      table.style.display = 'none';
+      ltbody.innerHTML = '';
+    } else {
+      heading.style.display = '';
+      blurb.style.display = '';
+      table.style.display = '';
+      ltbody.innerHTML = '';
+      left.forEach(f => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><code>${escapeHtml(f.path)}</code></td>
+          <td><span class="badge ${f.kind === 'demo_cache' ? 'info' : 'fail'}">${escapeHtml(f.kind)}</span></td>
+          <td>${escapeHtml(fmtBytes(f.size_bytes))}</td>
+          <td>${f.session_count}</td>
+          <td>${f.audio_count}</td>
+          <td class="meta">${escapeHtml(fmtMtime(f.mtime))}</td>
+          <td><button class="btn ghost sec-del">Delete</button></td>`;
+        tr.querySelector('.sec-del').addEventListener('click', () =>
+          confirmDeleteLeftover(f.path, f.size_bytes));
+        ltbody.appendChild(tr);
+      });
+    }
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="3" class="error-block">'
+      + escapeHtml(e.message) + '</td></tr>';
+  }
+}
+async function confirmDeleteLeftover(path, size) {
+  // Two prompts: (1) plain JS confirm so the operator sees the
+  // path + size in their browser dialog; (2) typed-DELETE prompt
+  // because the server-side endpoint requires it. Same gesture as
+  // session-audio deletion.
+  const ok = confirm(
+    `Permanently delete this plaintext copy?\n\n  ${path}\n  size: ${fmtBytes(size)}\n\n`
+    + `This cannot be undone. The data inside the encrypted vault is unaffected.`);
+  if (!ok) return;
+  const word = prompt('Type DELETE to confirm.');
+  if (word !== 'DELETE') { alert('confirmation phrase did not match — aborted.'); return; }
+  try {
+    await api('/api/security/plaintext-copies/delete', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({confirm: 'DELETE', path: path}),
+    });
+    await loadSecurityAudit();
+  } catch (e) {
+    alert('delete failed: ' + e.message);
+  }
+}
+$('#sec-rerun')?.addEventListener('click', loadSecurityAudit);
+
 $('#char-fix')?.addEventListener('click', async () => {
   if (!confirm('Quit Char if it\'s running, rewrite settings.json + store.json?')) return;
   try {
