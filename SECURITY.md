@@ -629,6 +629,47 @@ master_key  (32 bytes, in-process bytearray, forget()ed on shutdown)
   endpoint except `/health`, `/api/health`, `/`, and `/auth?token=…`.
 - Token comparison is constant-time (`secrets.compare_digest`).
 
+### Start-time token warmup
+
+`./run.sh start` derives every bearer token from a **single**
+master-key unlock and hands them to each spawned service via
+per-subprocess environment variables. The sequence:
+
+1. `cmd_start` reaches the post-gates checkpoint and prints a loud
+   "Authentication warmup" banner explaining what's about to
+   happen (Touch ID modal incoming, watch for the YubiKey LED).
+2. `python -m local_scribe.security.service_auth warm asr inspector`
+   runs in the foreground shell. The Touch ID + YubiKey banners
+   from [`touch_prompts.py`](local_scribe/common/touch_prompts.py)
+   stream to the operator's terminal (stderr is NOT redirected,
+   unlike the daemonised service spawns). The single
+   `unlock_master_key()` round-trip produces both
+   `ls_asr_<hex>` and `ls_inspector_<hex>` via HKDF.
+3. The JSON output is parsed into bash locals and **never
+   `export`ed**. Each service is then spawned as:
+
+       LOCAL_SCRIBE_ASR_TOKEN="$_asr_tok" asr_start
+
+   This is bash's per-subprocess env-injection form — the variable
+   exists in `asr_start`'s environment only, never in the parent
+   shell. The `exec tail -F` at the very end of `cmd_start` does
+   NOT inherit it.
+4. Each service worker checks `LOCAL_SCRIBE_<SERVICE>_TOKEN` at
+   lifespan startup, accepts the pre-warmed value, and skips its
+   own (otherwise-inevitable) `unlock_master_key()` call.
+
+Without the warmup, every `start` would issue two Touch ID + two
+YubiKey prompts — one per authentication-requiring service — and
+the explanatory banners would land in each service's *log file*
+rather than the operator's terminal. The 2026-05-11 audit (F10
+in [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md)) caught the
+silent prompts and prompted this fix.
+
+Manual `./run.sh asr start` / `./run.sh inspector start` invocations
+(outside of a parent `./run.sh start`) keep the legacy
+unlock-on-startup path — the env var simply isn't there, so each
+worker falls through to `ServiceToken.unlock()`.
+
 ### What's gated
 
 | endpoint | method | gated? |
@@ -732,11 +773,36 @@ not audio. Without the master key, the AES-256 envelope cannot be
 broken in any operationally meaningful time.
 
 **Status**: module implemented + unit-tested. Bootstrap-time
-vault-mount wiring (`./run.sh start` mounts before launching services;
-`./run.sh stop` detaches afterwards) is tracked in
-[TODO.md → "Encrypt audio at rest"](TODO.md). The master key the
-vault will consume is already in place (Option C, see Defense layer
-4 below); only the `hdiutil`-on-startup glue is pending.
+vault-mount wiring is **live as of 2026-05-11**:
+
+- `./run.sh bootstrap` creates the vault and relocates Char's data
+  dir into it (replacing the canonical
+  `~/Library/Application Support/hyprnote` with a symlink into the
+  mount).
+- `./run.sh start` enforces `vault_relocation_gate` (refuses to
+  start if the data dir is plaintext on disk) and then
+  `vault_auto_unlock_gate` (re-mounts the vault if a previous
+  `stop` dismounted it, prompting Touch ID + YubiKey).
+- `./run.sh stop` calls `vault_lock_on_stop` after every service
+  has been killed. This is a polite-only `hdiutil detach` — we
+  refuse to use `-force` here because Char's `app.db` SQLite handle
+  is the most common open-handle case, and a forced detach
+  mid-write would corrupt the operator's notes. If Char.app is
+  still running, we leave the vault mounted with an explicit
+  "quit Char and run `./run.sh vault lock`" message rather than
+  risk silent data loss.
+- `./run.sh vault lock` is the interactive escape hatch — it
+  retries with `-force` after a polite-detach failure (typically
+  a stale Finder window or Spotlight indexer), since the operator
+  has explicitly asked for the lock and the SQLite-safety concern
+  no longer applies.
+
+This means the at-rest-encryption guarantee now has a sharp time
+boundary: plaintext only exists on disk while the pipeline is up,
+and reverts to ciphertext-on-disk the moment `./run.sh stop`
+returns. The previous behaviour (vault stayed mounted until the
+operator manually invoked `./run.sh vault lock`) is no longer
+possible.
 
 **Known gap: data is plaintext while the vault is mounted.** This is
 inherent in the design — the whole point of a mounted volume is that
@@ -1957,13 +2023,16 @@ model in the rest of this document reads correctly.
   as long as the receiver validates a signature with a key never
   on the laptop.
 * **Auto-dismount the encrypted vault on screen lock; Touch
-  ID-gated remount on unlock and on Char restart.** Today the
-  vault stays mounted for the entire `./run.sh start` →
-  `./run.sh stop` window. Auto-dismount on
-  `com.apple.screenIsLocked` cuts the readable-data window down
-  to "while the screen is unlocked". Modes (`soft`,
-  `cooperative`, `strict`, `paranoid`) trade off Char-stability
-  against unmount-aggressiveness; full mode table + UX gotchas
+  ID-gated remount on unlock and on Char restart.** As of 2026-05-11
+  the vault stays mounted for the `./run.sh start` →
+  `./run.sh stop` window (`vault_lock_on_stop` polite-detaches on
+  every `stop`). This still leaves an unbounded readable-data
+  window inside that range — the operator could `start` in the
+  morning and walk away from a locked screen all afternoon.
+  Auto-dismount on `com.apple.screenIsLocked` cuts that down to
+  "while the screen is unlocked". Modes (`soft`, `cooperative`,
+  `strict`, `paranoid`) trade off Char-stability against
+  unmount-aggressiveness; full mode table + UX gotchas
   (recording loss, Touch-ID prompt fatigue, sleep-vs-lock
   semantics, Char crash-on-data-dir-disappearance) are in
   [`TODO.md`](TODO.md#privacy--security-p0). Closes two specific

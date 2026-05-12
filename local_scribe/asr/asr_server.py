@@ -464,8 +464,33 @@ async def _lifespan(app: FastAPI):
             service_auth.BYPASS_ENV,
         )
     else:
+        # Pre-derived token via env var. ``cmd_start`` in run.sh
+        # uses ``service_auth warm`` to do ONE Touch ID + ONE
+        # YubiKey unlock that covers every service that needs a
+        # bearer token, then spawns each service with its token in
+        # the per-subprocess environ. This short-circuit picks
+        # that up and skips the (otherwise inevitable) second
+        # Touch ID + YubiKey cycle inside the ASR worker. The
+        # token format is HKDF-derived from the same master key
+        # that the worker would have unlocked itself, so
+        # downstream auth checks are bit-identical to the legacy
+        # path. SECURITY.md § 'Defense layer 2' covers the
+        # threat model around env-var token passing (token-in-env
+        # is fine for explicit child-process handoff; we still
+        # forbid the parent shell from holding it).
+        prewarmed = os.environ.get("LOCAL_SCRIBE_ASR_TOKEN")
         test_mk = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
-        if test_mk:
+        if prewarmed:
+            _asr_token = service_auth.ServiceToken(
+                service="asr", token=prewarmed.strip(),
+            )
+            logger.info(
+                "service_auth: ASR token loaded from "
+                "LOCAL_SCRIBE_ASR_TOKEN env (fingerprint=%s) — "
+                "warmed by parent via `service_auth warm`",
+                service_auth.token_fingerprint(_asr_token.token),
+            )
+        elif test_mk:
             try:
                 mk = bytes.fromhex(test_mk.strip())
             except ValueError as exc:

@@ -375,18 +375,35 @@ def mount(password: bytes) -> Path:
     return _paths.mount
 
 
-def unmount() -> None:
+def unmount(*, force: bool = True) -> None:
     """Detach the bundle. Idempotent: returns silently if not mounted.
 
-    Tries a polite ``detach`` first, then ``detach -force`` if anything
-    holds open the volume (e.g. a stale Finder window). We surface the
-    final failure rather than swallow it because "I clicked stop but
-    plaintext is still visible on disk" is a footgun."""
+    With ``force=True`` (the default, used by interactive ``./run.sh
+    vault lock``) we try a polite ``detach`` first, then ``detach
+    -force`` if anything holds the volume open (a stale Finder
+    window, a Spotlight indexer, etc.). We surface the final failure
+    rather than swallow it because "I clicked lock but plaintext is
+    still visible on disk" is a footgun.
+
+    With ``force=False`` (used by ``cmd_stop``'s lock-on-stop hook)
+    we ONLY attempt the polite detach. If anything holds the volume
+    open we raise :class:`VaultError` so the caller can decide what
+    to do. This matters because Char's ``app.db`` is a live SQLite
+    handle whenever Char.app is running; a forced detach mid-write
+    is the textbook recipe for ``database disk image is malformed``
+    and we'd rather leave the vault mounted than corrupt the user's
+    notes.
+    """
     if not is_mounted():
         return
     try:
         _hdiutil(["detach", str(_paths.mount)], timeout=30)
     except VaultError as exc:
+        if not force:
+            # Caller (lock-on-stop) explicitly opted out of -force;
+            # propagate so they can warn the operator instead of
+            # truncating SQLite mid-write.
+            raise
         logger.warning("polite detach failed, retrying with -force: %s", exc)
         _hdiutil(["detach", str(_paths.mount), "-force"], timeout=30)
     # Best-effort: remove the now-empty mountpoint dir so the user

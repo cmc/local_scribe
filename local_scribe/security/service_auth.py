@@ -564,6 +564,7 @@ __all__ = [
     "random_token_for_tests",
     "client_token_for",
     "client_auth_header_for",
+    "warm_tokens",
 ]
 
 
@@ -646,6 +647,129 @@ def _cli_url(args: list[str]) -> int:
     return 0
 
 
+def warm_tokens(services: list[str], *,
+                prompt: Optional[str] = None) -> dict[str, str]:
+    """Derive bearer tokens for ``services`` from a SINGLE master-key
+    unlock.
+
+    Each entry in :data:`KNOWN_SERVICES` is HKDF-derived from the
+    same master key, so we can amortise the (Touch ID + YubiKey)
+    cost across all services that need a token at startup. Without
+    this primitive, ``cmd_start`` ends up calling
+    :func:`ServiceToken.unlock` once per service, which means N
+    Touch ID modals + N YubiKey taps before the pipeline is up — a
+    UX disaster surfaced by an operator on 2026-05-11 ("when the
+    services are loading it needs to print out the instruction to
+    accept the touchid press and tell user when the press the
+    yubikey").
+
+    Honours the same env-var overrides as
+    :func:`client_token_for`:
+
+    * ``LOCAL_SCRIBE_DISABLE_AUTH=1`` → returns ``{}``.
+    * ``LOCAL_SCRIBE_<SERVICE>_TOKEN`` → already-set tokens pass
+      through unchanged for that service.
+    * ``LOCAL_SCRIBE_MASTER_KEY_HEX`` / ``LOCAL_SCRIBE_TEST_MASTER_KEY_HEX``
+      → derive without prompting (ops debugging / tests).
+
+    Returns a ``{service: token}`` mapping in the same order as
+    ``services``. Raises :class:`UnknownServiceError` on an unknown
+    service name (we deliberately fail fast rather than silently
+    drop the bad entry — the caller is run.sh and an empty token
+    map would surface as a confusing "auth failure" downstream).
+    """
+    for s in services:
+        if s not in KNOWN_SERVICES:
+            raise UnknownServiceError(
+                f"unknown service {s!r}; known: {KNOWN_SERVICES}"
+            )
+    if is_bypass_enabled():
+        return {}
+
+    out: dict[str, str] = {}
+
+    # Phase 1: collect anything pre-set via per-service env. We do
+    # this BEFORE the unlock so a partial-set environment (e.g. ASR
+    # token is in env but inspector isn't) only prompts once for the
+    # missing one. If EVERY service is pre-set, we never unlock at
+    # all and the caller's banner is suppressed downstream.
+    needs_unlock: list[str] = []
+    for s in services:
+        env_var = f"LOCAL_SCRIBE_{s.upper()}_TOKEN"
+        val = os.environ.get(env_var)
+        if val:
+            out[s] = val.strip()
+        else:
+            needs_unlock.append(s)
+    if not needs_unlock:
+        return out
+
+    # Phase 2: master-key env-var paths (no Touch ID).
+    mk_hex = os.environ.get("LOCAL_SCRIBE_MASTER_KEY_HEX") \
+        or os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
+    if mk_hex:
+        try:
+            mk_bytes = bytes.fromhex(mk_hex.strip())
+        except ValueError as exc:
+            raise ServiceAuthError(
+                f"LOCAL_SCRIBE_MASTER_KEY_HEX not valid hex: {exc}"
+            ) from exc
+        for s in needs_unlock:
+            out[s] = derive_service_token(mk_bytes, s)
+        return out
+
+    # Phase 3: the real unlock path. This is the ONE Touch ID +
+    # ONE YubiKey tap that covers every service in ``needs_unlock``.
+    # The banners fire from inside ``unlock_master_key`` so the
+    # operator sees both prompts attributed to the same "service
+    # warmup" event.
+    from local_scribe.security import key_lifecycle  # noqa: PLC0415 — see note in client_token_for
+    services_label = " + ".join(needs_unlock)
+    mk = key_lifecycle.unlock_master_key(
+        prompt=(prompt
+                or f"Unlock local_scribe to start {services_label}"),
+    )
+    try:
+        for s in needs_unlock:
+            out[s] = derive_service_token(mk.as_bytes(), s)
+    finally:
+        mk.forget()
+    return out
+
+
+def _cli_warm(args: list[str]) -> int:
+    """``warm <service ...>`` — derive tokens for multiple services
+    from a single unlock and emit them as JSON to stdout. Used by
+    ``run.sh cmd_start`` so the operator sees ONE Touch ID + ONE
+    YubiKey prompt instead of one per service.
+
+    Output shape (stdout):
+
+        {"asr": "ls_asr_<hex>", "inspector": "ls_inspector_<hex>"}
+
+    Bypass mode (``LOCAL_SCRIBE_DISABLE_AUTH=1``) emits ``{}`` and
+    exits 0; the caller branches on emptiness.
+    """
+    import json as _json
+    import sys as _sys
+    if not args:
+        _sys.stderr.write(
+            f"usage: warm <{'|'.join(KNOWN_SERVICES)}> "
+            f"[<{'|'.join(KNOWN_SERVICES)}> ...]\n"
+        )
+        return 2
+    try:
+        tokens = warm_tokens(args)
+    except UnknownServiceError as exc:
+        _sys.stderr.write(f"error: {exc}\n")
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        _sys.stderr.write(f"error: {exc}\n")
+        return 1
+    _sys.stdout.write(_json.dumps(tokens) + "\n")
+    return 0
+
+
 def _cli_health(_args: list[str]) -> int:
     """Quick diagnostic dump: are the bypass + Keychain helper paths
     sane? Doesn't actually unlock anything (no Touch ID), just shows
@@ -682,6 +806,7 @@ def _cli_main(argv: list[str]) -> int:
         "fingerprint": _cli_fingerprint,
         "url": _cli_url,
         "health": _cli_health,
+        "warm": _cli_warm,
     }
     handler = dispatch.get(cmd)
     if handler is None:

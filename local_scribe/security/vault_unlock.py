@@ -136,10 +136,17 @@ def mount_vault(*, relocate_char: bool = True) -> vault.Path:
     return mount
 
 
-def unmount_vault() -> None:
+def unmount_vault(*, force: bool = True) -> None:
     """Detach the vault. No master-key prompt needed (we're locking
-    on the way out, not unlocking)."""
-    vault.unmount()
+    on the way out, not unlocking).
+
+    ``force=False`` is the lock-on-stop path: polite detach only,
+    raises :class:`vault.VaultError` if any process still holds the
+    volume open. The interactive ``./run.sh vault lock`` keeps
+    ``force=True`` so a stale Finder window doesn't leave plaintext
+    on disk after the operator explicitly asked us to lock.
+    """
+    vault.unmount(force=force)
 
 
 def rotate_vault_passphrase(old_master: bytes, new_master: bytes) -> None:
@@ -218,13 +225,28 @@ def _cli_unlock(args: list[str]) -> int:
     return 0
 
 
-def _cli_lock(_args: list[str]) -> int:
+def _cli_lock(args: list[str]) -> int:
     """``lock`` — unmount the vault. Idempotent (already-unmounted is
-    a no-op)."""
+    a no-op).
+
+    ``--polite`` opts out of the ``-force`` fallback. Used by
+    ``cmd_stop``'s lock-on-stop hook: if Char.app still has its
+    SQLite ``app.db`` open, a forced detach would risk corrupting the
+    user's notes; we'd rather leave the volume mounted and surface
+    the offending process to the operator.
+    """
     import json as _json
     import sys as _sys
-    unmount_vault()
-    _sys.stdout.write(_json.dumps({"unmounted": True}, indent=2) + "\n")
+    polite = "--polite" in args
+    try:
+        unmount_vault(force=not polite)
+    except vault.VaultError as exc:
+        _sys.stderr.write(f"polite detach failed: {exc}\n")
+        return 1
+    _sys.stdout.write(_json.dumps({
+        "unmounted": True,
+        "polite": polite,
+    }, indent=2) + "\n")
     return 0
 
 

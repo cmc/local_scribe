@@ -554,6 +554,179 @@ sys.exit(0 if vault.char_data_relocated() else 1)
   return 1
 }
 
+# Layer A.2 — auto-mount the vault before services come up. Sits
+# AFTER ``vault_relocation_gate`` (no point in mounting if the data
+# isn't relocated -- the relocation gate has already failed loudly).
+# Idempotent: if the vault is already mounted, this is a no-op. If
+# it isn't, we shell out to ``vault_unlock unlock --no-relocate`` and
+# THAT will prompt for Touch ID + YubiKey to derive the hdiutil
+# passphrase. The ``--no-relocate`` flag is correct because the
+# relocation gate just confirmed Char's data dir is already a
+# symlink into the mount -- we just need the mount itself live.
+#
+# Without this gate, the sequence "./run.sh stop" (which dismounts)
+# then "./run.sh start" would launch services against a dangling
+# symlink (Char's data dir points into an unmounted volume) and the
+# first read would surface as a cryptic ENOENT.
+#
+# Honours the same environment overrides as vault_relocation_gate so
+# the "no vault relationship at all" dev path stays consistent.
+vault_auto_unlock_gate() {
+  if [[ "${LOCAL_SCRIBE_SKIP_INTEGRITY:-0}" != "0" ]]; then
+    return 0
+  fi
+  if [[ "${LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA:-0}" != "0" ]]; then
+    return 0   # operator explicitly opted out of at-rest encryption
+  fi
+  if [[ ! -x "$VENV_PY" ]]; then
+    return 0   # bootstrap path, venv not built yet
+  fi
+  # Probe: does a vault exist on disk and is it currently mounted?
+  # Exit codes:
+  #   0 → mounted, nothing to do
+  #   1 → exists but not mounted (we'll unlock)
+  #   2 → doesn't exist (skip; ``vault_relocation_gate`` would already
+  #        have refused -- this branch is defense in depth)
+  local rc=0
+  "$VENV_PY" -c '
+import sys
+from local_scribe.security import vault
+if not vault.exists():
+    sys.exit(2)
+sys.exit(0 if vault.is_mounted() else 1)
+' 2>/dev/null
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) return 0 ;;
+    1)
+      printf "%s%sVault is locked — unlocking before services come up%s\n" \
+             "$c_bold" "$c_yellow" "$c_reset"
+      printf "  Touch ID + YubiKey tap required (the hdiutil passphrase is\n"
+      printf "  HKDF-derived from the master key; we never store it).\n\n"
+      if "$VENV_PY" -m local_scribe.security.vault_unlock unlock --no-relocate; then
+        return 0
+      fi
+      printf '\n'
+      printf "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n" \
+             "$c_red" "$c_reset"
+      printf "%s%sREFUSING TO START: vault unlock failed.%s\n" \
+             "$c_red" "$c_bold" "$c_reset"
+      printf '\n'
+      printf "  The encrypted vault is on disk but couldn't be mounted.\n"
+      printf "  Char's data dir is a symlink INTO the (unmounted) volume,\n"
+      printf "  so launching services now would corrupt that symlink the\n"
+      printf "  moment Char tries to read from it.\n"
+      printf '\n'
+      printf "  Common causes:\n"
+      printf "    %s•%s Touch ID prompt cancelled / wrong fingerprint\n" \
+             "$c_dim" "$c_reset"
+      printf "    %s•%s YubiKey not plugged in / tap timed out\n" \
+             "$c_dim" "$c_reset"
+      printf "    %s•%s Master key rotated but vault not re-keyed\n" \
+             "$c_dim" "$c_reset"
+      printf '\n'
+      printf "  Recover with: %s./run.sh vault unlock%s   (verbose; same prompts).\n" \
+             "$c_bold" "$c_reset"
+      printf "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n" \
+             "$c_red" "$c_reset"
+      return 1
+      ;;
+    *)
+      # Probe itself crashed -- log loud + refuse rather than mask.
+      printf "%svault auto-unlock probe failed (rc=%d); refusing to start%s\n" \
+             "$c_red" "$rc" "$c_reset" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Counterpart of ``vault_auto_unlock_gate``: dismount the encrypted
+# sparse bundle on the way out. Called from ``cmd_stop`` AFTER every
+# service has been killed (otherwise ASR / inspector still have
+# read handles on files inside the mount and ``hdiutil detach``
+# would either bounce or, with ``-force``, risk truncating an
+# in-flight write).
+#
+# Design constraints:
+#
+#   * Polite ``detach`` only -- NEVER ``-force``. The vault contains
+#     Char's SQLite DB (``app.db``); a forced unmount mid-write is the
+#     classic recipe for ``database is locked`` followed by hours of
+#     ``.recover`` work. If polite detach fails we leave the volume
+#     mounted and tell the operator exactly which process is holding
+#     it open. Lock-on-stop is a defense-in-depth nicety, not a
+#     hard guarantee -- the operator quitting Char.app is.
+#
+#   * Idempotent: no-op when no vault exists, when venv is missing,
+#     or when the vault is already unmounted. This means ``cmd_stop``
+#     can safely call us even when run twice or when ``cmd_start``
+#     never actually got off the ground.
+#
+#   * Honours ``LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA=1`` (no vault
+#     relationship to manage) and ``LOCAL_SCRIBE_SKIP_INTEGRITY=1``
+#     (test seam) for symmetry with the start-side gate.
+vault_lock_on_stop() {
+  if [[ "${LOCAL_SCRIBE_SKIP_INTEGRITY:-0}" != "0" ]]; then
+    return 0
+  fi
+  if [[ "${LOCAL_SCRIBE_ALLOW_PLAINTEXT_CHAR_DATA:-0}" != "0" ]]; then
+    return 0
+  fi
+  if [[ ! -x "$VENV_PY" ]]; then
+    return 0
+  fi
+  # Probe state first -- same exit-code convention as the unlock gate:
+  #   0 → mounted (we should detach)
+  #   1 → exists but not mounted (nothing to do)
+  #   2 → no vault on disk (nothing to do)
+  local rc=0
+  "$VENV_PY" -c '
+import sys
+from local_scribe.security import vault
+if not vault.exists():
+    sys.exit(2)
+sys.exit(0 if vault.is_mounted() else 1)
+' 2>/dev/null
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    return 0   # not mounted, or no vault -- nothing to lock
+  fi
+
+  # Refuse to dismount while Char.app holds the SQLite handle.
+  # We could ``-force`` here but the corruption risk on ``app.db``
+  # is too high to justify the convenience. Surface the situation
+  # clearly so the operator can quit Char and re-run.
+  if char_running; then
+    printf "%s⚠  vault left mounted: Char.app is still running%s\n" \
+           "$c_yellow" "$c_reset" >&2
+    printf "    Quit Char.app (Cmd-Q -- not just close window) so its\n" >&2
+    printf "    SQLite handle releases, then run %s./run.sh vault lock%s\n" \
+           "$c_bold" "$c_reset" >&2
+    printf "    to dismount safely. Forced detach would risk corrupting\n" >&2
+    printf "    ~/Library/Application Support/hyprnote/app.db.\n" >&2
+    return 0
+  fi
+
+  # Polite detach only — ``--polite`` opts the vault_unlock CLI out
+  # of its ``-force`` fallback so we never truncate a live SQLite.
+  # The interactive ``./run.sh vault lock`` path keeps the force
+  # behaviour; only the lock-on-stop hook is paranoid like this.
+  if "$VENV_PY" -m local_scribe.security.vault_unlock lock --polite >/dev/null 2>&1; then
+    printf "  %svault dismounted%s — Char data is now ciphertext-at-rest\n" \
+           "$c_green" "$c_reset"
+    return 0
+  fi
+  printf "%s⚠  polite detach failed; vault left mounted%s\n" \
+         "$c_yellow" "$c_reset" >&2
+  printf "    A process still has an open handle into the volume.\n" >&2
+  printf "    Find it with: %slsof +D \"\$HOME/Library/Application Support/local_scribe-vault\"%s\n" \
+         "$c_bold" "$c_reset" >&2
+  printf "    Then run: %s./run.sh vault lock%s   (uses -force as a fallback).\n" \
+         "$c_bold" "$c_reset" >&2
+  return 0   # don't fail cmd_stop overall -- services are already down
+}
+
 # Layer B — Char-binary verification gate. Verifies codesign +
 # Gatekeeper + linked-Mach-O hashes against the recorded baseline.
 # Honours ``LOCAL_SCRIBE_ALLOW_DIRTY_CHAR=1`` as an override.
@@ -2320,6 +2493,93 @@ asr_pid() {
 asr_start() { "$VENV_PY" -m local_scribe asr start; }
 asr_stop()  { "$VENV_PY" -m local_scribe asr stop;  }
 
+# Single-unlock bearer-token warmup. Sets the named bash variable
+# (by NAMEREF, so the caller doesn't need to capture stdout) to
+# the JSON blob ``{"asr": "ls_asr_...", "inspector": "ls_inspector_..."}``
+# emitted by ``service_auth warm``.
+#
+# Honours the same env-var bypasses as the service workers:
+#
+#   * LOCAL_SCRIBE_DISABLE_AUTH=1 → empty JSON ``{}``; caller
+#     skips the per-subprocess env injection and each service's
+#     ``service_auth.is_bypass_enabled()`` short-circuit takes
+#     over.
+#   * LOCAL_SCRIBE_<SERVICE>_TOKEN already set → that service
+#     is omitted from the unlock list and passes through.
+#   * LOCAL_SCRIBE_MASTER_KEY_HEX / LOCAL_SCRIBE_TEST_MASTER_KEY_HEX
+#     set → derive without Touch ID.
+#
+# The Touch ID + YubiKey banners are printed by
+# ``unlock_master_key`` (inside the python subprocess), but those
+# banners stream to OUR stderr — they're not redirected to a log
+# file like the daemonised service spawns. So the operator sees
+# the prompts in the foreground terminal, exactly where the
+# 2026-05-11 audit asked us to put them.
+#
+# We print our own short heads-up FIRST so the operator knows
+# this round-trip is coming before the system Touch ID modal
+# appears.
+warmup_service_tokens() {
+  local -n _out="$1"
+  _out=""
+
+  if [[ ! -x "$VENV_PY" ]]; then
+    say "${c_red}venv python missing — run \`./run.sh bootstrap\` first${c_reset}"
+    return 1
+  fi
+
+  # Bypass mode: no unlock needed, no banner needed.
+  if [[ "${LOCAL_SCRIBE_DISABLE_AUTH:-0}" != "0" ]]; then
+    _out="{}"
+    return 0
+  fi
+
+  # Heads-up banner. The actual Touch ID / YubiKey banners come
+  # from inside the python helper (touch_prompts module); they
+  # bracket the specific blocking step (Keychain read → YubiKey
+  # tap → master-key combine). Our banner here covers the
+  # higher-level intent ("you're about to be asked, here's why").
+  printf '\n'
+  printf "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n" \
+         "$c_bold" "$c_reset"
+  printf "%s%sAuthentication warmup%s\n" "$c_bold" "$c_yellow" "$c_reset"
+  printf '\n'
+  printf "  The ASR + inspector services each need a bearer token derived\n"
+  printf "  from your master key. To avoid hitting you with two Touch ID\n"
+  printf "  modals and two YubiKey taps in a row, we derive both tokens\n"
+  printf "  from a single unlock right here.\n\n"
+  printf "  Next steps (watch for them in this terminal):\n"
+  printf "    1.  %sTouch ID modal%s pops up — authenticate to unlock the\n" \
+         "$c_bold" "$c_reset"
+  printf "        Keychain half of the master key.\n"
+  printf "    2.  %sYubiKey LED starts flashing%s — tap it to release the\n" \
+         "$c_bold" "$c_reset"
+  printf "        YubiKey half. Total wait: typically <5 s after the tap.\n"
+  printf '\n'
+  printf "  Each service will then pick its token up from its own\n"
+  printf "  per-subprocess environment and start up silently.\n"
+  printf "%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n" \
+         "$c_bold" "$c_reset"
+  printf '\n'
+
+  # Run the warm verb. Stdout = JSON; stderr = banners + errors.
+  # We capture stdout into the nameref and let stderr stream
+  # through to the terminal so the touch_prompts banners are
+  # visible in real time.
+  local _json
+  if ! _json="$("$VENV_PY" -m local_scribe.security.service_auth warm asr inspector)"; then
+    say "${c_red}token warmup failed — see the error above.${c_reset}"
+    say "  Recover by re-running ${c_bold}./run.sh start${c_reset}, or use"
+    say "  ${c_bold}LOCAL_SCRIBE_DISABLE_AUTH=1 ./run.sh start${c_reset} to bypass auth"
+    say "  entirely (NOT recommended; every endpoint becomes open)."
+    return 1
+  fi
+  _out="$_json"
+  printf "  %stokens derived%s — starting services\n\n" \
+         "$c_green" "$c_reset"
+  return 0
+}
+
 inspector_pid() {
   [[ -f "$INSPECTOR_PID_FILE" ]] || return 1
   local pid; pid="$(cat "$INSPECTOR_PID_FILE")"
@@ -2688,6 +2948,12 @@ cmd_start() {
   # If the Char data dir is still plaintext on disk, we refuse here
   # with explicit recovery steps (see vault_relocation_gate above).
   vault_relocation_gate || return 1
+  # Auto-unlock gate: ``cmd_stop`` dismounts the vault, so by the
+  # time the operator runs ``cmd_start`` again the symlink may point
+  # into an unmounted volume. The gate detects that case and
+  # transparently prompts for Touch ID + YubiKey to re-mount before
+  # any service tries to read through the symlink.
+  vault_auto_unlock_gate || return 1
   char_integrity_gate || return 1
   preflight || {
     say "${c_red}preflight failed${c_reset}"
@@ -2703,13 +2969,62 @@ cmd_start() {
   launch_session_mint || return 1
   trap 'launch_session_close' EXIT INT TERM
 
+  # Token warmup — derive bearer tokens for every service that
+  # needs one BEFORE we spawn anything. Each spawned service
+  # picks up its token from its own per-subprocess environ and
+  # skips its own (otherwise-inevitable) Touch ID + YubiKey
+  # round-trip. Without this:
+  #
+  #   * ASR's lifespan hook → unlock #1 (Touch ID + YubiKey)
+  #   * Inspector's startup → unlock #2 (Touch ID + YubiKey)
+  #
+  # …and both prompts fire while the operator is staring at
+  # "starting asr ..." with no textual cue. The banners ARE
+  # printed by ``touch_prompts`` but they land in the service's
+  # log file (stdout/stderr are redirected for the daemonised
+  # spawn), not in the operator's terminal.
+  #
+  # With the warmup: ONE Touch ID + ONE YubiKey tap up front,
+  # visible banner in run.sh's foreground, and the spawned
+  # services come up silently because their tokens are already
+  # in env.
+  local _warmup_json="" _asr_tok="" _inspector_tok=""
+  if ! warmup_service_tokens _warmup_json; then
+    return 1
+  fi
+  # Parse JSON into bash locals. We pipe through python rather
+  # than shelling out to jq (which isn't a hard dependency) and
+  # rather than parsing JSON in bash by hand (which is a footgun).
+  if [[ -n "$_warmup_json" && "$_warmup_json" != "{}" ]]; then
+    _asr_tok="$("$VENV_PY" -c '
+import json, sys
+print(json.loads(sys.argv[1]).get("asr", ""))
+' "$_warmup_json")"
+    _inspector_tok="$("$VENV_PY" -c '
+import json, sys
+print(json.loads(sys.argv[1]).get("inspector", ""))
+' "$_warmup_json")"
+  fi
+  # Scrub the JSON blob — we don't want the full token JSON
+  # lingering in the parent shell's environ / locals.
+  unset _warmup_json
+
   lmstudio_start
   local lms_rc=$?    # 0 ok, 1 unreachable, 2 reachable-but-no-model
 
-  asr_start || return 1
+  # Per-subprocess env: ``LOCAL_SCRIBE_ASR_TOKEN=val asr_start``
+  # exports the var into ``asr_start``'s environ ONLY, so the
+  # token never enters this parent shell's environ and the
+  # ``exec tail -F`` at the end of cmd_start doesn't inherit it.
+  # The bash ``VAR=val funcname`` quirk is exactly what we want
+  # here -- see SECURITY.md § "Defense layer 2" for the threat
+  # model around env-var token passing.
+  LOCAL_SCRIBE_ASR_TOKEN="$_asr_tok" asr_start || return 1
   # Inspector is best-effort: if it fails to start, the ASR pipeline
   # still works -- just no web UI. Don't fail the whole `start` for it.
-  inspector_start || say "${c_yellow}inspector failed to start; ASR pipeline still ok${c_reset}"
+  LOCAL_SCRIBE_INSPECTOR_TOKEN="$_inspector_tok" inspector_start \
+    || say "${c_yellow}inspector failed to start; ASR pipeline still ok${c_reset}"
+  unset _asr_tok _inspector_tok
   # Egress proxy is also best-effort: ASR / LM Studio still work
   # without it, but Char loses its outbound firewall. Surface the
   # failure prominently though, since the most-secure default expects
@@ -2788,6 +3103,19 @@ cmd_stop() {
   inspector_stop
   egress_proxy_stop
   launch_session_close
+  # Lock-on-stop: the whole point of the encrypted vault is that
+  # plaintext only exists on disk while the operator is actively
+  # using the pipeline. Leaving it mounted after ``stop`` defeats
+  # that guarantee for anyone who can read the filesystem as our
+  # UID (including a curious shell session, a misconfigured backup
+  # agent, or any compromised app running as the user).
+  #
+  # ``vault_lock_on_stop`` is idempotent + polite-only: it skips when
+  # Char.app is still running (refuses to risk SQLite corruption on
+  # ``app.db``), when the vault is already unmounted, and when there
+  # is no vault at all. The operator can always force a lock with
+  # ``./run.sh vault lock`` after quitting Char.
+  vault_lock_on_stop
   printf "  %sLM Studio left running%s; use \`lms server stop\` to free GPU memory\n" \
          "$c_dim" "$c_reset"
 }

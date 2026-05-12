@@ -86,18 +86,30 @@ if not logger.handlers:
 def _resolve_token_holder_at_startup() -> Optional[service_auth.ServiceToken]:
     """Build the inspector's bearer-token holder.
 
-    Production: prompt Touch ID, fetch master key from Keychain, derive
-    the inspector token via HKDF.
+    Resolution order (matches the ASR worker; see also
+    ``service_auth.warm_tokens`` and the ``cmd_start`` flow in
+    ``run.sh``):
 
-    Test hook: ``LOCAL_SCRIBE_TEST_MASTER_KEY_HEX=<64 hex>`` skips
-    Touch ID and derives directly. Used by the FastAPI TestClient
-    integration tests.
-
-    If ``LOCAL_SCRIBE_DISABLE_AUTH=1`` is set, returns ``None``; the
-    middleware below treats ``None`` as bypass.
+    1. ``LOCAL_SCRIBE_DISABLE_AUTH=1`` → returns ``None`` (bypass).
+    2. ``LOCAL_SCRIBE_INSPECTOR_TOKEN`` → pre-warmed by the parent
+       shell via ``service_auth warm``. Skips the second Touch ID
+       + YubiKey cycle that would otherwise hit the operator at
+       inspector startup.
+    3. ``LOCAL_SCRIBE_TEST_MASTER_KEY_HEX`` → test hook; derives
+       without prompting. Used by the FastAPI TestClient
+       integration tests.
+    4. Production: prompt Touch ID, fetch master key from
+       Keychain, HKDF-derive the inspector token. This is what
+       happens on a manual ``./run.sh inspector start`` outside
+       of a parent ``./run.sh start``.
     """
     if service_auth.is_bypass_enabled():
         return None
+    prewarmed = os.environ.get("LOCAL_SCRIBE_INSPECTOR_TOKEN")
+    if prewarmed:
+        return service_auth.ServiceToken(
+            service="inspector", token=prewarmed.strip(),
+        )
     test_mk = os.environ.get("LOCAL_SCRIBE_TEST_MASTER_KEY_HEX")
     if test_mk:
         return service_auth.ServiceToken.from_master_key(
