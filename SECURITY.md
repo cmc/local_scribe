@@ -2079,6 +2079,14 @@ fixes them.
 
 ## Continuous-audit checklist
 
+> **Tip.** [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) is the
+> companion traceability matrix to this document: every guarantee
+> above resolves there to the exact module that enforces it and the
+> test that pins it. If you want to re-validate the posture, run the
+> commands at the bottom of that file rather than re-reading this
+> one front-to-back. The matrix also records every gap surfaced by
+> the 2026-05-11 audit cycle and the commit that closed it.
+
 Re-run this whenever:
 
 - `CHAR_KNOWN_GOOD_VERSION` is bumped,
